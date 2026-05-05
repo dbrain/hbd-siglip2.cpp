@@ -382,11 +382,61 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
 
     state_.compute_meta.resize(ggml_tensor_overhead() * QWEN3_TTS_DEC_MAX_NODES + ggml_graph_overhead());
 
-    // Optional: per-stage decoder profiling. Enable with QWEN3_TTS_DECODER_PROFILE=1.
-    // Uses ggml's eval-callback to break the graph at our named output markers
-    // (vq_output, pre_tfm_output, upsample_output, dec0..dec6_output) so we can
-    // measure wall time between sync points. Adds overhead — diagnostic only.
-    if (const char * env = std::getenv("QWEN3_TTS_DECODER_PROFILE"); env && *env != '0') {
+    // Per-stage decoder profile: QWEN3_TTS_DECODER_PROFILE=1 (named-tensor markers,
+    // shows dec0..dec6 + per-residual sub-stages).
+    // Per-op-type aggregate profile: QWEN3_TTS_DECODER_PROFILE_OP=1 (breaks graph
+    // at every IM2COL/MUL_MAT/CONV_*/SNAKE/CONCAT/CONT, aggregates wall time per
+    // op type, dumps after each decode call). Use to attribute conv_1d's 500ms
+    // between im2col and mul_mat.
+    const char * env_named = std::getenv("QWEN3_TTS_DECODER_PROFILE");
+    const char * env_op    = std::getenv("QWEN3_TTS_DECODER_PROFILE_OP");
+    const bool want_named = env_named && env_named[0] && env_named[0] != '0';
+    const bool want_op    = env_op    && env_op[0]    && env_op[0]    != '0';
+
+    if (want_op) {
+        ggml_backend_sched_set_eval_callback(state_.sched,
+            [](struct ggml_tensor * t, bool ask, void * /*ud*/) -> bool {
+                // Only break the graph at expensive ops we care about. Print
+                // per-call shape and time so we can see which mul_mat shapes
+                // are slow (cuBLAS tunes badly for some).
+                const enum ggml_op want_ops[] = {
+                    GGML_OP_MUL_MAT,
+                    GGML_OP_IM2COL,
+                    GGML_OP_CONV_TRANSPOSE_1D,
+                    GGML_OP_SNAKE,
+                };
+                bool is_target = false;
+                for (auto op : want_ops) { if (t->op == op) { is_target = true; break; } }
+                if (ask) return is_target;
+
+                using clk = std::chrono::high_resolution_clock;
+                static clk::time_point t_last;
+                static bool first = true;
+                if (first) { t_last = clk::now(); first = false; }
+                auto now = clk::now();
+                const double ms = std::chrono::duration<double, std::milli>(now - t_last).count();
+                t_last = now;
+
+                if (ms < 5.0) return true;  // skip tiny ops, only print substantial ones
+
+                const char * src0_t = t->src[0] ? ggml_type_name(t->src[0]->type) : "?";
+                const char * src1_t = t->src[1] ? ggml_type_name(t->src[1]->type) : "?";
+                long long s0_ne0 = t->src[0] ? t->src[0]->ne[0] : 0;
+                long long s0_ne1 = t->src[0] ? t->src[0]->ne[1] : 0;
+                long long s0_ne2 = t->src[0] ? t->src[0]->ne[2] : 0;
+                long long s1_ne0 = t->src[1] ? t->src[1]->ne[0] : 0;
+                long long s1_ne1 = t->src[1] ? t->src[1]->ne[1] : 0;
+                long long s1_ne2 = t->src[1] ? t->src[1]->ne[2] : 0;
+
+                fprintf(stderr, "  [op] %-12s %8.1f ms  src0=[%lld,%lld,%lld %s]  src1=[%lld,%lld,%lld %s]  dst=[%lld,%lld,%lld %s]\n",
+                        ggml_op_name(t->op), ms,
+                        s0_ne0, s0_ne1, s0_ne2, src0_t,
+                        s1_ne0, s1_ne1, s1_ne2, src1_t,
+                        (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], ggml_type_name(t->type));
+                return true;
+            }, nullptr);
+        fprintf(stderr, "QWEN3_TTS_DECODER_PROFILE_OP enabled — per-op (>5ms) shape+time in stderr\n");
+    } else if (want_named) {
         ggml_backend_sched_set_eval_callback(state_.sched,
             [](struct ggml_tensor * t, bool ask, void * /*ud*/) -> bool {
                 static const std::array<const char *, 27> markers = {
@@ -394,8 +444,6 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
                     "upsample_output", "dec0_output",
                     "dec1_output", "dec2_output", "dec3_output", "dec4_output",
                     "dec5_output", "dec6_output",
-                    // sub-stage markers within each decoder block — only fire
-                    // when QWEN3_TTS_DECODER_PROFILE is set.
                     "dec1_after_convt", "dec1_after_res0", "dec1_after_res1", "dec1_after_res2",
                     "dec2_after_convt", "dec2_after_res0", "dec2_after_res1", "dec2_after_res2",
                     "dec3_after_convt", "dec3_after_res0", "dec3_after_res1", "dec3_after_res2",
@@ -418,7 +466,7 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
                         (long long)t->ne[2], (long long)t->ne[3]);
                 t_last = now;
                 if (++call_idx >= (int)markers.size()) {
-                    first = true;  // reset for next decode call
+                    first = true;
                     fprintf(stderr, "  [decoder-profile] -- end of decode --\n");
                 }
                 return true;
