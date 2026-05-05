@@ -928,6 +928,25 @@ void TTSTransformer::clear_prefill_kv_cache() {
     icl_codec_section_cache_.clear();
 }
 
+void TTSTransformer::log_vram_breakdown(const char * label) const {
+    auto buf_mib = [](ggml_backend_buffer_t b) -> double {
+        return b ? ggml_backend_buffer_get_size(b) / (1024.0 * 1024.0) : 0.0;
+    };
+    const double weights      = buf_mib(model_.buffer);
+    const double kv           = buf_mib(state_.cache.buffer);
+    const double code_pred_kv = buf_mib(state_.code_pred_cache.buffer);
+    const double sched_cuda   = (state_.sched && state_.backend)
+        ? ggml_backend_sched_get_buffer_size(state_.sched, state_.backend) / (1024.0 * 1024.0)
+        : 0.0;
+    const double sched_cpu    = (state_.sched && state_.backend_cpu)
+        ? ggml_backend_sched_get_buffer_size(state_.sched, state_.backend_cpu) / (1024.0 * 1024.0)
+        : 0.0;
+    const double total = weights + kv + code_pred_kv + sched_cuda + sched_cpu;
+    fprintf(stderr,
+            "  [vram-talker %-20s] weights=%6.1f  kv=%5.1f  cp_kv=%4.1f  sched_cu=%4.1f  sched_cpu=%4.1f  total=%6.1f MiB\n",
+            label, weights, kv, code_pred_kv, sched_cuda, sched_cpu, total);
+}
+
 const TTSTransformer::prefill_kv_snapshot *
 TTSTransformer::get_prefill_kv_snapshot(uint64_t key) const {
     auto it = prefill_kv_cache_.find(key);
@@ -1619,9 +1638,18 @@ struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_token
         && state_.cache.k_cache[0]
         && ggml_is_quantized(state_.cache.k_cache[0]->type);
 
+    // Narrow K/V view to populated region after this prefill, padded to
+    // FATTN_KQ_STRIDE so the FA dispatcher stays on its preferred kernel.
+    // Manual path keeps the full n_ctx view (it doesn't dispatch through FA).
+    constexpr int32_t kFattnKqStride = 256;
+    const int32_t kv_n_eff = use_fa
+        ? std::min(state_.cache.n_ctx,
+                   ((n_past + n_tokens + kFattnKqStride - 1) / kFattnKqStride) * kFattnKqStride)
+        : state_.cache.n_ctx;
+
     struct ggml_tensor * inp_mask = nullptr;
     if (use_fa) {
-        inp_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, state_.cache.n_ctx, n_tokens);
+        inp_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, kv_n_eff, n_tokens);
         ggml_set_name(inp_mask, "inp_mask");
         ggml_set_input(inp_mask);
     }
@@ -1675,13 +1703,13 @@ struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_token
         ggml_build_forward_expand(gf, ggml_set_rows(ctx0, v_cache_2d, Vcur_2d, inp_pos));
 
         struct ggml_tensor * K = ggml_view_3d(ctx0, k_cache,
-            head_dim, n_kv_head, state_.cache.n_ctx,
+            head_dim, n_kv_head, kv_n_eff,
             k_cache->nb[1], k_cache->nb[2], 0);
 
         struct ggml_tensor * V = ggml_view_3d(ctx0, v_cache,
-            head_dim, n_kv_head, state_.cache.n_ctx,
+            head_dim, n_kv_head, kv_n_eff,
             v_cache->nb[1], v_cache->nb[2], 0);
-        
+
         struct ggml_tensor * Q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
         K = ggml_permute(ctx0, K, 0, 2, 1, 3);
         V = ggml_permute(ctx0, V, 0, 2, 1, 3);
@@ -1743,7 +1771,7 @@ struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_token
     return gf;
 }
 
-struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t /*n_past*/) {
+struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past) {
     const auto & cfg = model_.config;
     const int n_head = cfg.n_attention_heads;
     const int n_kv_head = cfg.n_key_value_heads;
@@ -1753,25 +1781,34 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t /*n_past*/) {
     const float rope_theta = cfg.rope_theta;
     const int n_layer = cfg.n_layers;
     const int n_tokens = 1;
-    
+
+    // Narrow K/V view to populated region (n_past+1), rounded up to
+    // FATTN_KQ_STRIDE=256 so the dispatcher stays on the VEC kernel for
+    // single-token decode. Saves ~linear FA work vs scanning full n_ctx
+    // — biggest payoff at small n_past, fades as gen approaches n_ctx.
+    constexpr int32_t kFattnKqStride = 256;
+    const int32_t kv_n_eff = std::min(
+        state_.cache.n_ctx,
+        ((n_past + 1 + kFattnKqStride - 1) / kFattnKqStride) * kFattnKqStride);
+
     struct ggml_init_params params = {
         /*.mem_size   =*/ state_.compute_meta.size(),
         /*.mem_buffer =*/ state_.compute_meta.data(),
         /*.no_alloc   =*/ true,
     };
-    
+
     struct ggml_context * ctx0 = ggml_init(params);
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, QWEN3_TTS_MAX_NODES, false);
 
     struct ggml_tensor * inp_step_embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hidden_size, 1);
     ggml_set_name(inp_step_embd, "inp_step_embd");
     ggml_set_input(inp_step_embd);
-    
+
     struct ggml_tensor * inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
     ggml_set_name(inp_pos, "inp_pos");
     ggml_set_input(inp_pos);
 
-    struct ggml_tensor * inp_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, state_.cache.n_ctx, 1);
+    struct ggml_tensor * inp_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, kv_n_eff, 1);
     ggml_set_name(inp_mask, "inp_mask");
     ggml_set_input(inp_mask);
 
@@ -1816,6 +1853,9 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t /*n_past*/) {
         struct ggml_tensor * k_cache = state_.cache.k_cache[il];
         struct ggml_tensor * v_cache = state_.cache.v_cache[il];
 
+        // set_rows still writes into the full cache (offset 0, full extent
+        // for the destination so set_rows can index any inp_pos). FA reads
+        // only the narrowed [0, kv_n_eff) view.
         struct ggml_tensor * k_cache_2d = ggml_view_2d(ctx0, k_cache, head_dim * n_kv_head, state_.cache.n_ctx, k_cache->nb[2], 0);
         struct ggml_tensor * v_cache_2d = ggml_view_2d(ctx0, v_cache, head_dim * n_kv_head, state_.cache.n_ctx, v_cache->nb[2], 0);
         struct ggml_tensor * Kcur_2d = ggml_view_2d(ctx0, Kcur, head_dim * n_kv_head, n_tokens, Kcur->nb[2], 0);
@@ -1824,17 +1864,17 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t /*n_past*/) {
         ggml_build_forward_expand(gf, ggml_set_rows(ctx0, v_cache_2d, Vcur_2d, inp_pos));
 
         struct ggml_tensor * K = ggml_view_3d(ctx0, k_cache,
-            head_dim, n_kv_head, state_.cache.n_ctx,
+            head_dim, n_kv_head, kv_n_eff,
             k_cache->nb[1], k_cache->nb[2], 0);
 
         struct ggml_tensor * V = ggml_view_3d(ctx0, v_cache,
-            head_dim, n_kv_head, state_.cache.n_ctx,
+            head_dim, n_kv_head, kv_n_eff,
             v_cache->nb[1], v_cache->nb[2], 0);
-        
+
         struct ggml_tensor * Q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
         K = ggml_permute(ctx0, K, 0, 2, 1, 3);
         V = ggml_permute(ctx0, V, 0, 2, 1, 3);
-        
+
         struct ggml_tensor * KQ_mask = ggml_get_tensor(ctx0, "inp_mask");
         cur = ggml_flash_attn_ext(ctx0, Q, K, V, KQ_mask, KQscale, 0.0f, 0.0f);
         cur = ggml_cont_2d(ctx0, cur, n_head * head_dim, 1);
@@ -2362,21 +2402,24 @@ bool TTSTransformer::forward_prefill(const float * prefill_embd, int32_t n_token
         ggml_backend_tensor_set(inp_pos, positions.data(), 0, n_tokens * sizeof(int32_t));
     }
 
-    // Causal mask for FA prefill — only present when QWEN3_TTS_PREFILL_FA is set.
-    // Shape [n_ctx, n_tokens]: row q is the mask for query token at pos n_past+q.
+    // Causal mask for FA prefill (only present on quant-KV path; manual
+    // attention uses ggml_diag_mask_inf inline). Shape [kv_n_eff, n_tokens]
+    // where kv_n_eff = round_up(n_past+n_tokens, FATTN_KQ_STRIDE) ≤ n_ctx.
+    // Row q masks query token at pos n_past+q: open [0, n_past+q], closed
+    // [n_past+q+1, kv_n_eff) — closed slots include the rounding pad.
     struct ggml_tensor * inp_mask = ggml_graph_get_tensor(gf, "inp_mask");
     if (inp_mask) {
-        const int32_t n_ctx = state_.cache.n_ctx;
-        std::vector<ggml_fp16_t> mask((size_t)n_tokens * n_ctx, ggml_fp32_to_fp16(-INFINITY));
+        const int32_t kv_n_eff = (int32_t) inp_mask->ne[0];
+        std::vector<ggml_fp16_t> mask((size_t) n_tokens * kv_n_eff, ggml_fp32_to_fp16(-INFINITY));
         for (int q = 0; q < n_tokens; ++q) {
             const int q_pos = n_past + q;
-            const int kv_end = std::min(q_pos + 1, n_ctx);
+            const int kv_end = std::min(q_pos + 1, kv_n_eff);
             for (int k = 0; k < kv_end; ++k) {
-                mask[(size_t)q * n_ctx + k] = ggml_fp32_to_fp16(0.0f);
+                mask[(size_t) q * kv_n_eff + k] = ggml_fp32_to_fp16(0.0f);
             }
         }
         ggml_backend_tensor_set(inp_mask, mask.data(),
-                                0, (size_t)n_tokens * n_ctx * sizeof(ggml_fp16_t));
+                                0, (size_t) n_tokens * kv_n_eff * sizeof(ggml_fp16_t));
     }
 
 #ifdef QWEN3_TTS_TIMING
@@ -2396,7 +2439,16 @@ bool TTSTransformer::forward_prefill(const float * prefill_embd, int32_t n_token
     t1 = clk::now();
     if (timing_) timing_->t_prefill_compute_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 #endif
-    
+
+    // QWEN3_TTS_LOG_SCHED=1 — one-shot dump of talker buffer reservations
+    // after first prefill. Vocoder breakdown is logged separately from
+    // qwen3_tts.cpp at the same moment.
+    static bool sched_logged = false;
+    if (!sched_logged && std::getenv("QWEN3_TTS_LOG_SCHED")) {
+        sched_logged = true;
+        log_vram_breakdown("post-first-prefill");
+    }
+
     struct ggml_tensor * hidden = ggml_graph_get_tensor(gf, "hidden_states");
     if (!hidden) {
         error_msg_ = "Failed to find hidden_states tensor";
@@ -2535,12 +2587,16 @@ bool TTSTransformer::forward_step(const float * step_embd, int32_t n_past,
         ggml_backend_tensor_set(inp_pos, &pos, 0, sizeof(int32_t));
     }
 
+    // Mask is sized to the narrowed K/V view (kv_n_eff = round_up(n_past+1,
+    // FATTN_KQ_STRIDE), capped at n_ctx). Open positions [0, n_past],
+    // closed [n_past+1, kv_n_eff) — closed slots are the rounding pad.
     struct ggml_tensor * inp_mask = ggml_graph_get_tensor(gf, "inp_mask");
-    std::vector<ggml_fp16_t> mask(state_.cache.n_ctx, ggml_fp32_to_fp16(-INFINITY));
-    for (int i = 0; i <= n_past; i++) {
+    const int32_t kv_n_eff = (int32_t) inp_mask->ne[0];
+    std::vector<ggml_fp16_t> mask(kv_n_eff, ggml_fp32_to_fp16(-INFINITY));
+    for (int i = 0; i <= n_past && i < kv_n_eff; i++) {
         mask[i] = ggml_fp32_to_fp16(0.0f);
     }
-    ggml_backend_tensor_set(inp_mask, mask.data(), 0, state_.cache.n_ctx * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(inp_mask, mask.data(), 0, (size_t) kv_n_eff * sizeof(ggml_fp16_t));
 
 #ifdef QWEN3_TTS_TIMING
     t1 = clk::now();

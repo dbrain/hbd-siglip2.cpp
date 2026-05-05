@@ -1181,6 +1181,23 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
     return true;
 }
 
+void AudioTokenizerDecoder::log_vram_breakdown(const char * label) const {
+    auto buf_mib = [](ggml_backend_buffer_t b) -> double {
+        return b ? ggml_backend_buffer_get_size(b) / (1024.0 * 1024.0) : 0.0;
+    };
+    const double weights    = buf_mib(model_.buffer);
+    const double sched_cuda = (state_.sched && state_.backend)
+        ? ggml_backend_sched_get_buffer_size(state_.sched, state_.backend) / (1024.0 * 1024.0)
+        : 0.0;
+    const double sched_cpu  = (state_.sched && state_.backend_cpu)
+        ? ggml_backend_sched_get_buffer_size(state_.sched, state_.backend_cpu) / (1024.0 * 1024.0)
+        : 0.0;
+    const double total = weights + sched_cuda + sched_cpu;
+    fprintf(stderr,
+            "  [vram-vocoder %-19s] weights=%6.1f  sched_cu=%5.1f  sched_cpu=%4.1f  total=%6.1f MiB\n",
+            label, weights, sched_cuda, sched_cpu, total);
+}
+
 void AudioTokenizerDecoder::stream_reset() {
     streaming_mode_ = false;
     n_past_ = 0;

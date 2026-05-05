@@ -224,6 +224,9 @@ public:
 
     const audio_decoder_config & get_config() const { return model_.config; }
 
+    // VRAM inventory dump — weights buffer + sched per-backend reservations.
+    void log_vram_breakdown(const char * label) const;
+
     const std::string & get_error() const { return error_msg_; }
     
 private:

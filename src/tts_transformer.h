@@ -326,6 +326,11 @@ public:
     // Drop all cached prefill KV snapshots. Called by Qwen3TTS::unload_model.
     void clear_prefill_kv_cache();
 
+    // One-line VRAM/host inventory for the talker. Triggered via
+    // QWEN3_TTS_LOG_SCHED — emits weights, KV, code-pred KV, and sched
+    // buffer sizes so a session can audit where bytes are going.
+    void log_vram_breakdown(const char * label) const;
+
     // -- Persistence helpers (used by Qwen3TTS::save/load_voice_warmup) ---
 
     // Read-only access to a cached entry, if present. Returns nullptr when

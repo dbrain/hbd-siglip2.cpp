@@ -759,6 +759,14 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
     result.t_prefill_ms     = transformer_.get_last_prefill_ms();
     sample_memory("synth/after-generate");
 
+    // QWEN3_TTS_LOG_SCHED=1 → one-shot vocoder VRAM breakdown alongside
+    // the talker breakdown emitted from forward_prefill.
+    static bool vocoder_vram_logged = false;
+    if (!vocoder_vram_logged && std::getenv("QWEN3_TTS_LOG_SCHED")) {
+        vocoder_vram_logged = true;
+        if (decoder_loaded_) audio_decoder_.log_vram_breakdown("post-first-generate");
+    }
+
     if (is_aborted()) {
         result.error_msg = "Aborted";
         return result;
