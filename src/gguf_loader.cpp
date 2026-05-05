@@ -165,7 +165,16 @@ bool load_tensor_data_from_file(
     std::string & error_msg,
     enum ggml_backend_dev_type preferred_backend_type
 ) {
+    // Try the requested device type first; if it doesn't exist (e.g. IGPU on
+    // a discrete-only machine), fall back to GPU then CPU. The previous
+    // IGPU-then-CPU path silently loaded the WavTokenizer vocoder weights into
+    // CPU buffer on systems with only a discrete GPU, which then forced the
+    // entire decoder graph to run on CPU.
     ggml_backend_t backend = ggml_backend_init_by_type(preferred_backend_type, nullptr);
+    if (!backend && preferred_backend_type != GGML_BACKEND_DEVICE_TYPE_CPU
+                 && preferred_backend_type != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+    }
     if (!backend && preferred_backend_type != GGML_BACKEND_DEVICE_TYPE_CPU) {
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     }
@@ -173,7 +182,7 @@ bool load_tensor_data_from_file(
         error_msg = "Failed to initialize backend for GGUF tensor loader";
         return false;
     }
-    
+
     // Allocate buffer for all tensors
     buffer = ggml_backend_alloc_ctx_tensors(model_ctx, backend);
     if (!buffer) {
@@ -181,6 +190,10 @@ bool load_tensor_data_from_file(
         ggml_backend_free(backend);
         return false;
     }
+    // Mark buffer as WEIGHTS so ggml's scheduler treats this as the source-of-
+    // backend for ops that consume it (per ggml-backend.cpp:819). Without this
+    // tag the scheduler defaults to CPU for ops where it can't infer otherwise.
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     
     // Open file for reading tensor data
     FILE * f = fopen(path.c_str(), "rb");

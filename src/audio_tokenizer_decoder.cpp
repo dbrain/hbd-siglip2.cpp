@@ -732,16 +732,16 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_residual_block(struct ggml_con
 
     int64_t in_channels = block.conv1_w->ne[1];
     int64_t out_channels = block.conv1_w->ne[2];
-    int padding = 6 * block.dilation;
-    x = make_causal_tail(ctx, x, padding, (int) in_channels, tail_name_prefix);
-    // The fused ggml_conv_1d_direct CUDA op exists (see
-    // ggml/src/ggml-cuda/conv-1d-direct.cu) and works correctly, but the
-    // current shared-mem-tiled implementation does not yet beat ggml's
-    // im2col + cuBLAS gemm path on Ampere for these residual-block shapes.
-    // The default ggml_conv_1d path stays the production route until the
-    // direct kernel is tuned (probably needs tensor-core mma + larger tiles
-    // co-designed with the [in_ch, seq] layout). See HANDOFF-perf.md.
-    x = ggml_conv_1d(ctx, block.conv1_w, x, 1, 0, block.dilation);
+    // Fused conv_1d_direct (wmma tensor-core kernel, no im2col temp). Causal
+    // padding via asymmetric p_left = (K-1)*d, p_right = 0 — no
+    // INPUT-flagged tail tensor needed (which would force the chain to CPU).
+    GGML_UNUSED(tail_name_prefix);
+    GGML_UNUSED(in_channels);
+    {
+        const int kernel  = (int) block.conv1_w->ne[0];
+        const int p_left  = (kernel - 1) * block.dilation;
+        x = ggml_conv_1d_direct(ctx, block.conv1_w, x, 1, p_left, 0, block.dilation);
+    }
     if (block.conv1_b) {
         x = ggml_add(ctx, x, ggml_reshape_3d(ctx, block.conv1_b, 1, out_channels, 1));
     }
@@ -751,7 +751,11 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_residual_block(struct ggml_con
     }
 
     out_channels = block.conv2_w->ne[2];
-    x = ggml_conv_1d(ctx, block.conv2_w, x, 1, 0, 1);
+    {
+        const int kernel = (int) block.conv2_w->ne[0];
+        const int p_left = kernel - 1;  // dilation=1
+        x = ggml_conv_1d_direct(ctx, block.conv2_w, x, 1, p_left, 0, 1);
+    }
     if (block.conv2_b) {
         x = ggml_add(ctx, x, ggml_reshape_3d(ctx, block.conv2_b, 1, out_channels, 1));
     }
@@ -965,9 +969,13 @@ struct ggml_cgraph * AudioTokenizerDecoder::build_graph(int32_t n_frames, int32_
      ggml_set_name(latent, "vq_output");
     
     struct ggml_tensor * latent_for_conv = ggml_cont(ctx0, latent);
-    struct ggml_tensor * latent_padded = make_causal_tail(
-        ctx0, latent_for_conv, 2, cfg.hidden_dim, "tail_pre_conv");
-     struct ggml_tensor * cur = ggml_conv_1d(ctx0, model_.pre_conv_w, latent_padded, 1, 0, 1);
+    // pre_conv via direct kernel (no im2col, no INPUT-flagged tail).
+    struct ggml_tensor * cur;
+    {
+        const int kernel = (int) model_.pre_conv_w->ne[0];
+        cur = ggml_conv_1d_direct(ctx0, model_.pre_conv_w, latent_for_conv,
+                                   1, kernel - 1, 0, 1);
+    }
      if (model_.pre_conv_b) {
          cur = ggml_add(ctx0, cur, ggml_reshape_3d(ctx0, model_.pre_conv_b, 1, cfg.latent_dim, 1));
      }
@@ -1018,8 +1026,11 @@ struct ggml_cgraph * AudioTokenizerDecoder::build_graph(int32_t n_frames, int32_
 
      ggml_set_name(cur, "upsample_output");
 
-     cur = make_causal_tail(ctx0, cur, 6, cfg.latent_dim, "tail_dec0");
-     cur = ggml_conv_1d(ctx0, model_.dec0_conv_w, cur, 1, 0, 1);
+     // dec0_conv via direct kernel (no INPUT-flagged tail, no im2col).
+     {
+         const int kernel = (int) model_.dec0_conv_w->ne[0];
+         cur = ggml_conv_1d_direct(ctx0, model_.dec0_conv_w, cur, 1, kernel - 1, 0, 1);
+     }
      if (model_.dec0_conv_b) {
          cur = ggml_add(ctx0, cur, ggml_reshape_3d(ctx0, model_.dec0_conv_b, 1, cfg.decoder_dim, 1));
      }
@@ -1040,8 +1051,10 @@ struct ggml_cgraph * AudioTokenizerDecoder::build_graph(int32_t n_frames, int32_
      
      ggml_set_name(cur, "dec5_output");
      
-     cur = make_causal_tail(ctx0, cur, 6, (int) cur->ne[1], "tail_dec6");
-     cur = ggml_conv_1d(ctx0, model_.dec6_conv_w, cur, 1, 0, 1);
+     {
+         const int kernel = (int) model_.dec6_conv_w->ne[0];
+         cur = ggml_conv_1d_direct(ctx0, model_.dec6_conv_w, cur, 1, kernel - 1, 0, 1);
+     }
      if (model_.dec6_conv_b) {
          cur = ggml_add(ctx0, cur, ggml_reshape_3d(ctx0, model_.dec6_conv_b, 1, 1, 1));
      }
