@@ -1063,6 +1063,28 @@ int main(int argc, char ** argv) {
         int64_t     seed               = body.value("seed", sp.seed);
         int         stream_batch_size       = body.value("stream_batch_size", 0);
         int         stream_first_batch_size = body.value("stream_first_batch_size", 0);
+        // Server-side defaults: when the request omits streaming params AND
+        // operator has configured defaults via env, opt the request into
+        // streaming. Both halve VRAM peak (vocoder graph/scratch bounded
+        // per batch) and improve TTFA. Body params always win. Operators
+        // who want all clients streaming can set both env vars; clients
+        // who want non-streaming explicitly set stream_batch_size=0 in
+        // the body.
+        if (!body.contains("stream_batch_size")) {
+            if (const char * env = std::getenv("QWEN3_TTS_DEFAULT_STREAM_BATCH_SIZE")) {
+                stream_batch_size = std::atoi(env);
+            }
+        }
+        if (!body.contains("stream_first_batch_size")) {
+            if (const char * env = std::getenv("QWEN3_TTS_DEFAULT_STREAM_FIRST_BATCH_SIZE")) {
+                stream_first_batch_size = std::atoi(env);
+            }
+        }
+        if (stream_format.empty() && stream_batch_size > 0) {
+            // unspecified stream_format with streaming on → assume the
+            // chunked-audio variant (matches response_format).
+            stream_format = "audio";
+        }
         if (max_audio_tokens < 1) max_audio_tokens = 1;
         if (max_audio_tokens > 8192) max_audio_tokens = 8192;
         if (stream_batch_size < 0) stream_batch_size = 0;
