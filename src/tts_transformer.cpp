@@ -1418,37 +1418,51 @@ bool TTSTransformer::build_prefill_graph(const int32_t * text_tokens, int32_t n_
                 }
             }
 
-            // ref_code embeddings: sum across codebooks, overlay with tts_pad
-            std::vector<float> embd_row(hidden_size);
-            for (int32_t f = 0; f < n_ref_frames; ++f) {
-                if (skip_ref_codes) {
+            // ref_code embeddings: sum across codebooks, overlay with tts_pad.
+            //
+            // Naive form does n_ref_frames * n_codebooks (~1072 for 67-frame
+            // refs) single-row D2H copies via lookup_single_embedding_row,
+            // each ~0.4 ms = ~400 ms host-side build cost on Q4. Instead,
+            // batch the gets: one per codebook, fetching all n_ref_frames
+            // rows at once. lookup_embedding_rows builds a get_rows graph
+            // when n>32, so this collapses to 16 batched D2H calls.
+            if (skip_ref_codes) {
+                for (int32_t f = 0; f < n_ref_frames; ++f) {
                     float * dst = icl_codec_section.data() + (size_t)(1 + f) * hidden_size;
                     for (int32_t h = 0; h < hidden_size; ++h) dst[h] = tts_pad_embed[h];
-                    continue;
                 }
-                float * dst = icl_codec_section.data() + (size_t)(1 + f) * hidden_size;
-
-                // sum codebook embeddings for this frame
+            } else {
+                std::vector<int32_t> cb_codes(n_ref_frames);
+                std::vector<float> rows; // n_ref_frames * hidden_size
                 for (int cb = 0; cb < cfg.n_codebooks; ++cb) {
-                    int32_t code = ref_codes[f * cfg.n_codebooks + cb];
+                    struct ggml_tensor * embd_table = nullptr;
                     if (cb == 0) {
-                        if (!lookup_single_embedding_row(model_.codec_embd, code, embd_row.data())) {
-                            return false;
-                        }
+                        embd_table = model_.codec_embd;
                     } else {
-                        if ((int)model_.code_pred_embd.size() < cb) continue;
-                        if (!lookup_single_embedding_row(model_.code_pred_embd[cb - 1], code, embd_row.data())) {
-                            return false;
-                        }
+                        if ((int) model_.code_pred_embd.size() < cb) continue;
+                        embd_table = model_.code_pred_embd[cb - 1];
                     }
-                    for (int32_t h = 0; h < hidden_size; ++h) {
-                        dst[h] += embd_row[h];
+                    for (int32_t f = 0; f < n_ref_frames; ++f) {
+                        cb_codes[f] = ref_codes[f * cfg.n_codebooks + cb];
+                    }
+                    char in_name[32], out_name[32];
+                    snprintf(in_name,  sizeof(in_name),  "inp_icl_cb%d", cb);
+                    snprintf(out_name, sizeof(out_name), "icl_cb%d_rows", cb);
+                    if (!lookup_embedding_rows(embd_table, cb_codes.data(),
+                                               n_ref_frames, in_name, out_name, rows)) {
+                        return false;
+                    }
+                    // Sum into icl_codec_section (offset by 1 for codec_bos slot).
+                    for (int32_t f = 0; f < n_ref_frames; ++f) {
+                        float * dst       = icl_codec_section.data() + (size_t)(1 + f) * hidden_size;
+                        const float * src = rows.data()              + (size_t) f * hidden_size;
+                        for (int32_t h = 0; h < hidden_size; ++h) dst[h] += src[h];
                     }
                 }
-
-                // overlay with tts_pad_embed
-                for (int32_t h = 0; h < hidden_size; ++h) {
-                    dst[h] += tts_pad_embed[h];
+                // Overlay with tts_pad_embed (added once per frame, not per codebook).
+                for (int32_t f = 0; f < n_ref_frames; ++f) {
+                    float * dst = icl_codec_section.data() + (size_t)(1 + f) * hidden_size;
+                    for (int32_t h = 0; h < hidden_size; ++h) dst[h] += tts_pad_embed[h];
                 }
             }
 
