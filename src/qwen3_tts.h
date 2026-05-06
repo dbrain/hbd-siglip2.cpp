@@ -196,6 +196,7 @@ public:
 
     // Query model info
     int32_t get_hidden_size() const;
+    int32_t get_sample_rate() const;
     const std::string & get_model_type() const;
     const std::vector<std::string> & get_speaker_names() const;
     const std::vector<int32_t> & get_speaker_ids() const;

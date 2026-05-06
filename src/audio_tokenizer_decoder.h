@@ -23,10 +23,13 @@ struct audio_decoder_config {
     int32_t n_heads = 16;               // Attention heads in pre-transformer
     int32_t ffn_dim = 1024;             // FFN intermediate dimension
     int32_t decoder_dim = 1536;         // Initial decoder dimension
-    int32_t upsample_rates[4] = {8, 5, 4, 3};  // Total: 480x upsampling
-    // per-decoder-block output channels, populated at load time from the
-    // transposed conv weights. used to size streaming-decode ring buffers.
-    int32_t dec_out_channels[4] = {0, 0, 0, 0};
+    // Per-decoder-block upsample stride. Sized at load time from the GGUF's
+    // `qwen3-tts-tokenizer.upsample_rates` metadata. V1 vocoder = {8,5,4,3}
+    // (4 blocks, 24 kHz cascade); V2 = {8,5,4,3,2} (5 blocks, 48 kHz).
+    std::vector<int32_t> upsample_rates;
+    // Per-decoder-block output channels, populated at load time from the
+    // transposed conv weights. Used to size streaming-decode ring buffers.
+    std::vector<int32_t> dec_out_channels;
     float rms_norm_eps = 1e-5f;
     float rope_theta = 10000.0f;
 };
@@ -124,20 +127,23 @@ struct audio_decoder_model {
     struct ggml_tensor * pre_conv_b = nullptr;
     
     // Decoder blocks
-    // Block 0: Initial conv [7, 1024, 1536]
+    // Block 0: Initial conv [7, latent_dim, decoder_dim]
     struct ggml_tensor * dec0_conv_w = nullptr;
     struct ggml_tensor * dec0_conv_b = nullptr;
-    
-    // Blocks 1-4: Snake + ConvTranspose + 3 residual blocks
-    decoder_block dec_blocks[4];
-    
-    // Block 5: Final snake activation
-    struct ggml_tensor * dec5_snake_alpha = nullptr;
-    struct ggml_tensor * dec5_snake_beta = nullptr;
-    
-    // Block 6: Output conv [7, 96, 1]
-    struct ggml_tensor * dec6_conv_w = nullptr;
-    struct ggml_tensor * dec6_conv_b = nullptr;
+
+    // Snake + ConvTranspose + 3 residual blocks per dec block.
+    // V1 has 4 blocks (24 kHz), V2 has 5 blocks (48 kHz).
+    std::vector<decoder_block> dec_blocks;
+
+    // Final snake activation. Lives at index `dec_blocks.size()+1` in the
+    // upstream `decoder.decoder.{N}` HF naming (V1: 5, V2: 6).
+    struct ggml_tensor * final_snake_alpha = nullptr;
+    struct ggml_tensor * final_snake_beta = nullptr;
+
+    // Output conv 1ch. Lives at index `dec_blocks.size()+2` in HF naming
+    // (V1: 6, V2: 7). Input channels = last dec block's out_channels.
+    struct ggml_tensor * final_conv_w = nullptr;
+    struct ggml_tensor * final_conv_b = nullptr;
     
     // GGML context for tensor metadata
     struct ggml_context * ctx = nullptr;

@@ -51,9 +51,70 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
         return false;
     }
     
-    model_.config.sample_rate = loader.get_u32("qwen3-tts.tokenizer.sample_rate", 24000);
-    model_.config.n_codebooks = loader.get_u32("qwen3-tts.tokenizer.num_codebooks", 16);
-    model_.config.codebook_size = loader.get_u32("qwen3-tts.tokenizer.codebook_size", 2048);
+    // Metadata keys: convert_tokenizer_to_gguf.py writes them under the
+    // `qwen3-tts-tokenizer.*` namespace (matches general.architecture).
+    // The original C++ reader read `qwen3-tts.tokenizer.*` and silently fell
+    // back to defaults — V1 happens to match its defaults so nothing
+    // visibly broke; V2 needs the real values, so try the canonical prefix
+    // first and fall back to the legacy one.
+    auto get_u32 = [&](const char * canonical, const char * legacy, int32_t dflt) {
+        int32_t v = loader.get_u32(canonical, INT32_MIN);
+        if (v != INT32_MIN) return v;
+        v = loader.get_u32(legacy, INT32_MIN);
+        if (v != INT32_MIN) return v;
+        return dflt;
+    };
+    model_.config.sample_rate   = get_u32("qwen3-tts-tokenizer.sample_rate",   "qwen3-tts.tokenizer.sample_rate",   24000);
+    model_.config.n_codebooks   = get_u32("qwen3-tts-tokenizer.num_codebooks", "qwen3-tts.tokenizer.num_codebooks", 16);
+    model_.config.codebook_size = get_u32("qwen3-tts-tokenizer.codebook_size", "qwen3-tts.tokenizer.codebook_size", 2048);
+
+    // Pull per-block upsample strides from the GGUF metadata.
+    //   V1 (24 kHz cascade) writes 4 entries: {8, 5, 4, 3}
+    //   V2 (48 kHz cascade) writes 5 entries: {8, 5, 4, 3, 2}
+    // Older V1 GGUFs (e.g. khimaros' release) may lack this key — fall back
+    // to the V1 values so existing deployments keep loading.
+    {
+        struct gguf_context * gc = loader.get_ctx();
+        int up_id = gguf_find_key(gc, "qwen3-tts-tokenizer.upsample_rates");
+        if (up_id < 0) up_id = gguf_find_key(gc, "qwen3-tts.tokenizer.upsample_rates");
+        if (up_id >= 0 && gguf_get_kv_type(gc, up_id) == GGUF_TYPE_ARRAY) {
+            const enum gguf_type elt = gguf_get_arr_type(gc, up_id);
+            const int64_t n = gguf_get_arr_n(gc, up_id);
+            const void * data = gguf_get_arr_data(gc, up_id);
+            model_.config.upsample_rates.clear();
+            model_.config.upsample_rates.reserve((size_t) n);
+            for (int64_t i = 0; i < n; ++i) {
+                int32_t v = 0;
+                switch (elt) {
+                    case GGUF_TYPE_UINT8:  v = ((const uint8_t  *) data)[i]; break;
+                    case GGUF_TYPE_INT8:   v = ((const int8_t   *) data)[i]; break;
+                    case GGUF_TYPE_UINT16: v = ((const uint16_t *) data)[i]; break;
+                    case GGUF_TYPE_INT16:  v = ((const int16_t  *) data)[i]; break;
+                    case GGUF_TYPE_UINT32: v = (int32_t) ((const uint32_t *) data)[i]; break;
+                    case GGUF_TYPE_INT32:  v = ((const int32_t  *) data)[i]; break;
+                    case GGUF_TYPE_UINT64: v = (int32_t) ((const uint64_t *) data)[i]; break;
+                    case GGUF_TYPE_INT64:  v = (int32_t) ((const int64_t  *) data)[i]; break;
+                    default: break;
+                }
+                if (v > 0) model_.config.upsample_rates.push_back(v);
+            }
+        }
+        if (model_.config.upsample_rates.empty()) {
+            model_.config.upsample_rates = {8, 5, 4, 3};  // V1 fallback
+        }
+    }
+    const int n_dec_blocks = (int) model_.config.upsample_rates.size();
+    model_.dec_blocks.assign(n_dec_blocks, decoder_block{});
+    model_.config.dec_out_channels.assign(n_dec_blocks, 0);
+    // Final-snake / final-conv live at upstream HF indices N+1 / N+2.
+    char final_snake_alpha_name[64];
+    char final_snake_beta_name[64];
+    char final_conv_w_name[64];
+    char final_conv_b_name[64];
+    snprintf(final_snake_alpha_name, sizeof(final_snake_alpha_name), "tok_dec.dec.%d.snake.alpha", n_dec_blocks + 1);
+    snprintf(final_snake_beta_name,  sizeof(final_snake_beta_name),  "tok_dec.dec.%d.snake.beta",  n_dec_blocks + 1);
+    snprintf(final_conv_w_name, sizeof(final_conv_w_name), "tok_dec.dec.%d.conv.weight", n_dec_blocks + 2);
+    snprintf(final_conv_b_name, sizeof(final_conv_b_name), "tok_dec.dec.%d.conv.bias",   n_dec_blocks + 2);
     
     int64_t n_tensors = loader.get_n_tensors();
     int dec_tensor_count = 0;
@@ -120,10 +181,10 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
         else if (sname == "tok_dec.pre_tfm.output_proj.bias") model_.pre_tfm_output_proj_b = tensor;
         else if (sname == "tok_dec.dec.0.conv.weight") model_.dec0_conv_w = tensor;
         else if (sname == "tok_dec.dec.0.conv.bias") model_.dec0_conv_b = tensor;
-        else if (sname == "tok_dec.dec.5.snake.alpha") model_.dec5_snake_alpha = tensor;
-        else if (sname == "tok_dec.dec.5.snake.beta") model_.dec5_snake_beta = tensor;
-        else if (sname == "tok_dec.dec.6.conv.weight") model_.dec6_conv_w = tensor;
-        else if (sname == "tok_dec.dec.6.conv.bias") model_.dec6_conv_b = tensor;
+        else if (sname == final_snake_alpha_name) model_.final_snake_alpha = tensor;
+        else if (sname == final_snake_beta_name)  model_.final_snake_beta  = tensor;
+        else if (sname == final_conv_w_name)      model_.final_conv_w      = tensor;
+        else if (sname == final_conv_b_name)      model_.final_conv_b      = tensor;
         else if (sname.find("pre_tfm.blk.") != std::string::npos) {
             int blk_idx;
             if (sscanf(name, "tok_dec.pre_tfm.blk.%d.", &blk_idx) == 1 && blk_idx >= 0 && blk_idx < 8) {
@@ -228,54 +289,54 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
                 if (blk_idx >= 0 && blk_idx < 8) model_.pre_tfm_layers[blk_idx].ffn_scale = tensor;
             }
             else if (MATCH1("tok_dec.dec.%d.snake.alpha", blk_idx)) {
-                if (blk_idx >= 1 && blk_idx <= 4) model_.dec_blocks[blk_idx-1].snake_alpha = tensor;
+                if (blk_idx >= 1 && blk_idx <= n_dec_blocks) model_.dec_blocks[blk_idx-1].snake_alpha = tensor;
             }
             else if (MATCH1("tok_dec.dec.%d.snake.beta", blk_idx)) {
-                if (blk_idx >= 1 && blk_idx <= 4) model_.dec_blocks[blk_idx-1].snake_beta = tensor;
+                if (blk_idx >= 1 && blk_idx <= n_dec_blocks) model_.dec_blocks[blk_idx-1].snake_beta = tensor;
             }
             else if (MATCH1("tok_dec.dec.%d.conv_t.weight", blk_idx)) {
-                if (blk_idx >= 1 && blk_idx <= 4) model_.dec_blocks[blk_idx-1].conv_t_w = tensor;
+                if (blk_idx >= 1 && blk_idx <= n_dec_blocks) model_.dec_blocks[blk_idx-1].conv_t_w = tensor;
             }
             else if (MATCH1("tok_dec.dec.%d.conv_t.bias", blk_idx)) {
-                if (blk_idx >= 1 && blk_idx <= 4) model_.dec_blocks[blk_idx-1].conv_t_b = tensor;
+                if (blk_idx >= 1 && blk_idx <= n_dec_blocks) model_.dec_blocks[blk_idx-1].conv_t_b = tensor;
             }
             else if (MATCH2("tok_dec.dec.%d.res.%d.act1.alpha", blk_idx, res_idx)) {
-                if (blk_idx >= 1 && blk_idx <= 4 && res_idx >= 2 && res_idx <= 4) {
+                if (blk_idx >= 1 && blk_idx <= n_dec_blocks && res_idx >= 2 && res_idx <= 4) {
                     model_.dec_blocks[blk_idx-1].res[res_idx-2].act1_alpha = tensor;
                 }
             }
             else if (MATCH2("tok_dec.dec.%d.res.%d.act1.beta", blk_idx, res_idx)) {
-                if (blk_idx >= 1 && blk_idx <= 4 && res_idx >= 2 && res_idx <= 4) {
+                if (blk_idx >= 1 && blk_idx <= n_dec_blocks && res_idx >= 2 && res_idx <= 4) {
                     model_.dec_blocks[blk_idx-1].res[res_idx-2].act1_beta = tensor;
                 }
             }
             else if (MATCH2("tok_dec.dec.%d.res.%d.conv1.weight", blk_idx, res_idx)) {
-                if (blk_idx >= 1 && blk_idx <= 4 && res_idx >= 2 && res_idx <= 4) {
+                if (blk_idx >= 1 && blk_idx <= n_dec_blocks && res_idx >= 2 && res_idx <= 4) {
                     model_.dec_blocks[blk_idx-1].res[res_idx-2].conv1_w = tensor;
                 }
             }
             else if (MATCH2("tok_dec.dec.%d.res.%d.conv1.bias", blk_idx, res_idx)) {
-                if (blk_idx >= 1 && blk_idx <= 4 && res_idx >= 2 && res_idx <= 4) {
+                if (blk_idx >= 1 && blk_idx <= n_dec_blocks && res_idx >= 2 && res_idx <= 4) {
                     model_.dec_blocks[blk_idx-1].res[res_idx-2].conv1_b = tensor;
                 }
             }
             else if (MATCH2("tok_dec.dec.%d.res.%d.act2.alpha", blk_idx, res_idx)) {
-                if (blk_idx >= 1 && blk_idx <= 4 && res_idx >= 2 && res_idx <= 4) {
+                if (blk_idx >= 1 && blk_idx <= n_dec_blocks && res_idx >= 2 && res_idx <= 4) {
                     model_.dec_blocks[blk_idx-1].res[res_idx-2].act2_alpha = tensor;
                 }
             }
             else if (MATCH2("tok_dec.dec.%d.res.%d.act2.beta", blk_idx, res_idx)) {
-                if (blk_idx >= 1 && blk_idx <= 4 && res_idx >= 2 && res_idx <= 4) {
+                if (blk_idx >= 1 && blk_idx <= n_dec_blocks && res_idx >= 2 && res_idx <= 4) {
                     model_.dec_blocks[blk_idx-1].res[res_idx-2].act2_beta = tensor;
                 }
             }
             else if (MATCH2("tok_dec.dec.%d.res.%d.conv2.weight", blk_idx, res_idx)) {
-                if (blk_idx >= 1 && blk_idx <= 4 && res_idx >= 2 && res_idx <= 4) {
+                if (blk_idx >= 1 && blk_idx <= n_dec_blocks && res_idx >= 2 && res_idx <= 4) {
                     model_.dec_blocks[blk_idx-1].res[res_idx-2].conv2_w = tensor;
                 }
             }
             else if (MATCH2("tok_dec.dec.%d.res.%d.conv2.bias", blk_idx, res_idx)) {
-                if (blk_idx >= 1 && blk_idx <= 4 && res_idx >= 2 && res_idx <= 4) {
+                if (blk_idx >= 1 && blk_idx <= n_dec_blocks && res_idx >= 2 && res_idx <= 4) {
                     model_.dec_blocks[blk_idx-1].res[res_idx-2].conv2_b = tensor;
                 }
             }
@@ -302,7 +363,7 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
         }
     }
     
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < n_dec_blocks; ++i) {
         model_.dec_blocks[i].res[0].dilation = 1;
         model_.dec_blocks[i].res[1].dilation = 3;
         model_.dec_blocks[i].res[2].dilation = 9;
@@ -312,15 +373,28 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
     // ggml conv_transpose_1d weight layout is [kernel, out_ch, in_ch], so
     // ne[1] is the output channel count. used by streaming decode for ring
     // buffer sizing.
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < n_dec_blocks; ++i) {
         if (model_.dec_blocks[i].conv_t_w) {
             model_.config.dec_out_channels[i] =
                 (int32_t) model_.dec_blocks[i].conv_t_w->ne[1];
         }
     }
-    fprintf(stderr, "  AudioTokenizerDecoder dec_out_channels: [%d, %d, %d, %d]\n",
-            model_.config.dec_out_channels[0], model_.config.dec_out_channels[1],
-            model_.config.dec_out_channels[2], model_.config.dec_out_channels[3]);
+    {
+        std::string ch_str = "[";
+        for (int i = 0; i < n_dec_blocks; ++i) {
+            if (i) ch_str += ", ";
+            ch_str += std::to_string(model_.config.dec_out_channels[i]);
+        }
+        ch_str += "]";
+        std::string up_str = "[";
+        for (int i = 0; i < n_dec_blocks; ++i) {
+            if (i) up_str += ", ";
+            up_str += std::to_string(model_.config.upsample_rates[i]);
+        }
+        up_str += "]";
+        fprintf(stderr, "  AudioTokenizerDecoder n_dec_blocks=%d upsample_rates=%s dec_out_channels=%s sample_rate=%d\n",
+                n_dec_blocks, up_str.c_str(), ch_str.c_str(), model_.config.sample_rate);
+    }
     
     // Normalize codebooks using GPU-safe memory access pattern.
     // Download tensor data to host, normalize on CPU, then upload back.
@@ -463,15 +537,19 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
     } else if (want_named) {
         ggml_backend_sched_set_eval_callback(state_.sched,
             [](struct ggml_tensor * t, bool ask, void * /*ud*/) -> bool {
-                static const std::array<const char *, 27> markers = {
+                // V1 final-snake / final-conv emit dec5/dec6; V2 (5 dec
+                // blocks) emits dec5/dec6/dec7. Both sets are listed so
+                // the named profile works for either architecture.
+                static const std::array<const char *, 33> markers = {
                     "vq_output", "pre_conv_output", "pre_tfm_output",
                     "upsample_output", "dec0_output",
                     "dec1_output", "dec2_output", "dec3_output", "dec4_output",
-                    "dec5_output", "dec6_output",
+                    "dec5_output", "dec6_output", "dec7_output",
                     "dec1_after_convt", "dec1_after_res0", "dec1_after_res1", "dec1_after_res2",
                     "dec2_after_convt", "dec2_after_res0", "dec2_after_res1", "dec2_after_res2",
                     "dec3_after_convt", "dec3_after_res0", "dec3_after_res1", "dec3_after_res2",
                     "dec4_after_convt", "dec4_after_res0", "dec4_after_res1", "dec4_after_res2",
+                    "dec5_after_convt", "dec5_after_res0", "dec5_after_res1", "dec5_after_res2",
                 };
                 bool is_marker = false;
                 for (const char * m : markers) { if (t->name[0] && std::strcmp(t->name, m) == 0) { is_marker = true; break; } }
@@ -1061,29 +1139,38 @@ struct ggml_cgraph * AudioTokenizerDecoder::build_graph(int32_t n_frames, int32_
      
      ggml_set_name(cur, "dec0_output");
      
-     int upsample_rates[4] = {8, 5, 4, 3};
-     for (int i = 0; i < 4; ++i) {
-         cur = apply_decoder_block(ctx0, cur, model_.dec_blocks[i], upsample_rates[i], i + 1);
+     const int n_blocks = (int) model_.dec_blocks.size();
+     for (int i = 0; i < n_blocks; ++i) {
+         cur = apply_decoder_block(ctx0, cur, model_.dec_blocks[i],
+                                   cfg.upsample_rates[i], i + 1);
          char name[32];
          snprintf(name, sizeof(name), "dec%d_output", i + 1);
          ggml_set_name(cur, name);
      }
-     
-     if (model_.dec5_snake_alpha) {
-         cur = apply_snake(ctx0, cur, model_.dec5_snake_alpha, model_.dec5_snake_beta);
+
+     if (model_.final_snake_alpha) {
+         cur = apply_snake(ctx0, cur, model_.final_snake_alpha, model_.final_snake_beta);
      }
-     
-     ggml_set_name(cur, "dec5_output");
-     
+
      {
-         const int kernel = (int) model_.dec6_conv_w->ne[0];
-         cur = ggml_conv_1d_direct(ctx0, model_.dec6_conv_w, cur, 1, kernel - 1, 0, 1);
+         char name[32];
+         snprintf(name, sizeof(name), "dec%d_output", n_blocks + 1);
+         ggml_set_name(cur, name);
      }
-     if (model_.dec6_conv_b) {
-         cur = ggml_add(ctx0, cur, ggml_reshape_3d(ctx0, model_.dec6_conv_b, 1, 1, 1));
+
+     {
+         const int kernel = (int) model_.final_conv_w->ne[0];
+         cur = ggml_conv_1d_direct(ctx0, model_.final_conv_w, cur, 1, kernel - 1, 0, 1);
      }
-     
-     ggml_set_name(cur, "dec6_output");
+     if (model_.final_conv_b) {
+         cur = ggml_add(ctx0, cur, ggml_reshape_3d(ctx0, model_.final_conv_b, 1, 1, 1));
+     }
+
+     {
+         char name[32];
+         snprintf(name, sizeof(name), "dec%d_output", n_blocks + 2);
+         ggml_set_name(cur, name);
+     }
     
     cur = ggml_tanh(ctx0, cur);
     

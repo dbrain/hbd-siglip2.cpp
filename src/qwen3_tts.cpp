@@ -958,6 +958,10 @@ int32_t Qwen3TTS::get_hidden_size() const {
     return transformer_.get_config().hidden_size;
 }
 
+int32_t Qwen3TTS::get_sample_rate() const {
+    return audio_decoder_.get_config().sample_rate;
+}
+
 const std::string & Qwen3TTS::get_model_type() const {
     return transformer_.get_config().model_type;
 }

@@ -1285,7 +1285,8 @@ int main(int argc, char ** argv) {
                  voice_ref_codes = std::move(voice_ref_codes),
                  voice_n_ref_frames,
                  stream_batch_size, stream_first_batch_size, is_sse, is_wav,
-                 synth_mutex = &synth_mutex, sample_rate_fallback = 24000,
+                 synth_mutex = &synth_mutex,
+                 sample_rate_fallback = tts.get_sample_rate(),
                  voice = voice, warmup_path = warmup_path, model_id = model_id,
                  &ensure_loaded_locked]
                 (size_t /*offset*/, httplib::DataSink & sink) mutable -> bool {

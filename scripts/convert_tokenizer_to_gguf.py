@@ -41,43 +41,39 @@ logger = logging.getLogger(__name__)
 class Qwen3TTSTokenizerConverter:
     """Converter for Qwen3-TTS-Tokenizer-12Hz model to GGUF format."""
 
-    # Direct tensor name mappings
-    TENSOR_MAP = {
+    # Direct tensor name mappings shared by V1 and V2 architectures.
+    # V1 final-snake/conv (HF idx 5/6) and V2 (HF idx 6/7) are added in
+    # __init__ once the architecture is identified — see _final_idx_map.
+    TENSOR_MAP_BASE = {
         # Encoder - downsample conv
         "encoder.downsample.conv.weight": "tok_enc.downsample.weight",
-        
+
         # Encoder quantizer projections
         "encoder.quantizer.acoustic_residual_vector_quantizer.input_proj.weight": "tok_enc.vq_acoustic.input_proj.weight",
         "encoder.quantizer.acoustic_residual_vector_quantizer.output_proj.weight": "tok_enc.vq_acoustic.output_proj.weight",
         "encoder.quantizer.semantic_residual_vector_quantizer.input_proj.weight": "tok_enc.vq_semantic.input_proj.weight",
         "encoder.quantizer.semantic_residual_vector_quantizer.output_proj.weight": "tok_enc.vq_semantic.output_proj.weight",
-        
+
         # Decoder pre-conv and output
         "decoder.pre_conv.conv.bias": "tok_dec.pre_conv.bias",
         "decoder.pre_conv.conv.weight": "tok_dec.pre_conv.weight",
-        
+
         # Decoder pre-transformer projections
         "decoder.pre_transformer.input_proj.bias": "tok_dec.pre_tfm.input_proj.bias",
         "decoder.pre_transformer.input_proj.weight": "tok_dec.pre_tfm.input_proj.weight",
         "decoder.pre_transformer.output_proj.bias": "tok_dec.pre_tfm.output_proj.bias",
         "decoder.pre_transformer.output_proj.weight": "tok_dec.pre_tfm.output_proj.weight",
         "decoder.pre_transformer.norm.weight": "tok_dec.pre_tfm.norm.weight",
-        
+
         # Decoder quantizer projections
         "decoder.quantizer.rvq_first.input_proj.weight": "tok_dec.vq_first.input_proj.weight",
         "decoder.quantizer.rvq_first.output_proj.weight": "tok_dec.vq_first.output_proj.weight",
         "decoder.quantizer.rvq_rest.input_proj.weight": "tok_dec.vq_rest.input_proj.weight",
         "decoder.quantizer.rvq_rest.output_proj.weight": "tok_dec.vq_rest.output_proj.weight",
-        
-        # Decoder initial conv (index 0)
+
+        # Decoder initial conv (HF index 0)
         "decoder.decoder.0.conv.weight": "tok_dec.dec.0.conv.weight",
         "decoder.decoder.0.conv.bias": "tok_dec.dec.0.conv.bias",
-        
-        # Decoder final snake activation (index 5) and output conv (index 6)
-        "decoder.decoder.5.alpha": "tok_dec.dec.5.snake.alpha",
-        "decoder.decoder.5.beta": "tok_dec.dec.5.snake.beta",
-        "decoder.decoder.6.conv.weight": "tok_dec.dec.6.conv.weight",
-        "decoder.decoder.6.conv.bias": "tok_dec.dec.6.conv.bias",
     }
 
     # Regex patterns for layer-specific tensors
@@ -179,6 +175,21 @@ class Qwen3TTSTokenizerConverter:
         self.config = self._load_config()
         self._extract_params()
 
+        # V1 (Qwen3TTSTokenizerModel)   = 4 dec blocks, final-snake at HF idx 5, final-conv at idx 6.
+        # V2 (Qwen3TTSTokenizerV2Model) = 5 dec blocks, final-snake at HF idx 6, final-conv at idx 7.
+        # The number of dec blocks is len(decoder_config.upsample_rates) — 4 in V1, 5 in V2.
+        # Build TENSOR_MAP per-instance with the correct final indices for this arch.
+        self.n_dec_blocks = len(self.upsample_rates)
+        self.TENSOR_MAP = dict(self.TENSOR_MAP_BASE)
+        final_snake_hf_idx = self.n_dec_blocks + 1  # 5 (V1) or 6 (V2)
+        final_conv_hf_idx  = self.n_dec_blocks + 2  # 6 (V1) or 7 (V2)
+        # Final-snake/conv stay numbered with HF indices in the GGUF too —
+        # the C++ loader looks them up dynamically by `n_dec_blocks + 1/2`.
+        self.TENSOR_MAP[f"decoder.decoder.{final_snake_hf_idx}.alpha"] = f"tok_dec.dec.{final_snake_hf_idx}.snake.alpha"
+        self.TENSOR_MAP[f"decoder.decoder.{final_snake_hf_idx}.beta"]  = f"tok_dec.dec.{final_snake_hf_idx}.snake.beta"
+        self.TENSOR_MAP[f"decoder.decoder.{final_conv_hf_idx}.conv.weight"] = f"tok_dec.dec.{final_conv_hf_idx}.conv.weight"
+        self.TENSOR_MAP[f"decoder.decoder.{final_conv_hf_idx}.conv.bias"]   = f"tok_dec.dec.{final_conv_hf_idx}.conv.bias"
+
     def _load_config(self) -> dict[str, Any]:
         """Load model configuration from config.json."""
         config_path = self.input_dir / "config.json"
@@ -212,12 +223,18 @@ class Qwen3TTSTokenizerConverter:
         self.decoder_num_quantizers = decoder_config.get("num_quantizers", 16)
         self.decoder_semantic_codebook_size = decoder_config.get("semantic_codebook_size", 4096)
 
-        # Audio parameters
-        self.sample_rate = self.config.get("input_sample_rate", 24000)
+        # Audio parameters. V2 (Qwen3TTSTokenizerV2Model) adds an
+        # `output_sample_rate: 48000` field; V1 omits it (output == input).
+        self.sample_rate = self.config.get(
+            "output_sample_rate",
+            self.config.get("input_sample_rate", 24000),
+        )
         self.frame_rate = encoder_config.get("_frame_rate", 12.5)
         self.upsample_rates = decoder_config.get("upsample_rates", [8, 5, 4, 3])
 
-        self.model_name = "Qwen3-TTS-Tokenizer-12Hz"
+        archs = self.config.get("architectures", [])
+        self.is_v2 = any("V2" in a for a in archs)
+        self.model_name = "Qwen3-TTS-Tokenizer-12Hz" + ("-48kHz" if self.is_v2 else "")
 
     def _map_tensor_name(self, hf_name: str) -> str | None:
         """Map HuggingFace tensor name to GGML convention."""
