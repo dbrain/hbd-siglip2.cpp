@@ -5,18 +5,18 @@
 > ⚠️ Robot driven guff ⚠️, I pushed ideas/what if's and let the robot (Claude) summon these changes into existence. I'm technically a software engineer but I may as well have been a sentient potato with this fork.
 > 
 > What I do know:
-> - The parent fork was giving me 0.1 RTS, which is surely not everyones experience
-> - Pytorch was giving me 0.8 RTS after a bit of fondling
+> - The parent fork was giving me 0.1 RTS on a RTX 3060, which is surely not everyones experience
+> - Pytorch was giving me 0.9~ RTS after a bit of fondling
 > - faster-qwen3-tts 1.8 RTS on this hardware
-> - This fork is now giving me 2.8ish RTS
+> - This fork is now giving me 3.3ish RTS with Q8 - 2.5ish with Q4_K_M
 >
 > What it adds that I need for my low low VRAM:
 > - Model load/unload/timeout
 > - Ability to clone voices using the speaker encoder from base with the VoiceDesign model - either using Base model file or an extracted speaker encoder only (I'll publish at some point~)
-> - Streaming with 100-200ms TTFA
+> - Streaming with 30-40ms TTFA (slower with cold voice loading - 500ms~)
 > - Ability to save voices in a "probably flakey way that won't survive upgrades"
 > - Tried to minimise VRAM - but I don't know I have original numbers anymore - rounding up it's around 3.5GB peak peak
-> - Q4_K_M model I'll publish at some point (nothing special, just quanted from F16) drops it to something like 2.2GB peak with TBH a "hard to tell if its worse" quality a bit of a drop RTF (2.8ish -> 2.1ish)
+> - Q4_K_M model I'll publish at some point (nothing special, just quanted from F16) drops it to something like 2.2GB peak with TBH a "hard to tell if its worse" quality a bit of a drop RTF (3.3ish -> 2.4ish)
 >
 > YMMV, "works well" on my shoddy RTX 3060 12GB / "AMD CPU with a 5 in it" / RAM that I needed to down the frequency of because it kept crashing gaming PC now server that I bought from "some guy on facebook marketplace" when I thought it'd be funny to plan with local LLMs/ASR/.. vision? for a project that apparently now does everything.
 >
