@@ -3277,7 +3277,18 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     tts_timing timing = {};
     auto t_gen_start = clk::now();
     auto t0 = t_gen_start, t1 = t_gen_start;
+    // gcc-13's -Wdangling-pointer flags this because `timing` is a stack
+    // local and `timing_` is a member. We null `timing_` before generate()
+    // returns (search "timing_ = nullptr" below), so the pointer is never
+    // dereferenced after this function exits — the warning is benign here.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdangling-pointer="
+#endif
     timing_ = &timing;
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 #endif
 
     if (!model_.ctx) {
