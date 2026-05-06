@@ -1150,12 +1150,17 @@ int main(int argc, char ** argv) {
         int         max_audio_tokens = body.value("max_audio_tokens", default_max_audio_tokens);
         float       repetition_penalty = body.value("repetition_penalty", sp.repetition_penalty);
         int64_t     seed               = body.value("seed", sp.seed);
-        // Server-side streaming defaults. Both halve VRAM peak (vocoder
-        // graph/scratch bounded per batch) and improve TTFA, with no
-        // measurable RTFA cost. Built-in defaults below match prod settings;
-        // env overrides them; per-request body always wins. Clients who
-        // want non-streaming explicitly set stream_batch_size=0 in the body.
-        int default_stream_batch_size       = 60;
+        // Server-side streaming defaults. The vocoder rebuilds its full
+        // cascade graph per batch, and every cascade intermediate is sized
+        // `batch * stride^cascade * channels * 4 bytes`. So sched_cu scales
+        // ~linearly with batch: 60 ≈ 288 MiB, 30 ≈ 144 MiB, 20 ≈ 96 MiB
+        // (V1 24 kHz, RTX 3060). Default 30 is the knee — within bench-noise
+        // RTF of 60 (~0.4 % avg) for a 144 MiB sched_cu cut. Push lower if
+        // VRAM-pressed; expect ~2 % RTF cost at 20 and below.
+        // first_batch_size=1 keeps TTFB at one-codec-frame regardless of
+        // steady-state batch. Per-request body always wins; env overrides
+        // the built-in default.
+        int default_stream_batch_size       = 30;
         int default_stream_first_batch_size = 1;
         if (const char * env = std::getenv("QWEN3_TTS_DEFAULT_STREAM_BATCH_SIZE")) {
             default_stream_batch_size = std::atoi(env);

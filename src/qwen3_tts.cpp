@@ -666,8 +666,26 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
                             (long long)(get_time_ms() - t_warmup_start));
                 }
             } else {
+                // Chunk the warmup decode at the steady-state batch size so
+                // its graph shape matches the synth's chunks. Without this,
+                // a single n_ref_frames-wide cascade graph dominates the
+                // sched arena (e.g. 96 ref frames → ~480 MiB sched_cu) and
+                // pins the union for the rest of the process. State is
+                // n_past-driven so chunked warmup is bit-identical to a
+                // single-shot warmup; only the discarded PCM stream gets
+                // re-spliced, which we don't keep anyway.
+                int chunk = stream->batch_size > 0 ? stream->batch_size : 30;
                 std::vector<float> warmup_pcm;
-                if (!audio_decoder_.stream_decode(ref_codes, n_ref_frames, warmup_pcm)) {
+                bool ok = true;
+                for (int off = 0; off < n_ref_frames; off += chunk) {
+                    const int n = std::min(chunk, n_ref_frames - off);
+                    if (!audio_decoder_.stream_decode(
+                            ref_codes + (size_t) off * n_cb, n, warmup_pcm)) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (!ok) {
                     result.error_msg = "Failed to warm-up vocoder with ref codes: " + audio_decoder_.get_error();
                     return result;
                 }
@@ -675,8 +693,8 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
                 audio_decoder_.capture_stream_state(snap);
                 icl_cache_.emplace(hash, std::move(snap));
                 if (params.print_timing) {
-                    fprintf(stderr, "  ICL warmup: cache MISS (hash=%016llx, %d frames) — decoded + cached in %lld ms\n",
-                            (unsigned long long) hash, n_ref_frames,
+                    fprintf(stderr, "  ICL warmup: cache MISS (hash=%016llx, %d frames, chunk=%d) — decoded + cached in %lld ms\n",
+                            (unsigned long long) hash, n_ref_frames, chunk,
                             (long long)(get_time_ms() - t_warmup_start));
                 }
                 // discard warmup_pcm — downstream only sees post-ref PCM
