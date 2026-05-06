@@ -130,8 +130,8 @@ Qwen3TtsAudio * qwen3_tts_synthesize(
 }
 
 int32_t qwen3_tts_sample_rate(const Qwen3Tts * tts) {
-    (void)tts;
-    return 24000;
+    if (!tts) return 24000;
+    return tts->engine.get_sample_rate();
 }
 
 void qwen3_tts_free_audio(Qwen3TtsAudio * audio) {
