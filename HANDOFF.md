@@ -85,18 +85,23 @@ If you touch the text path or anyone reports text drift, **remember**: HF `Sigli
 
 These are flagged so the next agent doesn't redo them or wastes the same context window.
 
-### Graph caching attempt — partial, blocked, reverted
+### Graph caching attempt — both shared-sched and per-entry-sched paths blocked
 
-Tried to cache `(graph_ctx, gf, input/output tensor pointers)` per shape and reuse across calls so we'd skip the per-call build_block traversal *and* enable CUDA-graph reuse (which needs stable tensor pointers to warm up). On the second call, `ggml_backend_sched_alloc_graph` either silently leaves stale `tensor->data` pointers in place (gallocr's `init_tensor` skips re-allocation when `data != NULL`) or fails the `ggml_backend_tensor_alloc` assertion when both `data` and `buffer` are non-NULL.
+Tried to cache `(graph_ctx, gf, input/output tensor pointers)` per shape and reuse across calls so we'd skip the per-call build_block traversal *and* enable CUDA-graph reuse (which needs stable tensor pointers to warm up).
 
-Workarounds tried:
-1. Iterate `ggml_graph_n_nodes(gf)` + the four cached input pointers, set `data = nullptr`.
-2. Same plus `buffer = nullptr` (fixed the assertion → next call's compute crashed instead with `illegal memory access` on MUL/GELU).
-3. Walk *every* tensor in `graph_ctx` via `ggml_get_first_tensor` / `ggml_get_next_tensor`, clear `data` and `buffer`. Same illegal-memory crash.
+**Variant 1 (shared scheduler):** clear `data`/`buffer` on every cached compute-pool tensor before each `ggml_backend_sched_alloc_graph`. First call works; second call crashes with `illegal memory access` on the first compute kernel (varies — GELU, MUL, etc.).
 
-Diagnosis: `ggml_backend_sched_split_graph` rebuilds an internal `sched->graph` each call (frees `sched->ctx`, creates fresh split-copy tensors at the same context-buffer offsets as last call). `gallocr->node_allocs[]` was indexed by position from the *first* call's `sched->graph.nodes[]`. On the second call, even though the position-indexed offsets are still valid, *something* about the path causes node-internal data writes to land on memory that's been reused for a different tensor. Suspect: `sched->graph.n_leafs` may include split-copies that get assigned overlapping offsets to our cleared cached tensors, but `ggml_gallocr_needs_realloc` returns false because the leaf/node *counts* match, so the path skips the full-reserve fallback that would re-derive offsets.
+**Variant 2 (per-cache-entry scheduler):** each cache entry holds its own `ggml_backend_sched_t`, so the gallocr's `node_allocs[]` table is exclusive to that entry. **Same crash.** The per-sched isolation does NOT fix the bug, which means the issue is *not* multi-shape interference — it's something in how gallocr re-uses its offset table across calls on the same graph.
 
-Path forward for the next agent: either (a) fork ggml's gallocr to add a "force-rebind everything from saved offsets" call that doesn't trigger the `data == NULL` short-circuit, or (b) hold a dedicated `ggml_backend_sched_t` per cache entry (the "small VRAM cost" path the original handoff alluded to) — each entry's gallocr has a stable, non-shared view of `sched->graph` and the offset table can't get confused by other shapes. The (b) approach is probably <1 day of work and unblocks CUDA-graph capture as a free byproduct.
+Diagnosis (deeper): `ggml_backend_sched_split_graph` frees `sched->ctx` and creates fresh split-copy tensors at the same context-buffer offsets each call. Even when their gallocr is per-entry, the internal `sched->graph.nodes[]`/`leafs[]` tables may include split-copy tensors whose pointers cycle each call. `ggml_gallocr_needs_realloc` returns false because the leaf/node *counts* match across calls (graph is identical), so the path skips the full-reserve fallback that would re-derive offsets. But the saved `node_allocs[]` is keyed by position in `sched->graph` — and on the second call, position N may point to a *fresh* split-copy tensor whose `data == NULL`, triggering an allocation at the saved offset that overlaps with one of our cached tensors that *also* has `data` cleared and gets allocated at the same address.
+
+Bottom line: Both variants land Variant-1's crash. The fix isn't "isolate gallocrs" — it's "force the gallocr to re-derive offsets fresh each call when our tensor data is cleared." Practical paths the next agent should explore:
+
+1. **Fork ggml's gallocr** to add an explicit "re-reserve and re-bind" entry point that doesn't skip on `data != NULL`. Probably ~50 LOC in `src/ggml-alloc.c`. The cleanest unlock.
+2. **Skip the scheduler entirely.** Use raw `ggml_backend_graph_compute` with a fixed single-backend path (drop the CPU fallback for vision/text encoder; verify all ops have CUDA kernels — they do). Manually manage one pinned compute buffer with offsets baked in once. More work but no scheduler-internal state to fight.
+3. **Cache the build but not the gf.** Keep `graph_ctx` alive across calls (skipping build_block — the heavy step), call `ggml_graph_clear` and `ggml_build_forward_expand` again from the cached output tensor each call, then alloc/compute/reset as before. Saves the construction cost without reusing gallocr state. Should not crash.
+
+Path 3 is the lowest-risk experiment to start with. (I didn't try it this pass — context budget.)
 
 ### CUDA graphs (`-DGGML_CUDA_GRAPHS=ON`) — built, measured, no-op (slight regression)
 
