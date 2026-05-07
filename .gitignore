@@ -1,5 +1,6 @@
 # Build
 build/
+build-cuda/
 
 # Forensics artifacts (scratch audio / code dumps / soak logs)
 forensics/audio/
