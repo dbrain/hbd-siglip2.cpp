@@ -79,9 +79,46 @@ in `src/siglip2_server.cpp::main()` (and both CLIs), the graph-begin
 hook, the per-op anchor/follower pattern. Phase A1 is the same
 machinery, bigger fusion.
 
-## Phase A1 — QKV-prep chain fusion *(SCAFFOLDED, PARKED — gallocr aliasing trap)*
+## ✅ Phase A1 landed (2026-05-09) — QKV-prep chain fusion
 
-> **Status:** kernel + plan-builder + dispatcher are all in `src/cuda/siglip2_megakernel.{cu,cuh}` already; default-off (`SIGLIP2_ENABLE_QKV_PREP=1` to opt in). When enabled, vision output is bit-clean vs A1-OFF (cosine 1.0000000) but **every text encode produces NaN**. The bug is a single-kernel late-anchor design colliding with ggml's gallocr; the fix is a 2-kernel design with a persistent scratch buffer. Receipts below — read before re-attempting.
+**2-kernel design: copy mm+bias to persistent device scratch at the qkv_add
+anchor; split-permute-pad-cast from scratch into Q_pad / K_cast / V_cast at
+the topo-last of those three.** 9 launches per encoder block (1 add + 3 cont
++ 3 pad + 2 cast) → 2 kernels, saves 7 per block × 27 = 189 per encode.
+
+Plan-builder finds 27 chains for both text and vision; dispatcher fires the
+copy at qkv_add and the split at V_cast (or whichever of {q_pad, k_cast,
+v_cast} happens to be last). Followers: 7 per block (3 cont + 3 pad +
+non-anchor cast/pad). Scratch buffer is a single `cudaMalloc`'d slab sized
+for `3 * H * max(text_n_pos, vision_n_pos) * 4 B` ≈ 9.6 MiB, lazy-allocated
+on the first qkv_add anchor fire and reused across all 27 blocks per
+encode (CUDA stream is sequential, so block N's split kernel reads scratch
+before block N+1's copy kernel writes).
+
+**Self-parity (A1 ON vs A1 OFF, same C++ binary):** vision **1.0000000**,
+text **1.0000000** across all five prompts. Numerically bit-identical to
+ggml's split path — scratch holds exactly what the bias-add would produce,
+and the split kernel writes exactly what cont/pad/cast would. **HF parity
+unchanged from A0-only:** vision 0.999944, text 0.999756, image-1920×1080→
+729 0.999523, score 0.999986 / 5.6e-7.
+
+**Bench A/B (clean GPU, kobbler-vision-1 stopped):**
+
+  - `/v1/embeddings`:               55.9 → 49.6 ms (**−11.3 %**)
+  - `/v1/text_embeddings`:          36.9 → 33.5 ms (**−9.2 %**)
+  - `/v1/classify`:                 90.5 → 80.8 ms (**−10.7 %**)
+  - `/v1/classify_from_embeddings`: 37.3 → 33.6 ms (**−9.9 %**)
+
+Kill switch: `SIGLIP2_DISABLE_QKV_PREP=1`. Default ON in the install hook.
+
+## Phase A1 — design history & gallocr aliasing trap (read before extending)
+
+The first attempt at A1 was a single-kernel late-anchor design — anchored
+on V_cast (last in topo of {Q_pad, K_cast, V_cast}), reading directly from
+`qkv_add->data` and writing the three FA inputs in one launch. Plan-builder
+found 27 chains correctly and the kernel produced bit-clean vision output
+(cosine 1.0 vs A1-OFF), but **every text encode produced NaN**. Hours of
+delight follow.
 
 ### What the late-anchor approach tried
 

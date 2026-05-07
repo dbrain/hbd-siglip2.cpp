@@ -136,7 +136,7 @@ void launch_fused_layernorm_affine(
 }
 
 // ----------------------------------------------------------------------------
-// Fused QKV-prep kernel
+// QKV-prep — 2-kernel form (copy-to-scratch + split-permute-pad-cast)
 // ----------------------------------------------------------------------------
 //
 // Replaces (3 cont + 3 pad + 2 cast) per encoder block with one launch.
@@ -156,6 +156,22 @@ void launch_fused_layernorm_affine(
 // Grid: (n_pos, 3*n_head, 1). Block: (d_pad, 1, 1). One thread per output
 // element across all three outputs.
 namespace {
+
+// (1) Scratch-fill: scratch[i] = mm[i] + bias[i % triH].
+//     Grid: (n_pos, ceil(triH / 256), 1). Block: (256, 1, 1). One thread per
+//     element of the (triH, n_pos) F32 output.
+__global__ void qkv_copy_to_scratch_kernel(
+        const float * __restrict__ mm,
+        const float * __restrict__ bias,
+        float       * __restrict__ scratch,
+        const int                  triH,
+        const int                  n_pos) {
+    const int p   = blockIdx.x;
+    const int tid = blockIdx.y * blockDim.x + threadIdx.x;
+    if (tid >= triH) return;
+    const int idx = p * triH + tid;
+    scratch[idx] = mm[idx] + bias[tid];
+}
 
 __global__ void fused_qkv_prep_kernel(
         const float * __restrict__ qkv,
@@ -199,6 +215,19 @@ __global__ void fused_qkv_prep_kernel(
 }
 
 }  // namespace
+
+void launch_qkv_copy_to_scratch(
+        const float * mm,
+        const float * bias,
+        float       * scratch,
+        int           triH,
+        int           n_pos,
+        cudaStream_t  stream) {
+    constexpr int TPB = 256;
+    const dim3 grid((unsigned) n_pos, (unsigned) ((triH + TPB - 1) / TPB), 1);
+    const dim3 block((unsigned) TPB, 1, 1);
+    qkv_copy_to_scratch_kernel<<<grid, block, 0, stream>>>(mm, bias, scratch, triH, n_pos);
+}
 
 void launch_fused_qkv_prep(
         const float * qkv,
@@ -266,10 +295,15 @@ struct LayerNormEntry {
 // upstream followers' op_hook calls have already returned true).
 
 struct QkvPrepEntry {
-    const ggml_tensor * qkv_node    = nullptr;  // qkv bias-add (data source)
-    const ggml_tensor * q_pad_dst   = nullptr;  // F32 dst we write to
-    const ggml_tensor * k_cast_dst  = nullptr;  // F16 dst we write to
-    const ggml_tensor * v_cast_dst  = nullptr;  // F16 dst we write to
+    // Copy-to-scratch fields (used at qkv_add anchor)
+    const ggml_tensor * mm_node     = nullptr;  // mul_mat output (F32, 3*H × n_pos)
+    const ggml_tensor * bias_node   = nullptr;  // qkv bias (F32, 3*H)
+    const ggml_tensor * qkv_add     = nullptr;  // anchor 1 — bias-add node
+    // Split-from-scratch fields (used at v_cast / split anchor)
+    const ggml_tensor * q_pad_dst   = nullptr;
+    const ggml_tensor * k_cast_dst  = nullptr;
+    const ggml_tensor * v_cast_dst  = nullptr;
+    const ggml_tensor * split_anchor = nullptr; // anchor 2 — last of {q_pad,k_cast,v_cast}
     int H      = 0;
     int n_pos  = 0;
     int n_head = 0;
@@ -277,32 +311,51 @@ struct QkvPrepEntry {
     int d_pad  = 0;
 };
 
+// Persistent device scratch — sized for the hottest (3*H, n_pos) F32 shape.
+// Lazy-allocated on first qkv-prep anchor fire; freed at process exit. The
+// 9.6 MiB it costs (3 * 1152 * 729 * 4) is dwarfed by the launch savings
+// across 27 layers per encode. Single buffer reused across all blocks
+// because the CUDA stream is sequential per encode and siglip2_server's
+// encode_mutex serializes encodes.
+struct QkvScratch {
+    float * d_ptr  = nullptr;
+    size_t  cap_b  = 0;
+    bool ensure(size_t need_b) {
+        if (cap_b >= need_b && d_ptr) return true;
+        if (d_ptr) { cudaFree(d_ptr); d_ptr = nullptr; }
+        if (cudaMalloc(&d_ptr, need_b) != cudaSuccess) {
+            d_ptr = nullptr;
+            return false;
+        }
+        cap_b = need_b;
+        return true;
+    }
+};
+
 namespace {
 
 std::unordered_map<const ggml_tensor *, LayerNormEntry> g_ln_anchors;
 std::unordered_set<const ggml_tensor *>                 g_ln_followers;
 
-std::unordered_map<const ggml_tensor *, QkvPrepEntry>   g_qkv_anchors;
+// Two anchor maps: one for the copy-to-scratch kernel (anchored on
+// qkv_add), one for the split-from-scratch kernel (anchored on the last
+// of {q_pad, k_cast, v_cast}). Plan-builder populates both with the same
+// QkvPrepEntry so the dispatcher reads from one map per anchor lookup.
+std::unordered_map<const ggml_tensor *, QkvPrepEntry>   g_qkv_copy_anchors;
+std::unordered_map<const ggml_tensor *, QkvPrepEntry>   g_qkv_split_anchors;
 std::unordered_set<const ggml_tensor *>                 g_qkv_followers;
+QkvScratch                                              g_qkv_scratch;
 
 bool     g_enabled              = true;
-// Phase A1 QKV-prep is PARKED default-off: the late-anchor design (firing at
-// V_cast.idx so all output dsts are reachable) means by the time the fused
-// kernel reads `qkv_add->data`, ggml's gallocr has freed that slot (its
-// static analysis says qkv_add's last consumer is the conts, which we made
-// followers — gallocr doesn't know we deferred). The slot may have been
-// reused by a different tensor mid-graph. For vision (n_pos=729) the
-// aliasing happens to land on something benign and the output is bit-clean
-// vs A1-OFF; for text (n_pos=64) the aliasing corrupts a live tensor and
-// every encode produces NaN. The fix is a 2-kernel design:
-//   1. Anchor qkv_add: copy mm + bias into a persistent device-side scratch
-//      buffer (sized for the hottest 3*H*n_pos shape; ~10 MiB).
-//   2. Anchor V_cast: split-permute-pad-cast from scratch → Q_pad/K_cast/V_cast.
-// Saves 7 launches per block (= 9 fused → 2 kernels). Set
-// SIGLIP2_ENABLE_QKV_PREP=1 to opt in for development; do NOT ship default-on
-// until the scratch-buffer redesign lands. See HANDOFF-megakernel-v0.md
-// "Phase A1 — gallocr aliasing trap" for receipts.
-bool     g_qkv_enabled          = false;
+// QKV-prep — 2-kernel form: anchor 1 on qkv_add copies mm+bias into a
+// persistent device-side scratch buffer (replacing the bias-add); anchor 2
+// on the topo-last of {q_pad, k_cast, v_cast} split-permute-pad-casts from
+// scratch into the FA inputs. 9 ops per block (1 add + 3 cont + 3 pad +
+// 2 cast) → 2 kernels. Bit-identical to ggml's split path. Kill switch:
+// SIGLIP2_DISABLE_QKV_PREP=1. The earlier single-kernel design hit a
+// gallocr aliasing trap (qkv_add slot reclaimed before the late anchor
+// fired); see HANDOFF-megakernel-v0.md for receipts.
+bool     g_qkv_enabled          = true;
 uint64_t g_ln_groups_built      = 0;
 uint64_t g_ln_anchor_fires      = 0;
 uint64_t g_ln_follower_fires    = 0;
@@ -385,7 +438,8 @@ void build_ln_plan(const ggml_cgraph * cgraph) {
 }
 
 void build_qkv_prep_plan(const ggml_cgraph * cgraph) {
-    g_qkv_anchors.clear();
+    g_qkv_copy_anchors.clear();
+    g_qkv_split_anchors.clear();
     g_qkv_followers.clear();
     if (!cgraph || !g_qkv_enabled) return;
 
@@ -472,23 +526,23 @@ void build_qkv_prep_plan(const ggml_cgraph * cgraph) {
         if (k_cast->ne[0] != d_pad || k_cast->ne[1] != n_pos || k_cast->ne[2] != n_head) continue;
         if (v_cast->ne[0] != d_pad || v_cast->ne[1] != n_pos || v_cast->ne[2] != n_head) continue;
 
-        // Anchor = whichever of {q_pad, k_cast, v_cast} appears LAST in
-        // the cgraph topo order. By that point ggml has dispatched (and
-        // we've followered) every other node in the chain, and the qkv
-        // add's data is settled.
-        const ggml_tensor * anchor = nullptr;
-        int anchor_idx = -1;
+        // Split anchor = whichever of {q_pad, k_cast, v_cast} appears
+        // LAST in topo order. By that point all the upstream cont/pad/cast
+        // followers have fired; the scratch buffer (written at qkv_add
+        // anchor earlier in topo) is still alive.
+        const ggml_tensor * split_anchor = nullptr;
+        int split_anchor_idx = -1;
         for (int j = i + 1; j < n; ++j) {
             ggml_tensor * c = ggml_graph_node((ggml_cgraph *) cgraph, j);
             if (c == q_pad || c == k_cast || c == v_cast) {
-                if (j > anchor_idx) { anchor_idx = j; anchor = c; }
+                if (j > split_anchor_idx) { split_anchor_idx = j; split_anchor = c; }
             }
         }
-        if (!anchor) continue;
+        if (!split_anchor) continue;
 
-        // Skip if any of these nodes are already claimed by a different
-        // chain (defensive — locally unique by weight name + offset).
-        if (g_qkv_anchors.count(anchor) ||
+        // Skip if any node is already claimed.
+        if (g_qkv_copy_anchors.count(add) ||
+            g_qkv_split_anchors.count(split_anchor) ||
             g_qkv_followers.count(q_cont) || g_qkv_followers.count(q_pad) ||
             g_qkv_followers.count(k_cont) || g_qkv_followers.count(k_pad) ||
             g_qkv_followers.count(k_cast) ||
@@ -498,19 +552,23 @@ void build_qkv_prep_plan(const ggml_cgraph * cgraph) {
         }
 
         QkvPrepEntry e;
-        e.qkv_node   = add;
-        e.q_pad_dst  = q_pad;
-        e.k_cast_dst = k_cast;
-        e.v_cast_dst = v_cast;
-        e.H          = H_block;
-        e.n_pos      = n_pos;
-        e.n_head     = n_head;
-        e.d_head     = d_head;
-        e.d_pad      = d_pad;
-        g_qkv_anchors[anchor] = e;
+        e.mm_node      = mm;
+        e.bias_node    = add->src[1];   // qkv bias
+        e.qkv_add      = add;
+        e.q_pad_dst    = q_pad;
+        e.k_cast_dst   = k_cast;
+        e.v_cast_dst   = v_cast;
+        e.split_anchor = split_anchor;
+        e.H            = H_block;
+        e.n_pos        = n_pos;
+        e.n_head       = n_head;
+        e.d_head       = d_head;
+        e.d_pad        = d_pad;
+        g_qkv_copy_anchors[add]            = e;
+        g_qkv_split_anchors[split_anchor]  = e;
 
         auto add_follower = [&](const ggml_tensor * t) {
-            if (t && t != anchor) g_qkv_followers.insert(t);
+            if (t && t != split_anchor) g_qkv_followers.insert(t);
         };
         add_follower(q_cont); add_follower(q_pad);
         add_follower(k_cont); add_follower(k_pad); add_follower(k_cast);
@@ -536,9 +594,12 @@ extern "C" void siglip2_graph_begin_hook(
         const int n = cgraph ? ggml_graph_n_nodes((ggml_cgraph *) cgraph) : 0;
         std::fprintf(stderr,
             "[siglip2-megakernel] graph_begin: LN groups=%zu (followers=%zu) "
-            "QKV groups=%zu (followers=%zu) total_nodes=%d\n",
+            "QKV groups=%zu (copy_anchors=%zu split_anchors=%zu followers=%zu) "
+            "total_nodes=%d\n",
             g_ln_anchors.size(),  g_ln_followers.size(),
-            g_qkv_anchors.size(), g_qkv_followers.size(), n);
+            g_qkv_groups_built,
+            g_qkv_copy_anchors.size(), g_qkv_split_anchors.size(),
+            g_qkv_followers.size(), n);
         --g_log_budget;
     }
 }
@@ -559,18 +620,36 @@ extern "C" bool siglip2_op_hook(
         return true;
     }
 
-    // QKV-prep anchor: fire fused split-permute-pad-cast kernel.
+    // QKV-prep anchors. Two phases per block:
+    //   (1) qkv_add  → copy mm + bias to scratch (replaces the bias-add launch)
+    //   (2) v_cast   → split-permute-pad-cast from scratch to FA inputs
     if (g_qkv_enabled) {
-        auto it = g_qkv_anchors.find(dst);
-        if (it != g_qkv_anchors.end()) {
-            const QkvPrepEntry & e = it->second;
-            const float * qkv = e.qkv_node ? (const float *) e.qkv_node->data : nullptr;
-            float * q_pad     = e.q_pad_dst   ? (float *) e.q_pad_dst->data   : nullptr;
-            void  * k_cast    = e.k_cast_dst  ? e.k_cast_dst->data            : nullptr;
-            void  * v_cast    = e.v_cast_dst  ? e.v_cast_dst->data            : nullptr;
-            if (!qkv || !q_pad || !k_cast || !v_cast) return false;
+        // Copy phase.
+        auto it_c = g_qkv_copy_anchors.find(dst);
+        if (it_c != g_qkv_copy_anchors.end()) {
+            const QkvPrepEntry & e = it_c->second;
+            const float * mm   = e.mm_node   ? (const float *) e.mm_node->data   : nullptr;
+            const float * bias = e.bias_node ? (const float *) e.bias_node->data : nullptr;
+            if (!mm || !bias) return false;
 
-            launch_fused_qkv_prep(qkv, q_pad, k_cast, v_cast,
+            const int triH = 3 * e.H;
+            const size_t need_b = (size_t) triH * (size_t) e.n_pos * sizeof(float);
+            if (!g_qkv_scratch.ensure(need_b)) return false;
+
+            launch_qkv_copy_to_scratch(mm, bias, g_qkv_scratch.d_ptr, triH, e.n_pos, stream);
+            ++g_qkv_anchor_fires;
+            return true;
+        }
+        // Split phase.
+        auto it_s = g_qkv_split_anchors.find(dst);
+        if (it_s != g_qkv_split_anchors.end()) {
+            const QkvPrepEntry & e = it_s->second;
+            float * q_pad  = e.q_pad_dst   ? (float *) e.q_pad_dst->data   : nullptr;
+            void  * k_cast = e.k_cast_dst  ? e.k_cast_dst->data            : nullptr;
+            void  * v_cast = e.v_cast_dst  ? e.v_cast_dst->data            : nullptr;
+            if (!q_pad || !k_cast || !v_cast || !g_qkv_scratch.d_ptr) return false;
+
+            launch_fused_qkv_prep(g_qkv_scratch.d_ptr, q_pad, k_cast, v_cast,
                                   e.H, e.n_pos, e.n_head, e.d_head, e.d_pad,
                                   stream);
             ++g_qkv_anchor_fires;
@@ -617,8 +696,8 @@ bool install() {
         if (v[0] != '\0' && std::strcmp(v, "0") != 0) g_log_budget = 5;
     }
 
-    if (const char * e = std::getenv("SIGLIP2_ENABLE_QKV_PREP")) {
-        if (e[0] != '\0' && std::strcmp(e, "0") != 0) g_qkv_enabled = true;
+    if (const char * d = std::getenv("SIGLIP2_DISABLE_QKV_PREP")) {
+        if (d[0] != '\0' && std::strcmp(d, "0") != 0) g_qkv_enabled = false;
     }
 
     ggml_cuda_set_graph_begin_hook(siglip2_graph_begin_hook);
@@ -627,7 +706,7 @@ bool install() {
 
     std::fprintf(stderr,
         "[siglip2-megakernel] installed: fused-LN%s\n",
-        g_qkv_enabled ? " + QKV-prep (DEV-ONLY, broken on text — see HANDOFF-megakernel-v0.md)" : "");
+        g_qkv_enabled ? " + QKV-prep (copy→scratch + split-permute-pad-cast, 9 ops → 2)" : "");
     return true;
 }
 
