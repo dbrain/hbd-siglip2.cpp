@@ -1,5 +1,6 @@
 #include "siglip2_text.h"
 #include "siglip2_tokenizer.h"
+#include "cuda/siglip2_megakernel.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -48,6 +49,7 @@ bool write_bytes(const std::string & p, const void * data, size_t n, std::string
 } // namespace
 
 int main(int argc, char ** argv) {
+    siglip2_megakernel::install();
     std::string model_path, tok_path, mask_path, out_path;
     std::string tokenizer_path, text_input;
     for (int i = 1; i < argc; ++i) {

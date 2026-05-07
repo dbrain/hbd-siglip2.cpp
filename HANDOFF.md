@@ -1,6 +1,6 @@
 # siglip2.cpp — Handoff
 
-You're picking up `siglip2.cpp` after the 2026-05-07 VRAM pass + 2026-05-08 perf pass + 2026-05-09 QKV-fusion pass. Feature parity has been complete since M5; the prior passes drove VRAM from 1855 MiB to 1438 MiB and added padded MMA-FA for d_head=72; this last pass landed fused Q/K/V projections at conversion time, closing 14 % off the text path. Read `AGENTS.md` for the architectural overview; this doc is **what to do next + why + the user's disposition**.
+You're picking up `siglip2.cpp` after the 2026-05-07 VRAM pass + 2026-05-08 perf pass + 2026-05-09 QKV-fusion pass + 2026-05-09 megakernel-v0 Phase A0 (fused LayerNorm). Feature parity has been complete since M5; the prior passes drove VRAM from 1855 MiB to 1438 MiB and added padded MMA-FA for d_head=72; QKV fusion closed 14 % off the text path; Phase A0 ships the first custom CUDA kernel under `src/cuda/` and shaves another 3-4 % off every endpoint by collapsing 110+ LN launches per encode. Read `AGENTS.md` for the architectural overview; this doc is **what to do next + why + the user's disposition**.
 
 ## Cold-pickup orientation — if you've got a long run ahead
 
@@ -44,24 +44,26 @@ Translation: **pick targets, swing big, report when shocking.** The user is expl
 
 ## Where we are
 
-- Branch: `dbrain/siglip2-v0`, 17 commits + the QKV-fusion change in flight, never pushed. Baseline is `qwen3-tts.cpp@main` (4068ce4) + `ggml@master` (dbrain/ggml fork).
-- Builds: `build/` (CPU) and `build-cuda/` (sm_86); both pass smoke + all four parity scripts.
-- Parity (all four scripts, post QKV-fusion):
-  - `parity_check_vision.py`: cosine **0.999907** (synthetic pixel_values; no resize) — was 0.999937 (−3 µcos, sampling noise)
-  - `parity_check_text.py`:   cosine **0.999779** — was 0.999723 (+5.6 µcos, very slight improvement)
-  - `parity_check_score.py`:  logits cosine **0.999987**, probs MAE **5.0e-7** — was 0.999992 / 3.8e-7
-  - `parity_check_image.py` (1920×1080 → 729 patches): cosine **0.999545** — was 0.999054 (**+491 µcos**, real improvement; fused matmul has slightly better numerics than three independent ones)
+- Branch: `dbrain/siglip2-v0`, 18 commits + the megakernel-A0 change in flight, never pushed. Baseline is `qwen3-tts.cpp@main` (4068ce4) + `ggml@master` (dbrain/ggml fork @ a3fc6843).
+- Builds: `build/` (CPU) and `build-cuda/` (sm_86); both pass smoke + all four parity scripts. CUDA build now also produces `libsiglip2_megakernel.a` linked into all binaries.
+- Parity (all four scripts, post megakernel-A0):
+  - `parity_check_vision.py`: cosine **0.999944** (synthetic pixel_values; no resize) — was 0.999907 pre-A0 (+37 µcos, slight improvement; one fewer F32 round-trip through memory in the LN chain)
+  - `parity_check_text.py`:   cosine **0.999756** — was 0.999779 (−23 µcos, reduction-tree shuffle noise)
+  - `parity_check_score.py`:  logits cosine **0.999986**, probs MAE **5.6e-7** — was 0.999987 / 5.0e-7
+  - `parity_check_image.py` (1920×1080 → 729 patches): cosine **0.999523** — was 0.999545 (−22 µcos, same noise band)
+  - **Self-parity (megakernel ON vs OFF, same C++ binary):** vision **0.999923**, text **0.999930-0.999965** across 5 prompts. Confirms the LN fusion is the only source of drift and it's well below the 0.999 floor budget.
 - Live cross-check vs `kobbler-vision-1` on a 320×180 PNG, max_num_patches=729: Image embedding cosine **0.995865**, scores MAE **1.92e-2** — bit-identical to pre-fusion (Q8 noise floor, fusion doesn't move it).
 - VRAM, full-tower deploy mode (both vision + text loaded, the user's actual flow):
   - Python (kobbler-vision-1):    **2322 MiB** post-warmup
   - C++ post-load (idle):         **1504 MiB** (**−818 MiB / −35 %** vs Python)
   - C++ post-warmup:              **1566 MiB** (after first `/v1/embeddings` + `/v1/text_embeddings`; +62 MiB of compute-pool activations relative to post-load)
   - For reference: `--vision-only` is **664 MiB** post-load and `--text-only` would be **~944 MiB**, but **the user's real deploy uses both towers**, so optimize for the full-tower number.
-- Endpoint p50 (30 runs, both servers warmed, GPU shared with kobbler-vision + tts-qwen3 + dev iter container so wobble is real):
-  - `/v1/embeddings`:               C++ ~58 ms vs Python ~54 ms (cpp **1.07×** — was 1.10× pre-QKV-fusion)
-  - `/v1/text_embeddings`:          C++ ~38 ms vs Python ~26 ms (cpp **1.43×** — was **1.71×**, **−14% absolute**)
-  - `/v1/classify`:                 C++ ~94 ms vs Python ~70 ms (cpp **1.34×** — was 1.45×)
-  - `/v1/classify_from_embeddings`: C++ ~38 ms vs Python ~21 ms (cpp **1.79×** — was 2.08×)
+- Endpoint p50 (30 runs, both servers warmed). The 2026-05-09 measurement protocol is **one tower at a time** — kobbler-vision-1 doesn't unload itself and pollutes side-by-side numbers. The "clean GPU" column is C++ alone (kobbler-vision-1 stopped); the "shared GPU" column is the older both-running baseline kept for ratio continuity.
+  - `/v1/embeddings`:               clean **55.8 ms** (was 58.2 pre-A0; **−4.1 %**); shared GPU ~58 vs Python ~54 (cpp 1.07× pre-A0 → A0 not yet re-measured against python)
+  - `/v1/text_embeddings`:          clean **37.1 ms** (was 38.3 pre-A0; **−3.1 %**); shared baseline cpp 1.43× python pre-A0
+  - `/v1/classify`:                 clean **90.2 ms** (was 94.1 pre-A0; **−4.1 %**); shared baseline cpp 1.34× python pre-A0
+  - `/v1/classify_from_embeddings`: clean **37.1 ms** (was 38.5 pre-A0; **−3.6 %**); shared baseline cpp 1.79× python pre-A0
+  - Python head-to-head re-bench is the next agent's first move post-A1 (Phase A1 = QKV-prep fusion is the bigger chunk; bench once after both land).
 - Reload time: C++ cold-load **0.66 s** vs Python **10.5 s** — **~16× faster** swap (no torch/transformers import). Dominant for kobbler's vision↔TTS↔STT GPU-sharing.
 - Host RAM: Python ~3 GiB → C++ ~568 MiB.
 
@@ -71,7 +73,7 @@ If you touch the text path or anyone reports text drift, **remember**: HF `Sigli
 
 ## What landed in this pass
 
-2026-05-07 (VRAM pass), 2026-05-08 (perf pass + housekeeping), 2026-05-09 (QKV fusion). In commit order:
+2026-05-07 (VRAM pass), 2026-05-08 (perf pass + housekeeping), 2026-05-09 (QKV fusion + megakernel-v0 Phase A0). In commit order:
 
 - **`dc83baa` — chore: remove inherited TTS source** (lever H). 51 files, ~30k lines deleted. Tree now only has SigLIP2.
 - **`d8bb673` — feat(convert): Q8_0 the text token embedding** (lever B). Drop `_is_keep_f16` special case for `t.token_embd.weight`. Saves ~390 MiB VRAM. GGUF on disk shrinks 1.74 → 1.47 GiB.
@@ -82,6 +84,16 @@ If you touch the text path or anyone reports text drift, **remember**: HF `Sigli
 - **`48fd16e` — perf(fa): zero-pad d_head 72 → 80 to hit MMA tensor-core path.** ggml's CUDA MMA / WMMA flash-attn kernels require D % 16 == 0; SigLIP2's d_head=72 was falling back to the (CUDA-cores) tile kernel. We zero-pad Q/K/V's d-axis to next multiple of 16 before FA and slice the result back before the output projection. Zero padding is mathematically null (Q·K and V both contribute 0 in padded slots) so parity is unchanged. **+14–23 % p50 on every endpoint, same VRAM.** See the helper `fa_attn_pad_slice` in `src/siglip2_vision.cpp`.
 - **`77f97f1` — docs: revert parity floor to 0.999** (housekeeping; user briefly relaxed to 0.997 on 2026-05-08 then put it back).
 - **(this pass) — perf(convert,vision,text): fuse Q/K/V projections per layer.** The converter now stacks `q_proj`/`k_proj`/`v_proj` along the output dim into one `attn_qkv.{weight,bias}` per encoder block, and `build_block` runs a single wider mul_mat + bias-add instead of three. Q/K/V become *strided* `ggml_view_3d` views into the fused output (no `ggml_reshape_3d` step — non-contiguous along positions), and the existing `ggml_cont`-before-`ggml_pad` path materialises them when the d_head-pad helper needs contiguous memory, so parity is unchanged. **−6 ms (−14 %) on text and classify_from_embeddings, −7 ms (−7 %) on classify, −1 ms (−2 %) on embeddings.** Image-parity cosine on the heavy-downsample shape *improved* from 0.999054 → 0.999545 (single matmul has slightly better fp32 accumulator behaviour than three independent ones). 81 fewer kernel launches per request × both towers loaded.
+
+- **(this pass) — perf(cuda): megakernel-v0 Phase A0 — fused LayerNorm-with-affine.** First custom CUDA kernel under `src/cuda/`. ggml-cuda exposes graph-begin and per-op hooks (already plumbed in the ggml fork at `a3fc6843`); `siglip2_megakernel::install()` wires `siglip2_graph_begin_hook` (scans every cgraph for the `ggml_norm → ggml_mul-w → ggml_add-b` chain shape, anchors the plan on the ADD's dst, marks norm + mul as followers) and `siglip2_op_hook` (fires one `fused_layernorm_affine_kernel` per anchor, returns true for followers). Same one-pass mean+var formula as `ggml/src/ggml-cuda/norm.cu`; the affine multiplies use `__fmul_rn` / `__fadd_rn` to suppress FMA fusion so the result matches ggml's split (norm → mul → add) per-store-rounding bit-for-bit modulo the reduction-tree shuffle. Plan-builder records **55 LN groups for text** (27 × 2 + final_ln) and **56 for vision** (27 × 2 + probe_head + post_ln), so each text encode drops 110 launches and each vision encode drops 112; `/v1/classify` (vision + 5 texts) drops 662. Wired into siglip2-server, siglip2-cli, siglip2-text-cli; CPU-only builds (`GGML_CUDA=OFF`) get a stub `install()` that returns false. Kill switch: `SIGLIP2_DISABLE_MEGAKERNEL=1`. Verbose graph-begin counts: `SIGLIP2_MEGAKERNEL_VERBOSE=1`. **Clean-GPU A/B (kobbler-vision-1 stopped):**
+  - `/v1/embeddings`:               58.2 → 55.8 ms (**−4.1 %**)
+  - `/v1/text_embeddings`:          38.3 → 37.1 ms (**−3.1 %**)
+  - `/v1/classify`:                 94.1 → 90.2 ms (**−4.1 %**)
+  - `/v1/classify_from_embeddings`: 38.5 → 37.1 ms (**−3.6 %**)
+
+  Self-parity (megakernel ON vs OFF, same C++ binary): vision cosine **0.99992**, text **0.99993-0.99997** across 5 prompts. HF parity (post-A0): vision **0.999944**, text **0.999756**, image-1920×1080→729 **0.999523**, score logits **0.999986** / probs MAE 5.6e-7 — all comfortably above the 0.999 floor.
+
+  3-4 % is small for a custom-kernel commit, but it validates the scaffolding (hooks land, plan-builder finds the right node count, kill-switch works, parity holds) and is the foundation for the bigger fusions ahead. Per-launch cost on these small ops (norm, mul) is ~10-12 µs, not the 12-15 µs estimated; the bigger wins live in the **QKV-prep chain** (3 cont + 3 pad + 2 cast = 8 launches/block, fuseable to one custom split-permute-pad-cast kernel — Phase A1, see `HANDOFF-megakernel-v0.md`).
 
 ## Dead ends and partial attempts (2026-05-09 pass)
 

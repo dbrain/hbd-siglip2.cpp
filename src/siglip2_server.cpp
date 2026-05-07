@@ -13,6 +13,7 @@
 #include "siglip2_tokenizer.h"
 #include "siglip2_score.h"
 #include "siglip2_preproc.h"
+#include "cuda/siglip2_megakernel.h"
 
 // stb_image is already linked into siglip2_preproc as the implementation;
 // here we only need extern declarations to call stbi_load_from_memory.
@@ -299,6 +300,10 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "--tokenizer (or TOKENIZER_PATH env) is required unless --vision-only.\n");
         return 2;
     }
+    // Install fused CUDA kernels (Phase A0: layer-norm-with-affine). Must run
+    // before any encoder load so the hooks are live for the first graph
+    // compute. No-op when GGML_CUDA is OFF or SIGLIP2_DISABLE_MEGAKERNEL=1.
+    siglip2_megakernel::install();
     ServerState st;
     st.cfg = cfg;
     if (!cfg.lazy_load) {

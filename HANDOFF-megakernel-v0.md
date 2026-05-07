@@ -31,11 +31,13 @@
 ## Cold-pickup orientation
 
 The win you're chasing: **text path is launch-overhead-bound**, ~80%
-of the 38 ms / 5-prompt p50 is CUDA kernel launch overhead (486
-launches per encode × ~12-15 µs each). PyTorch beats us at ~26 ms
-because it issues maybe 100-200 launches via cuDNN/cuBLAS fusion.
+of the 38 ms / 5-prompt p50 is CUDA kernel launch overhead (~745
+launches per encode × ~10-12 µs each — a hair lower than the original
+12-15 µs estimate; A0 measurements re-grounded the per-launch cost).
+PyTorch beats us at ~26 ms because it issues maybe 100-200 launches
+via cuDNN/cuBLAS fusion.
 
-Megakernel collapses that 486 → ~30, putting text encode at
+Megakernel collapses that ~745 → ~30, putting text encode at
 **~2-3 ms per prompt** (well below Python). /v1/text_embeddings and
 /v1/classify_from_embeddings drop from 1.43× and 1.79× python to
 sub-1×. /v1/classify (vision + text loop) closes too because the
@@ -46,6 +48,38 @@ compute-bound at that batch size — megakernel saves ~1-2 ms there
 (launches are <10% of the encode). Phase A targets text. Phase B
 targets vision but the ROI is much smaller; consider that phase
 optional.
+
+## ✅ Phase A0 landed (2026-05-09)
+
+**Fused LayerNorm-with-affine** is in. First custom kernel under
+`src/cuda/`. Plan-builder finds **55 LN groups for text** and **56 for
+vision**; op-hook fires `fused_layernorm_affine_kernel` per anchor and
+short-circuits the upstream norm + mul as followers. Per text encode
+drops 110 launches; per vision encode drops 112; `/v1/classify` drops
+662. Wins are **3-4 % across all four endpoints** on a clean GPU
+(kobbler-vision-1 stopped):
+
+  - `/v1/embeddings`:               58.2 → 55.8 ms (**−4.1 %**)
+  - `/v1/text_embeddings`:          38.3 → 37.1 ms (**−3.1 %**)
+  - `/v1/classify`:                 94.1 → 90.2 ms (**−4.1 %**)
+  - `/v1/classify_from_embeddings`: 38.5 → 37.1 ms (**−3.6 %**)
+
+HF parity holds: vision 0.999944, text 0.999756, image-1920×1080→729
+0.999523, score 0.999986. Self-parity (ON vs OFF same binary) is
+0.99992-0.99997 across the board — drift is reduction-tree shuffle
+noise, not a numerical bug.
+
+Smaller than expected because per-launch cost on these tiny ops
+(`norm` + 1D-bcast `mul` + 1D-bcast `add`) is **~10-12 µs**, not the
+12-15 µs estimated. The bigger wins live in the **QKV-prep chain**
+(see Phase A1 below).
+
+The scaffolding is now load-bearing — `siglip2_megakernel::install()`
+in `src/siglip2_server.cpp::main()` (and both CLIs), the graph-begin
+hook, the per-op anchor/follower pattern. Phase A1 is the same
+machinery, bigger fusion.
+
+## Phase A1 — QKV-prep chain fusion (the next ~3-5 ms swing)
 
 ## Where things stand
 
@@ -70,7 +104,62 @@ optional.
   - /v1/classify:                 94 ms  (cpp 1.34× python — text-bound)
   - /v1/classify_from_embeddings: 38 ms  (cpp 1.79× python — **target**)
 
-## What "phase A" looks like
+After QKV mul_mat + bias_add (2 launches), `build_block` fans out 11
+ops just to prep Q/K/V for `flash_attn_ext`:
+
+```
+qkv = mul_mat(qkv_w, cur) + qkv_b               (already done)
+Q = view_3d(qkv, off=0)        K = view(off=1H) V = view(off=2H)   (free)
+Q = permute(0,2,1,3)           K = permute(...)  V = permute(...)  (free metadata)
+Q = pad(cont(Q), pad=8)        K = pad(cont(K))  V = pad(cont(V))  (6 launches)
+                               K_f16 = cast(K)   V_f16 = cast(V)   (2 launches)
+KQV = flash_attn_ext(Q, K_f16, V_f16, mask, kq_scale)              (1 launch)
+KQV = view_3d(slice off pad)
+KQV = cont                                                          (1 launch — for o_proj input)
+```
+
+That's 9 launches per block × 27 blocks = **243 launches** that one
+custom CUDA kernel can replace with **3** (one writer per Q/K/V), or
+plausibly **1** if you write all three outputs from one grid.
+
+**The fused kernel:** read the strided F32 qkv buffer, write three
+contiguous outputs:
+- Q F32 of shape `(d_pad=80, n_pos, n_head)`, with the padded slot
+  (d=72..79) zero-filled.
+- K F16 of the same shape, zero-padded, fp32→fp16 cast inline.
+- V F16 likewise.
+
+Each output goes directly into the existing dst tensor that ggml
+allocated for the post-cast (K) / post-pad (V) / post-pad (Q) node.
+The 9 follower ops short-circuit via the per-op hook. Same pattern
+as the LN fusion landed in A0.
+
+**ROI:** ~3.5 ms per text encode, ~3.5 ms per vision encode (assuming
+~10-12 µs per skipped launch). Combined with A0, this should put text
+at ~33 ms (vs 26 ms python = 1.27×) and embeddings at ~52 ms (already
+sub-Python on a clean GPU; ratio stays favourable). /v1/classify drops
+the most because it walks both towers + 5 text iterations, all
+benefitting.
+
+**Plan-builder shape:** anchor on each block's QKV `add` (the bias
+add), walk forward in topo order recording `(view, view, view,
+permute*3, cont*3, pad*3, cast*2)` until you hit the FA node. If the
+shape matches, fill `QkvPrepEntry { qkv_dst, q_pad_dst, k_cast_dst,
+v_cast_dst, n_pos, d_head, n_head, d_pad, kv_scale_offset }`. Anchor
+the fused kernel on the LAST cast (V_cast) — by then ggml has
+allocated the dsts for Q_pad, K_cast, V_cast, and the qkv data is
+ready. Followers: every other intermediate node in the chain.
+
+**Risk:** strided source memory layout (qkv is non-contig along
+positions), F16 quant must round-to-nearest matching ggml's
+`ggml_compute_forward_cpy_f16` semantics, the d_head=72→80 zero-pad
+needs to be exactly zero-bit (not denormal). All achievable; just
+careful kernel work.
+
+**Don't fuse the post-FA `cont` into this** — that one runs on FA's
+output and a different shape. Phase A2.
+
+## What "phase A" originally looked like (kept for context)
 
 **Goal:** one fused CUDA kernel per text encoder block at fixed shape
 n_pos=64, H=1152, d_head=72, n_head=16. Inputs: input activations

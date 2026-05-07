@@ -1,5 +1,6 @@
 #include "siglip2_vision.h"
 #include "siglip2_preproc.h"
+#include "cuda/siglip2_megakernel.h"
 
 #include <algorithm>
 #include <cmath>
@@ -55,6 +56,7 @@ bool write_file(const std::string & path, const void * data, size_t bytes, std::
 } // namespace
 
 int main(int argc, char ** argv) {
+    siglip2_megakernel::install();
     std::string model_path;
     std::string pixel_path;
     std::string image_path;

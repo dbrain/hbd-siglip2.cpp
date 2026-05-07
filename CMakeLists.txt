@@ -57,6 +57,36 @@ set(CMAKE_BUILD_RPATH_USE_ORIGIN TRUE)
 set(GGML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml")
 add_subdirectory(${GGML_DIR})
 
+# Phase A megakernel — fused per-pattern CUDA kernels (LayerNorm-with-affine
+# in v0). Built as either a real CUDA lib when GGML_CUDA=ON or a stub-only
+# lib otherwise, so callers can unconditionally invoke
+# siglip2_megakernel::install().
+if(GGML_CUDA)
+    enable_language(CUDA)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES "native")
+    endif()
+    add_library(siglip2_megakernel STATIC
+        src/cuda/siglip2_megakernel.cu
+    )
+    set_target_properties(siglip2_megakernel PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        POSITION_INDEPENDENT_CODE  ON
+    )
+    target_include_directories(siglip2_megakernel PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda
+        ${GGML_DIR}/include
+    )
+    target_link_libraries(siglip2_megakernel PUBLIC ggml)
+else()
+    add_library(siglip2_megakernel STATIC
+        src/cuda/siglip2_megakernel_stub.cpp
+    )
+    target_include_directories(siglip2_megakernel PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda
+    )
+endif()
+
 # Image preprocessor library (NaFlex resize + patchify; stb_image for I/O)
 add_library(siglip2_preproc STATIC
     src/siglip2_preproc.cpp
@@ -132,6 +162,7 @@ add_executable(siglip2-cli
 target_link_libraries(siglip2-cli PRIVATE
     siglip2_vision
     siglip2_preproc
+    siglip2_megakernel
 )
 
 # Text-side parity tool
@@ -141,6 +172,7 @@ add_executable(siglip2-text-cli
 target_link_libraries(siglip2-text-cli PRIVATE
     siglip2_text
     siglip2_tokenizer
+    siglip2_megakernel
 )
 
 if(SIGLIP2_SERVER)
@@ -156,12 +188,13 @@ if(SIGLIP2_SERVER)
         siglip2_tokenizer
         siglip2_score
         siglip2_preproc
+        siglip2_megakernel
         httplib::httplib
         nlohmann_json::nlohmann_json
     )
 endif()
 
-install(TARGETS siglip2_vision siglip2_text siglip2_preproc siglip2_tokenizer siglip2_score siglip2-cli siglip2-text-cli
+install(TARGETS siglip2_vision siglip2_text siglip2_preproc siglip2_tokenizer siglip2_score siglip2_megakernel siglip2-cli siglip2-text-cli
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION bin
