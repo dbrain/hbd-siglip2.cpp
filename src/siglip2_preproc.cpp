@@ -50,12 +50,62 @@ void compute_target_size(
     out_w = scaled_size(lo, width,  patch_size);
 }
 
-// Bilinear resize for HxWxC uint8 -> dst_h x dst_w x C uint8.
-// Matches PIL.Image.BILINEAR (no antialias). Channels-last memory order.
+// Antialiased bilinear ("triangle") resize. Matches torchvision's
+// F.interpolate(mode='bilinear', antialias=True) which HF
+// Siglip2ImageProcessor uses by default for both up- and down-sampling.
 //
-// PIL's bilinear maps each output pixel to a "centered" source coordinate:
-// src = (out + 0.5) * src_size / dst_size - 0.5. This matches torchvision's
-// interpolation when antialias=False.
+// Algorithm (separable triangular low-pass):
+//   per axis:
+//     scale = src/dst
+//     support_radius r = max(scale, 1.0)   // widens the kernel when downsampling
+//     for each output pixel i:
+//       center = (i + 0.5) * scale - 0.5
+//       weight at source position k:  max(0, 1 - |(k - center) / r|)
+//     normalize weights so they sum to 1
+//   apply along height first into a float intermediate, then along width.
+//
+// Reference: PyTorch aten/src/ATen/native/cpu/UpSampleKernel.cpp
+// upsample_bilinear2d_aa (same triangular separable filter).
+struct AAFilter1D {
+    int               max_taps = 0;
+    std::vector<int>  first;        // first source index per output pixel
+    std::vector<int>  taps;         // tap count per output pixel
+    std::vector<float> weights;     // [out * max_taps + tap]
+};
+
+void build_aa_filter(int src_size, int dst_size, AAFilter1D & f) {
+    const double scale = (double)src_size / (double)dst_size;
+    const double r     = std::max(scale, 1.0);
+    f.max_taps = (int)std::ceil(2.0 * r) + 2;
+    f.first.assign(dst_size, 0);
+    f.taps.assign(dst_size, 0);
+    f.weights.assign((size_t)dst_size * f.max_taps, 0.0f);
+
+    for (int i = 0; i < dst_size; ++i) {
+        const double center = (i + 0.5) * scale - 0.5;
+        int k0 = (int)std::ceil (center - r);
+        int k1 = (int)std::floor(center + r);
+        // r is at least 1.0, so the window has at least one tap.
+        f.first[i] = k0;
+        const int n = k1 - k0 + 1;
+
+        double sum = 0.0;
+        for (int t = 0; t < n; ++t) {
+            const int k = k0 + t;
+            const double d = (k - center) / r;
+            const double w = std::max(0.0, 1.0 - std::abs(d));
+            f.weights[(size_t)i * f.max_taps + t] = (float)w;
+            sum += w;
+        }
+        // Normalize. (Sum is always > 0 because the center tap has w=1.)
+        const float inv = (float)(1.0 / sum);
+        for (int t = 0; t < n; ++t) {
+            f.weights[(size_t)i * f.max_taps + t] *= inv;
+        }
+        f.taps[i] = n;
+    }
+}
+
 void resize_bilinear_u8(
     const uint8_t * src,
     int             src_h,
@@ -64,44 +114,56 @@ void resize_bilinear_u8(
     uint8_t *       dst,
     int             dst_h,
     int             dst_w) {
-    const double sy = (double)src_h / (double)dst_h;
-    const double sx = (double)src_w / (double)dst_w;
+    AAFilter1D fy, fx;
+    build_aa_filter(src_h, dst_h, fy);
+    build_aa_filter(src_w, dst_w, fx);
 
+    // Pass 1: filter along height. Output shape: (dst_h, src_w, channels) float.
+    std::vector<float> tmp((size_t)dst_h * src_w * channels);
     for (int y = 0; y < dst_h; ++y) {
-        double fy = (y + 0.5) * sy - 0.5;
-        int    y0 = (int)std::floor(fy);
-        double dy = fy - y0;
-        int    y1 = y0 + 1;
-        if (y0 < 0)        { y0 = 0; dy = 0.0; }
-        if (y0 >= src_h-1) { y0 = src_h - 1; y1 = y0; dy = 0.0; }
-        else                { y1 = std::min(y1, src_h - 1); }
+        const int   k0 = fy.first[y];
+        const int   n  = fy.taps[y];
+        const float * wrow = fy.weights.data() + (size_t)y * fy.max_taps;
+        for (int x = 0; x < src_w; ++x) {
+            float * out = tmp.data() + ((size_t)y * src_w + x) * channels;
+            for (int c = 0; c < channels; ++c) out[c] = 0.0f;
+            for (int t = 0; t < n; ++t) {
+                int sy = k0 + t;
+                if (sy < 0)        sy = 0;
+                if (sy >= src_h)   sy = src_h - 1;
+                const float w = wrow[t];
+                const uint8_t * sp = src + ((size_t)sy * src_w + x) * channels;
+                for (int c = 0; c < channels; ++c) {
+                    out[c] += w * (float)sp[c];
+                }
+            }
+        }
+    }
 
+    // Pass 2: filter along width. Input: tmp (dst_h, src_w, c) float.
+    // Output: dst (dst_h, dst_w, c) uint8.
+    for (int y = 0; y < dst_h; ++y) {
         for (int x = 0; x < dst_w; ++x) {
-            double fx = (x + 0.5) * sx - 0.5;
-            int    x0 = (int)std::floor(fx);
-            double dx = fx - x0;
-            int    x1 = x0 + 1;
-            if (x0 < 0)        { x0 = 0; dx = 0.0; }
-            if (x0 >= src_w-1) { x0 = src_w - 1; x1 = x0; dx = 0.0; }
-            else                { x1 = std::min(x1, src_w - 1); }
-
-            const uint8_t * p00 = src + (y0 * src_w + x0) * channels;
-            const uint8_t * p01 = src + (y0 * src_w + x1) * channels;
-            const uint8_t * p10 = src + (y1 * src_w + x0) * channels;
-            const uint8_t * p11 = src + (y1 * src_w + x1) * channels;
-            uint8_t *       po  = dst + (y  * dst_w + x ) * channels;
-
-            const double w00 = (1.0 - dx) * (1.0 - dy);
-            const double w01 = dx         * (1.0 - dy);
-            const double w10 = (1.0 - dx) * dy;
-            const double w11 = dx         * dy;
-
+            const int   k0 = fx.first[x];
+            const int   n  = fx.taps[x];
+            const float * wrow = fx.weights.data() + (size_t)x * fx.max_taps;
+            uint8_t * out = dst + ((size_t)y * dst_w + x) * channels;
+            float acc[8] = {0}; // up to 8 channels supported here
+            for (int t = 0; t < n; ++t) {
+                int sx = k0 + t;
+                if (sx < 0)      sx = 0;
+                if (sx >= src_w) sx = src_w - 1;
+                const float w = wrow[t];
+                const float * sp = tmp.data() + ((size_t)y * src_w + sx) * channels;
+                for (int c = 0; c < channels; ++c) {
+                    acc[c] += w * sp[c];
+                }
+            }
             for (int c = 0; c < channels; ++c) {
-                double v = p00[c]*w00 + p01[c]*w01 + p10[c]*w10 + p11[c]*w11;
-                int    iv = (int)std::round(v);
+                int iv = (int)std::lrintf(acc[c]);
                 if (iv < 0)   iv = 0;
                 if (iv > 255) iv = 255;
-                po[c] = (uint8_t)iv;
+                out[c] = (uint8_t)iv;
             }
         }
     }
