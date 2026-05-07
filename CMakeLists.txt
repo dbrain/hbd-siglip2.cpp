@@ -15,8 +15,8 @@ if(SIGLIP2_TIMING)
     add_compile_definitions(SIGLIP2_TIMING)
 endif()
 
-# HTTP server (gated, off until M4)
-option(SIGLIP2_SERVER "Build the HTTP server reproducing kobbler-vision endpoints" OFF)
+# HTTP server reproducing kobbler-vision endpoints.
+option(SIGLIP2_SERVER "Build the HTTP server" ON)
 if(SIGLIP2_SERVER)
     include(FetchContent)
     FetchContent_Declare(httplib
@@ -142,6 +142,24 @@ target_link_libraries(siglip2-text-cli PRIVATE
     siglip2_text
     siglip2_tokenizer
 )
+
+if(SIGLIP2_SERVER)
+    add_executable(siglip2-server
+        src/siglip2_server.cpp
+    )
+    target_include_directories(siglip2-server PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/vendor
+    )
+    target_link_libraries(siglip2-server PRIVATE
+        siglip2_vision
+        siglip2_text
+        siglip2_tokenizer
+        siglip2_score
+        siglip2_preproc
+        httplib::httplib
+        nlohmann_json::nlohmann_json
+    )
+endif()
 
 install(TARGETS siglip2_vision siglip2_text siglip2_preproc siglip2_tokenizer siglip2_score siglip2-cli siglip2-text-cli
     ARCHIVE DESTINATION lib
