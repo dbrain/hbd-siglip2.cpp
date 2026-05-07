@@ -30,6 +30,18 @@ if(SIGLIP2_SERVER)
     FetchContent_MakeAvailable(httplib nlohmann_json)
 endif()
 
+# Sentencepiece (used by the multilingual text tokenizer; Gemma-style .model)
+include(FetchContent)
+set(SPM_ENABLE_SHARED OFF CACHE BOOL "" FORCE)
+set(SPM_ENABLE_TCMALLOC OFF CACHE BOOL "" FORCE)
+set(SPM_USE_BUILTIN_PROTOBUF ON CACHE BOOL "" FORCE)
+set(SPM_BUILD_TEST OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(sentencepiece
+    GIT_REPOSITORY https://github.com/google/sentencepiece.git
+    GIT_TAG        v0.2.0
+)
+FetchContent_MakeAvailable(sentencepiece)
+
 find_package(Threads REQUIRED)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -99,6 +111,20 @@ target_link_libraries(siglip2_score PUBLIC
     Threads::Threads
 )
 
+# Multilingual tokenizer (sentencepiece wrapper)
+add_library(siglip2_tokenizer STATIC
+    src/siglip2_tokenizer.cpp
+)
+target_include_directories(siglip2_tokenizer PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${sentencepiece_SOURCE_DIR}/src
+    ${sentencepiece_BINARY_DIR}
+)
+target_link_libraries(siglip2_tokenizer PUBLIC
+    sentencepiece-static
+    Threads::Threads
+)
+
 # CLI: load GGUF + (image|pixel-values) -> embedding
 add_executable(siglip2-cli
     src/siglip2_cli.cpp
@@ -114,9 +140,10 @@ add_executable(siglip2-text-cli
 )
 target_link_libraries(siglip2-text-cli PRIVATE
     siglip2_text
+    siglip2_tokenizer
 )
 
-install(TARGETS siglip2_vision siglip2_text siglip2_preproc siglip2-cli siglip2-text-cli
+install(TARGETS siglip2_vision siglip2_text siglip2_preproc siglip2_tokenizer siglip2_score siglip2-cli siglip2-text-cli
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION bin
