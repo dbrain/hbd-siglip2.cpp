@@ -76,7 +76,6 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "load failed: %s\n", enc.last_error().c_str());
         return 1;
     }
-    const int seq = enc.config().max_position_embeddings;
 
     std::vector<int32_t> token_ids, attention_mask;
     std::string err;
@@ -87,32 +86,33 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "tokenizer load failed: %s\n", tk.last_error().c_str());
             return 1;
         }
-        if (!tk.encode(text_input, seq, token_ids, attention_mask)) {
+        // Natural-length tokenization (matches HF live service behavior).
+        if (!tk.encode(text_input, -1, token_ids, attention_mask)) {
             fprintf(stderr, "tokenize failed: %s\n", tk.last_error().c_str());
             return 1;
         }
-        fprintf(stderr, "tokenized: pad=%d vocab=%d active=%d/%d\n",
-            tk.pad_token_id(), tk.vocab_size(),
-            (int)std::count(attention_mask.begin(), attention_mask.end(), 1), seq);
+        fprintf(stderr, "tokenized: pad=%d vocab=%d n_tokens=%zu\n",
+            tk.pad_token_id(), tk.vocab_size(), token_ids.size());
     } else {
         std::vector<uint8_t> tok_raw, mask_raw;
         if (!read_bytes(tok_path, tok_raw, err))  { fprintf(stderr, "%s\n", err.c_str()); return 1; }
         if (!read_bytes(mask_path, mask_raw, err)){ fprintf(stderr, "%s\n", err.c_str()); return 1; }
-        const size_t expected = sizeof(int32_t) * (size_t)seq;
-        if (tok_raw.size() != expected || mask_raw.size() != expected) {
-            fprintf(stderr,
-                "size mismatch: tok=%zu mask=%zu expected=%zu (seq=%d sizeof(int32)=%zu)\n",
-                tok_raw.size(), mask_raw.size(), expected, seq, sizeof(int32_t));
+        if (tok_raw.size() != mask_raw.size() ||
+            tok_raw.size() == 0 ||
+            tok_raw.size() % sizeof(int32_t) != 0) {
+            fprintf(stderr, "tok/mask size mismatch or invalid (tok=%zu mask=%zu)\n",
+                tok_raw.size(), mask_raw.size());
             return 1;
         }
+        const size_t n = tok_raw.size() / sizeof(int32_t);
         token_ids.assign(reinterpret_cast<const int32_t *>(tok_raw.data()),
-                         reinterpret_cast<const int32_t *>(tok_raw.data()) + seq);
+                         reinterpret_cast<const int32_t *>(tok_raw.data()) + n);
         attention_mask.assign(reinterpret_cast<const int32_t *>(mask_raw.data()),
-                              reinterpret_cast<const int32_t *>(mask_raw.data()) + seq);
+                              reinterpret_cast<const int32_t *>(mask_raw.data()) + n);
     }
 
     std::vector<float> emb;
-    if (!enc.encode(token_ids.data(), attention_mask.data(), emb)) {
+    if (!enc.encode(token_ids.data(), (int)token_ids.size(), attention_mask.data(), emb)) {
         fprintf(stderr, "encode failed: %s\n", enc.last_error().c_str());
         return 1;
     }

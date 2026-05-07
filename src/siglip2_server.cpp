@@ -206,13 +206,20 @@ bool encode_text(
     const std::string & prompt,
     std::vector<float> & out_emb,
     std::string &       err) {
+    // Match HuggingFace Siglip2Processor's text branch exactly:
+    //   - pad input_ids to max_position_embeddings (64) with pad_token_id
+    //   - DO NOT pass attention_mask to the model. Siglip2Processor returns
+    //     only input_ids for text-only calls; the live kobbler-vision service
+    //     does `model.text_model(**inputs)` without a mask, so pad-token-0
+    //     embeddings flow through attention as real tokens. Passing a mask
+    //     would diverge by ~0.24 cosine on short prompts.
     std::vector<int32_t> ids, mask;
-    const int seq = st.text->config().max_position_embeddings;
-    if (!st.tokenizer->encode(prompt, seq, ids, mask)) {
+    const int max_pos = st.text->config().max_position_embeddings;
+    if (!st.tokenizer->encode(prompt, max_pos, ids, mask)) {
         err = "tokenize: " + st.tokenizer->last_error();
         return false;
     }
-    if (!st.text->encode(ids.data(), mask.data(), out_emb)) {
+    if (!st.text->encode(ids.data(), max_pos, /*attention_mask=*/nullptr, out_emb)) {
         err = "text encode: " + st.text->last_error();
         return false;
     }

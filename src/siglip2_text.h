@@ -33,12 +33,17 @@ public:
     const TextConfig & config() const { return config_; }
     const std::string & last_error() const { return error_msg_; }
 
-    // token_ids:        length = config.max_position_embeddings, int32
-    // attention_mask:   length = config.max_position_embeddings, int32 (1=valid, 0=pad)
-    // out_embedding:    resized to projection_size on success
+    // token_ids:        length n_tokens (must be > 0 and <= max_position_embeddings)
+    // attention_mask:   length n_tokens (1=valid, 0=pad). May be nullptr if no padding.
+    // out_embedding:    resized to projection_size on success.
+    //
+    // Pools at position n_tokens-1 (the last position in the batch), matching HF's
+    // last_hidden_state[:, -1, :]. For multi-prompt batches the caller pads all
+    // prompts to the same n_tokens (longest-in-batch) for HF parity.
     bool encode(
         const int32_t *      token_ids,
-        const int32_t *      attention_mask,
+        int                  n_tokens,
+        const int32_t *      attention_mask, // may be nullptr
         std::vector<float> & out_embedding);
 
 private:

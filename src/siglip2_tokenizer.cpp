@@ -58,11 +58,6 @@ bool Tokenizer::encode(
         error_msg_ = "Tokenizer not loaded";
         return false;
     }
-    if (max_length <= 0) {
-        error_msg_ = "max_length must be > 0";
-        return false;
-    }
-
     std::vector<int> ids;
     auto status = state_->proc.Encode(text, &ids);
     if (!status.ok()) {
@@ -70,11 +65,16 @@ bool Tokenizer::encode(
         return false;
     }
 
-    // SigLIP2's HF tokenizer appends EOS before padding (Gemma convention).
-    // Sentencepiece's plain Encode doesn't, so we add it here. If truncation
-    // would drop EOS, we keep it as the last position to mirror HF.
+    // Append EOS (Gemma/SigLIP2 convention) — sentencepiece's plain Encode does not.
     if (eos_id_ >= 0) {
         ids.push_back(eos_id_);
+    }
+
+    if (max_length <= 0) {
+        // Natural-length output: no padding, mask all 1s.
+        out_token_ids.assign(ids.begin(), ids.end());
+        out_attention_mask.assign(ids.size(), 1);
+        return true;
     }
 
     out_token_ids.assign((size_t)max_length, pad_id_);
@@ -82,10 +82,10 @@ bool Tokenizer::encode(
 
     const int n_keep = std::min((int)ids.size(), max_length);
     for (int i = 0; i < n_keep; ++i) {
-        out_token_ids[i]     = ids[i];
+        out_token_ids[i]      = ids[i];
         out_attention_mask[i] = 1;
     }
-    // If we had to truncate and EOS got dropped, replace the last token with EOS.
+    // If truncation dropped EOS, keep it pinned at the last position.
     if (eos_id_ >= 0 && (int)ids.size() > max_length) {
         out_token_ids[max_length - 1] = eos_id_;
     }

@@ -301,17 +301,25 @@ bool TextEncoder::load(const std::string & gguf_path) {
 
 bool TextEncoder::encode(
     const int32_t *      token_ids,
+    int                  n_tokens,
     const int32_t *      attention_mask,
     std::vector<float> & out_embedding) {
     if (!state_) {
         error_msg_ = "TextEncoder not loaded";
         return false;
     }
+    if (n_tokens <= 0 || n_tokens > config_.max_position_embeddings) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "n_tokens must be in (0, %d], got %d",
+            config_.max_position_embeddings, n_tokens);
+        error_msg_ = buf;
+        return false;
+    }
 
     const int   H        = config_.hidden_size;
     const int   n_head   = config_.num_attention_heads;
     const int   d_head   = H / n_head;
-    const int   n_pos    = config_.max_position_embeddings;
+    const int   n_pos    = n_tokens;
     const float kq_scale = 1.0f / std::sqrt((float)d_head);
     const int   proj     = config_.projection_size;
 
