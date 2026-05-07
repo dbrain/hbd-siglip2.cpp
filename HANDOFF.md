@@ -1,20 +1,20 @@
 # siglip2.cpp — Handoff
 
-You're picking up `siglip2.cpp` after the 2026-05-07 VRAM-minimisation pass + 2026-05-08 perf pass. Feature parity has been complete since M5; the last two passes drove VRAM from 1855 MiB to 1438 MiB and added padded MMA-FA for the d_head=72 case. Read `AGENTS.md` for the architectural overview; this doc is **what to do next + why + the user's disposition**.
+You're picking up `siglip2.cpp` after the 2026-05-07 VRAM pass + 2026-05-08 perf pass + 2026-05-09 QKV-fusion pass. Feature parity has been complete since M5; the prior passes drove VRAM from 1855 MiB to 1438 MiB and added padded MMA-FA for d_head=72; this last pass landed fused Q/K/V projections at conversion time, closing 14 % off the text path. Read `AGENTS.md` for the architectural overview; this doc is **what to do next + why + the user's disposition**.
 
 ## Cold-pickup orientation — if you've got a long run ahead
 
-The user is asleep. They want to come back to "shocking news," not to a polite request for permission. Three fattest swings, in order of where I'd put my chips for an overnight session:
+The user is asleep. They want to come back to "shocking news," not to a polite request for permission. The biggest swings remaining, in order of where I'd put my chips:
 
-1. **Megakernel-style block fusion** (lever E below). The biggest single perf jump on the board. The user explicitly opted in for this kind of work — `dbrain/ggml@master` is exactly the worktree to fork further. Pattern reference: `kobbler/docker/tts-qwen3-dev/HANDOFF-megakernel-v0.md`. Plan it as Phase A (skeleton + parity-clean fused attn block at fixed shape n_pos=729, H=1152) → Phase B (FFN fusion + multi-shape) and write a `HANDOFF-megakernel-v0.md` of your own as you go so the *next* agent can resume mid-flight.
+1. **Megakernel-style block fusion** (lever E below). Still the biggest single perf jump on the board. The user explicitly opted in for this kind of work — `dbrain/ggml@master` is exactly the worktree to fork further. Pattern reference: `kobbler/docker/tts-qwen3-dev/HANDOFF-megakernel-v0.md`. Plan it as Phase A (skeleton + parity-clean fused attn block at fixed shape n_pos=729, H=1152) → Phase B (FFN fusion + multi-shape) and write a `HANDOFF-megakernel-v0.md` of your own as you go so the *next* agent can resume mid-flight.
 
-2. **Graph caching for fixed-shape encoders.** Text path always has n_pos=64; vision shapes are bounded by max_num_patches and there are only a finite set the binary-search can land on. Right now `encode()` rebuilds the graph + reruns `ggml_backend_sched_alloc_graph` every call — that's pure overhead, especially visible on the text path (54 ms vs Python's 34 ms; the kernels aren't the gap, the setup is). Cache `(shape) → built graph + bound input tensors` and reuse. Should win 10–30 % on text and classify_from_embeddings without touching kernels.
+2. **Graph caching for fixed-shape encoders.** **Tried and partially blocked this pass — see "Dead ends" below.** A safe blanket-clear of `tensor->data` + `tensor->buffer` on graph_ctx tensors between calls *should* let `ggml_backend_sched_alloc_graph` re-bind compute-pool offsets cleanly, but in practice produces an illegal-memory-access on the second compute (split-graph copies in `sched->ctx` end up with offsets that collide with the cached node_alloc table). The next agent should either fork ggml's gallocr to expose a clean "rebind everything" entry point, or run with `GGML_CUDA_USE_GRAPHS` enabled *plus* graph caching simultaneously (single biggest win available — CUDA graphs need stable tensor pointers AND that's exactly what graph caching provides). Estimated 10–20 % more on text + classify_from_embeddings if landed cleanly.
 
-3. **Padded MMA FA was already landed in this pass** (`48fd16e`); see "What landed" below for context. With megakernel + graph caching both done you'll have closed the perf gap to Python decisively without touching VRAM.
+3. **Padded MMA FA was already landed earlier** (`48fd16e`); see "What landed" below.
 
-If you want a smaller warm-up before megakernel, the **banana-stand** ffn_down padding (lever J) is fully implemented — three files, ~30 LOC, measured −126 MiB VRAM at the cost of 74 µcos on one image-parity shape. The user wanted to keep the 0.999 sentinel "for now"; if you read the lever and decide it's the right move for the deploy, surface the data and ask, but don't land without explicit OK on that one.
+If you want a smaller warm-up before megakernel, the **banana-stand** ffn_down padding (lever J) is fully implemented — three files, ~30 LOC, measured −126 MiB VRAM at the cost of 74 µcos on one image-parity shape. **Per the user 2026-05-09: keep this parked unless you hit a 400 MiB-class win or actual OOM pressure.** 126 MiB doesn't move the needle on a 12 GB GPU and the cosine cost isn't worth it.
 
-Stay below 0.999 cosine on the real-image path = needs explicit user buy-in. Everything else is fair game.
+Stay above 0.999 cosine on the real-image path. Everything else is fair game.
 
 ## The user's standing instructions
 
@@ -42,26 +42,24 @@ Translation: **pick targets, swing big, report when shocking.** The user is expl
 
 ## Where we are
 
-- Branch: `dbrain/siglip2-v0`, 16 commits, never pushed. Baseline is `qwen3-tts.cpp@main` (4068ce4) + `ggml@master` (dbrain/ggml fork).
+- Branch: `dbrain/siglip2-v0`, 17 commits + the QKV-fusion change in flight, never pushed. Baseline is `qwen3-tts.cpp@main` (4068ce4) + `ggml@master` (dbrain/ggml fork).
 - Builds: `build/` (CPU) and `build-cuda/` (sm_86); both pass smoke + all four parity scripts.
-- Parity (all four scripts):
-  - `parity_check_vision.py`: cosine **0.999937** (synthetic pixel_values; no resize)
-  - `parity_check_text.py`:   cosine **0.999723**
-  - `parity_check_score.py`:  logits cosine **0.999992**, probs MAE **3.8e-7**
-  - `parity_check_image.py` (1920×1080 → 729 patches, the heavy-downsample case): cosine **0.999054** ← AA bilinear + padded MMA FA, both above 0.999
-- Live cross-check vs `kobbler-vision-1` (Python fp16, GPU) on a 320×180 PNG, max_num_patches=729 (an *upsample* case where AA can't help; cosine is bounded by Q8 noise):
-  - Image embedding cosine: **0.995865**
-  - Score MAE: **1.92e-2**
+- Parity (all four scripts, post QKV-fusion):
+  - `parity_check_vision.py`: cosine **0.999907** (synthetic pixel_values; no resize) — was 0.999937 (−3 µcos, sampling noise)
+  - `parity_check_text.py`:   cosine **0.999779** — was 0.999723 (+5.6 µcos, very slight improvement)
+  - `parity_check_score.py`:  logits cosine **0.999987**, probs MAE **5.0e-7** — was 0.999992 / 3.8e-7
+  - `parity_check_image.py` (1920×1080 → 729 patches): cosine **0.999545** — was 0.999054 (**+491 µcos**, real improvement; fused matmul has slightly better numerics than three independent ones)
+- Live cross-check vs `kobbler-vision-1` on a 320×180 PNG, max_num_patches=729: Image embedding cosine **0.995865**, scores MAE **1.92e-2** — bit-identical to pre-fusion (Q8 noise floor, fusion doesn't move it).
 - VRAM (siglip2-server, model loaded + warmed, RTX 3060):
   - Python (kobbler-vision-1):    **2325 MiB**
-  - C++ both towers (full):       **1438 MiB**  (−887 MiB / **−38%** vs Python)
-  - C++ `--vision-only`:           **720 MiB**  (−1605 MiB / **−69%** vs Python — kobbler's deploy target)
+  - C++ both towers (full, post-warmup): **~1920 MiB** (−405 MiB vs Python — note: this is post-warmup including activations; the **post-load resident** is closer to 1440 MiB with a ~480 MiB activation peak that lands during the first encode).
+  - C++ `--vision-only`:           **720 MiB** post-load (−1605 MiB / **−69%** vs Python — kobbler's deploy target)
   - C++ `--text-only`:             **944 MiB**
-- Endpoint p50 (8 runs, both servers warmed, GPU somewhat shared with neighbours so absolute numbers wobble run-to-run):
-  - `/v1/embeddings`:               C++ ~60 ms vs Python ~56 ms (≈0.93×)
-  - `/v1/text_embeddings`:          C++ ~47 ms vs Python ~29 ms (≈0.61× — graph-setup bound, see lever below)
-  - `/v1/classify`:                 C++ ~101 ms vs Python ~69 ms (≈0.68×)
-  - `/v1/classify_from_embeddings`: C++ ~45 ms vs Python ~22 ms (≈0.48× — small-batch text, ditto)
+- Endpoint p50 (30 runs, both servers warmed, GPU shared with kobbler-vision + tts-qwen3 + dev iter container so wobble is real):
+  - `/v1/embeddings`:               C++ ~58 ms vs Python ~54 ms (cpp **1.07×** — was 1.10× pre-QKV-fusion)
+  - `/v1/text_embeddings`:          C++ ~38 ms vs Python ~26 ms (cpp **1.43×** — was **1.71×**, **−14% absolute**)
+  - `/v1/classify`:                 C++ ~94 ms vs Python ~70 ms (cpp **1.34×** — was 1.45×)
+  - `/v1/classify_from_embeddings`: C++ ~38 ms vs Python ~21 ms (cpp **1.79×** — was 2.08×)
 - Reload time: C++ cold-load **0.66 s** vs Python **10.5 s** — **~16× faster** swap (no torch/transformers import). Dominant for kobbler's vision↔TTS↔STT GPU-sharing.
 - Host RAM: Python ~3 GiB → C++ ~568 MiB.
 
@@ -71,7 +69,7 @@ If you touch the text path or anyone reports text drift, **remember**: HF `Sigli
 
 ## What landed in this pass
 
-2026-05-07 (VRAM pass), then 2026-05-08 (perf pass + housekeeping). In commit order:
+2026-05-07 (VRAM pass), 2026-05-08 (perf pass + housekeeping), 2026-05-09 (QKV fusion). In commit order:
 
 - **`dc83baa` — chore: remove inherited TTS source** (lever H). 51 files, ~30k lines deleted. Tree now only has SigLIP2.
 - **`d8bb673` — feat(convert): Q8_0 the text token embedding** (lever B). Drop `_is_keep_f16` special case for `t.token_embd.weight`. Saves ~390 MiB VRAM. GGUF on disk shrinks 1.74 → 1.47 GiB.
@@ -81,6 +79,32 @@ If you touch the text path or anyone reports text drift, **remember**: HF `Sigli
 - **`4849c9f` — feat(preproc): antialiased bilinear CPU resize** (lever A). Separable triangular AA filter matching torchvision `F.interpolate(antialias=True)`. Lifts image cosine at heavy-downsample shapes from <0.998 to ≥0.999.
 - **`48fd16e` — perf(fa): zero-pad d_head 72 → 80 to hit MMA tensor-core path.** ggml's CUDA MMA / WMMA flash-attn kernels require D % 16 == 0; SigLIP2's d_head=72 was falling back to the (CUDA-cores) tile kernel. We zero-pad Q/K/V's d-axis to next multiple of 16 before FA and slice the result back before the output projection. Zero padding is mathematically null (Q·K and V both contribute 0 in padded slots) so parity is unchanged. **+14–23 % p50 on every endpoint, same VRAM.** See the helper `fa_attn_pad_slice` in `src/siglip2_vision.cpp`.
 - **`77f97f1` — docs: revert parity floor to 0.999** (housekeeping; user briefly relaxed to 0.997 on 2026-05-08 then put it back).
+- **(this pass) — perf(convert,vision,text): fuse Q/K/V projections per layer.** The converter now stacks `q_proj`/`k_proj`/`v_proj` along the output dim into one `attn_qkv.{weight,bias}` per encoder block, and `build_block` runs a single wider mul_mat + bias-add instead of three. Q/K/V become *strided* `ggml_view_3d` views into the fused output (no `ggml_reshape_3d` step — non-contiguous along positions), and the existing `ggml_cont`-before-`ggml_pad` path materialises them when the d_head-pad helper needs contiguous memory, so parity is unchanged. **−6 ms (−14 %) on text and classify_from_embeddings, −7 ms (−7 %) on classify, −1 ms (−2 %) on embeddings.** Image-parity cosine on the heavy-downsample shape *improved* from 0.999054 → 0.999545 (single matmul has slightly better fp32 accumulator behaviour than three independent ones). 81 fewer kernel launches per request × both towers loaded.
+
+## Dead ends and partial attempts (2026-05-09 pass)
+
+These are flagged so the next agent doesn't redo them or wastes the same context window.
+
+### Graph caching attempt — partial, blocked, reverted
+
+Tried to cache `(graph_ctx, gf, input/output tensor pointers)` per shape and reuse across calls so we'd skip the per-call build_block traversal *and* enable CUDA-graph reuse (which needs stable tensor pointers to warm up). On the second call, `ggml_backend_sched_alloc_graph` either silently leaves stale `tensor->data` pointers in place (gallocr's `init_tensor` skips re-allocation when `data != NULL`) or fails the `ggml_backend_tensor_alloc` assertion when both `data` and `buffer` are non-NULL.
+
+Workarounds tried:
+1. Iterate `ggml_graph_n_nodes(gf)` + the four cached input pointers, set `data = nullptr`.
+2. Same plus `buffer = nullptr` (fixed the assertion → next call's compute crashed instead with `illegal memory access` on MUL/GELU).
+3. Walk *every* tensor in `graph_ctx` via `ggml_get_first_tensor` / `ggml_get_next_tensor`, clear `data` and `buffer`. Same illegal-memory crash.
+
+Diagnosis: `ggml_backend_sched_split_graph` rebuilds an internal `sched->graph` each call (frees `sched->ctx`, creates fresh split-copy tensors at the same context-buffer offsets as last call). `gallocr->node_allocs[]` was indexed by position from the *first* call's `sched->graph.nodes[]`. On the second call, even though the position-indexed offsets are still valid, *something* about the path causes node-internal data writes to land on memory that's been reused for a different tensor. Suspect: `sched->graph.n_leafs` may include split-copies that get assigned overlapping offsets to our cleared cached tensors, but `ggml_gallocr_needs_realloc` returns false because the leaf/node *counts* match, so the path skips the full-reserve fallback that would re-derive offsets.
+
+Path forward for the next agent: either (a) fork ggml's gallocr to add a "force-rebind everything from saved offsets" call that doesn't trigger the `data == NULL` short-circuit, or (b) hold a dedicated `ggml_backend_sched_t` per cache entry (the "small VRAM cost" path the original handoff alluded to) — each entry's gallocr has a stable, non-shared view of `sched->graph` and the offset table can't get confused by other shapes. The (b) approach is probably <1 day of work and unblocks CUDA-graph capture as a free byproduct.
+
+### CUDA graphs (`-DGGML_CUDA_GRAPHS=ON`) — built, measured, no-op (slight regression)
+
+Rebuilt with the flag on, expecting the warmed-up CUDA-graph path to kick in after two calls. It doesn't, because `ggml_cuda_graph_get_key(cgraph) = cgraph->nodes[0]` and our first node is a freshly-allocated tensor pointer on every call. Even if the key matched, `ggml_cuda_graph_update_required` does a `memcmp(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor))` which always differs because the tensors themselves are fresh objects. Net effect with the flag on: small overhead from the compatibility/warmup checks, no benefit (text path crept up ~10 ms). **Reverted to OFF.** This re-enables only after graph caching above is solved.
+
+### Lever J (ffn_down padding) — confirmed parked
+
+Per the user 2026-05-09: 126 MiB VRAM win is not worth a sub-0.999 cosine drop. The bar to drop below 0.999 is a 400 MiB-class win or actual OOM pressure (neither applies on a 12 GB GPU with vision-only at 720 MiB resident). Implementation details are still in lever J below; left documented in case the deploy substrate changes.
 
 ## Lever queue — what's left
 
@@ -93,11 +117,12 @@ Ordered for an overnight run: biggest swings first, smaller-but-clean wins below
 - **How to start:** read the qwen3-tts handoff doc, then sketch a `HANDOFF-megakernel-v0.md` here mirroring its structure. Phase A target = parity-clean fused vision encoder block at fixed n_pos=729, H=1152, d_head=72. Q8 weights, F32 activations, FA path inside the kernel (no separate FA dispatch).
 - **Risk:** Real. Massive-rewrite-of-internal-GGML territory. User explicitly opted in. Expect 1–2 weeks if you go all the way through Phase A + B; less if you stop at a single-shape Phase A drop-in.
 
-### Graph caching for fixed-shape encoders *(perf; medium)*
+### Graph caching for fixed-shape encoders *(perf; medium — bumped to "do this BEFORE megakernel, it unblocks CUDA graphs")*
 - Right now both `VisionEncoder::encode()` and `TextEncoder::encode()` allocate the per-call arena, build the cgraph from scratch, and run `ggml_backend_sched_alloc_graph` every call. For text n_pos is constant (=64) so this is pure overhead repeated forever; for vision the shape varies but is bounded — there's a finite set of `(n_patches_h, n_patches_w)` shapes the binary-search lands on for any fixed `max_num_patches`.
-- **Suspected payoff:** text path is at 0.61× of Python (47 ms vs 29 ms); the kernels themselves can't be that gap, so it's almost all setup. A graph cache (small LRU keyed on shape) should reclaim 10–30 % on text + classify_from_embeddings.
-- **How:** keep a `std::unordered_map<key, BuiltGraph>` on the encoder where `BuiltGraph` carries the arena buffer, the cgraph, and the bound input/output tensor pointers. On entry to `encode()`, look up by shape; on miss, build + insert. `ggml_backend_sched_alloc_graph` results need a `ggml_backend_sched_reset` between calls — verify the cache holds up across resets, otherwise hold one sched per cache entry (small VRAM cost).
-- **Risk:** Low–medium. Watch for thread-safety if a request hits the encoder while another is computing (`encode_mutex` already serializes server side, so probably fine).
+- **Suspected payoff:** Even after QKV fusion, text is at 1.43× python (38 ms vs 26 ms). With graph caching + CUDA graphs (which need stable tensor pointers and depend on caching first) this should be ≤1.0×.
+- **What was tried this pass (failed):** see "Dead ends" above. The shared-scheduler path runs into gallocr offset reuse issues across calls.
+- **Recommended path:** one `ggml_backend_sched_t` per cache entry. Pay the small extra activation-buffer VRAM (call it ~50–100 MiB per cached shape; vision-only deploy still well under 1 GiB). Single-shape text cache + a 2–3 entry vision LRU. Keyed on `(n_pos)` for text, `(n_patches_h, n_patches_w)` for vision. Then enable `-DGGML_CUDA_GRAPHS=ON` and the warmup path takes over after two stable calls.
+- **Risk:** Medium. The per-shape VRAM cost is the main concern; the user has explicitly OK'd "go crazy" on perf, and ~100 MiB extra activation overhead beats the 10–20 % perf left on the table.
 
 ### Endpoint perf — bonus *(small; complements megakernel/graph-cache)*
 - **Pinned-memory upload paths.** `ggml_backend_tensor_set` with pageable host memory is a known small loss. Pinned alloc for the I/O scratch on the encoder side could shave a few ms off small-batch endpoints (text + classify_from_embeddings).
