@@ -300,7 +300,7 @@ bool TextEncoder::load(const std::string & gguf_path) {
         }
         std::vector<ggml_backend_buffer_type_t> bufts;
         for (auto b : backends) bufts.push_back(ggml_backend_get_default_buffer_type(b));
-        const int max_nodes = 8192;
+        const int max_nodes = 2048;
         state_->sched = ggml_backend_sched_new(
             backends.data(), bufts.data(), (int)backends.size(),
             max_nodes, false, true);
@@ -339,7 +339,7 @@ bool TextEncoder::encode(
     const float kq_scale = 1.0f / std::sqrt((float)d_head);
     const int   proj     = config_.projection_size;
 
-    const int    max_nodes = 8192;
+    const int    max_nodes = 2048;
     const size_t arena_sz  =
         ggml_tensor_overhead() * 4096 +
         ggml_graph_overhead_custom(max_nodes, false);
