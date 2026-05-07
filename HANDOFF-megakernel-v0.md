@@ -79,7 +79,57 @@ in `src/siglip2_server.cpp::main()` (and both CLIs), the graph-begin
 hook, the per-op anchor/follower pattern. Phase A1 is the same
 machinery, bigger fusion.
 
-## Phase A1 — QKV-prep chain fusion (the next ~3-5 ms swing)
+## Phase A1 — QKV-prep chain fusion *(SCAFFOLDED, PARKED — gallocr aliasing trap)*
+
+> **Status:** kernel + plan-builder + dispatcher are all in `src/cuda/siglip2_megakernel.{cu,cuh}` already; default-off (`SIGLIP2_ENABLE_QKV_PREP=1` to opt in). When enabled, vision output is bit-clean vs A1-OFF (cosine 1.0000000) but **every text encode produces NaN**. The bug is a single-kernel late-anchor design colliding with ggml's gallocr; the fix is a 2-kernel design with a persistent scratch buffer. Receipts below — read before re-attempting.
+
+### What the late-anchor approach tried
+
+One fused kernel anchored on `V_cast` (the highest-topo of {Q_pad, K_cast, V_cast} per block), reading from `qkv_add->data` and writing the three FA inputs in one launch. Plan-builder finds 27 chains for both text and vision (verified via `SIGLIP2_MEGAKERNEL_VERBOSE=1`). With A1 ON:
+- vision self-parity vs A1-OFF: cosine **1.0000000** (looks bit-perfect)
+- text self-parity vs A1-OFF: every output is **NaN** (silent NaN propagation through subsequent attention)
+
+### Why it breaks
+
+`gallocr`'s static analysis for `qkv_add`:
+- last consumer = the three `cont` ops (which read it via the strided permuted views)
+- so `qkv_add.data`'s lifetime = [qkv_add.idx, last_cont.idx]
+- after `last_cont.idx`, the slot is freeable → reusable for any other tensor
+
+Our late-anchor fires at `V_cast.idx > last_cont.idx`. By that point gallocr has already let the slot host a different tensor whose lifetime intersects this window. We read garbage. For vision (n_pos=729), the colliding tensor happens to land somewhere that doesn't matter for cosine; for text (n_pos=64) the smaller tensor sizes change gallocr's packing and the collision corrupts a live attention output → NaN.
+
+### Why we can't just move the anchor earlier
+
+Any anchor index `i` must satisfy:
+- `i ≤ qkv_add.idx`  to read `qkv_add.data` (or `mm.data + bias.data`)
+- `i ≥ max(Q_pad.idx, K_cast.idx, V_cast.idx)` to write to those dsts (their slots may be aliased with active tensors before their lifetime starts)
+
+These constraints are **mutually exclusive** because `Q_pad.idx > qkv_add.idx` by graph topology. No single anchor works.
+
+### The 2-kernel fix
+
+Decouple read and write into two separately-anchored kernels:
+
+1. **Anchor on `qkv_add`** (replaces the bias-add): launch a kernel that reads `mm.data + bias.data`, sums them, writes to a **persistent scratch buffer** allocated in `install()` once. Followers: nothing — qkv_add itself is the anchor.
+2. **Anchor on `V_cast`** (last in topo): launch the existing fused split-permute-pad-cast kernel reading from scratch, writing to Q_pad / K_cast / V_cast. Followers: 3 conts + 3 pads + 2 casts (skip qkv_add since it's the other anchor).
+
+Scratch-buffer sizing: `3 * H * max(text_n_pos, vision_n_pos) * sizeof(float)` = `3 * 1152 * 729 * 4` ≈ **10 MiB** for the hottest shape. Allocate once in `install()` (or lazy-on-first-fire). Reuse across all 27 blocks per encode — block N's scratch is consumed before block N+1's write because the CUDA stream is sequenced.
+
+Total: 9 ops/block (1 add + 3 cont + 3 pad + 2 cast) → 2 kernels. **Saves 7 launches per block × 27 = 189/encode** — same as the abandoned single-kernel design. Roughly 1.5-2 ms per text encode at ~10 µs/launch.
+
+### Where to anchor in code
+
+Plan-builder needs two entries per block — one for each anchor. The followers list shrinks accordingly. `g_qkv_anchors` already maps `dst → QkvPrepEntry` so a second map (or a discriminated `enum AnchorRole { COPY_TO_SCRATCH, SPLIT_FROM_SCRATCH }`) handles both. The scratch pointer is per-block (since blocks are sequential, one block's scratch is fine — but if you ever go pipelined / multi-stream, you'd need n_blocks scratches).
+
+### Don't fall into these adjacent traps
+
+- **Don't try to anchor on the FIRST cont and read qkv_add inline.** Same lifetime problem: the cont's compute (returning true via op_hook) is at last_cont.idx for the LAST cont but earlier for the others; gallocr still expires qkv_add.data at last_cont.idx and any earlier read sees the data alive only until its OWN cont fires.
+- **Don't try to redirect FA's input pointers via `tensor->data = scratch_ptr`** post-allocation. ggml's gallocr keeps internal bookkeeping; mutating `data` after `sched_alloc_graph` corrupts the allocator's state on the next graph compute.
+- **Don't insert a no-op "consumer" node into the graph to extend qkv_add's lifetime.** That changes the graph structure (build_block in two TUs); doable but more invasive than scratch + 2 kernels, and you'd still need to walk the graph twice anyway.
+- The auto-memory entry on the qwen3-tts.cpp A2 sub-megakernel (`project_qwen3tts_a2_autofusion_block.md`) describes a related but distinct trap: ggml's `try_fuse({RMS_NORM, MUL})` eats the anchor before op_hook fires. SigLIP2 doesn't use RMSNorm so that specific pre-fusion doesn't bite us, but the take-away is the same — **ggml-cuda's static behaviour limits where you can hook from, design around it.**
+
+### Original Phase A1 framing (kept for context)
+
 
 ## Where things stand
 

@@ -23,6 +23,7 @@
 
 #include "ggml.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
@@ -135,6 +136,91 @@ void launch_fused_layernorm_affine(
 }
 
 // ----------------------------------------------------------------------------
+// Fused QKV-prep kernel
+// ----------------------------------------------------------------------------
+//
+// Replaces (3 cont + 3 pad + 2 cast) per encoder block with one launch.
+//
+// Source layout — qkv is the bias-add output, F32 contiguous, ne=(3*H, n_pos)
+// with ne[0]=3*H innermost. For position p, head h, component c (0=Q, 1=K,
+// 2=V), the d_head-element vector lives at byte offset
+//   p * (3*H * 4) + c * H * 4 + h * d_head * 4
+// i.e. flat F32 index `p * 3*H + c * H + h * d_head + d`.
+//
+// Destination layout — each of {q_pad, k_cast, v_cast} is contiguous in the
+// permuted/padded shape ne=(d_pad, n_pos, n_head) where ne[0]=d_pad is
+// innermost, ne[1]=n_pos, ne[2]=n_head. Flat index `h * d_pad * n_pos +
+// p * d_pad + d`. q_pad is F32; k_cast / v_cast are F16. Padded slots
+// (d in [d_head, d_pad)) are written as exact zero.
+//
+// Grid: (n_pos, 3*n_head, 1). Block: (d_pad, 1, 1). One thread per output
+// element across all three outputs.
+namespace {
+
+__global__ void fused_qkv_prep_kernel(
+        const float * __restrict__ qkv,
+        float       * __restrict__ q_pad,
+        __half      * __restrict__ k_cast,
+        __half      * __restrict__ v_cast,
+        const int                  H,
+        const int                  n_head,
+        const int                  d_head,
+        const int                  d_pad,
+        const int                  n_pos) {
+    const int d  = threadIdx.x;
+    if (d >= d_pad) return;
+    const int p  = blockIdx.x;
+    const int hc = blockIdx.y;          // 0..3*n_head - 1
+    const int c  = hc / n_head;         // 0=Q, 1=K, 2=V
+    const int h  = hc - c * n_head;
+
+    const int dst_idx = h * d_pad * n_pos + p * d_pad + d;
+
+    if (d < d_head) {
+        const int src_idx = p * 3 * H + c * H + h * d_head + d;
+        const float v = qkv[src_idx];
+        if (c == 0) {
+            q_pad[dst_idx] = v;
+        } else if (c == 1) {
+            k_cast[dst_idx] = __float2half(v);
+        } else {
+            v_cast[dst_idx] = __float2half(v);
+        }
+    } else {
+        // Pad slot — exact zero (no denormals).
+        if (c == 0) {
+            q_pad[dst_idx] = 0.0f;
+        } else if (c == 1) {
+            k_cast[dst_idx] = __ushort_as_half((unsigned short) 0);
+        } else {
+            v_cast[dst_idx] = __ushort_as_half((unsigned short) 0);
+        }
+    }
+}
+
+}  // namespace
+
+void launch_fused_qkv_prep(
+        const float * qkv,
+        float       * q_pad,
+        void        * k_cast,
+        void        * v_cast,
+        int           H,
+        int           n_pos,
+        int           n_head,
+        int           d_head,
+        int           d_pad,
+        cudaStream_t  stream) {
+    const dim3 grid((unsigned) n_pos, (unsigned) (3 * n_head), 1);
+    const dim3 block((unsigned) d_pad, 1, 1);
+    fused_qkv_prep_kernel<<<grid, block, 0, stream>>>(
+        qkv, q_pad,
+        static_cast<__half *>(k_cast),
+        static_cast<__half *>(v_cast),
+        H, n_head, d_head, d_pad, n_pos);
+}
+
+// ----------------------------------------------------------------------------
 // Plan: (norm → mul-with-weight → add-with-bias) chain detection
 // ----------------------------------------------------------------------------
 //
@@ -169,16 +255,61 @@ struct LayerNormEntry {
     float eps   = 1e-6f;
 };
 
+// ----------------------------------------------------------------------------
+// Phase A1: QKV-prep chain plan
+// ----------------------------------------------------------------------------
+//
+// One QkvPrepEntry per encoder block whose qkv bias-add is followed by the
+// (3 cont + 3 pad + 2 cast) chain feeding flash_attn_ext. Anchor = whichever
+// of {q_pad, k_cast, v_cast} has the highest topo index in the cgraph (so
+// when the op-hook anchors and the fused kernel writes all three dsts, the
+// upstream followers' op_hook calls have already returned true).
+
+struct QkvPrepEntry {
+    const ggml_tensor * qkv_node    = nullptr;  // qkv bias-add (data source)
+    const ggml_tensor * q_pad_dst   = nullptr;  // F32 dst we write to
+    const ggml_tensor * k_cast_dst  = nullptr;  // F16 dst we write to
+    const ggml_tensor * v_cast_dst  = nullptr;  // F16 dst we write to
+    int H      = 0;
+    int n_pos  = 0;
+    int n_head = 0;
+    int d_head = 0;
+    int d_pad  = 0;
+};
+
 namespace {
 
 std::unordered_map<const ggml_tensor *, LayerNormEntry> g_ln_anchors;
 std::unordered_set<const ggml_tensor *>                 g_ln_followers;
 
-bool     g_enabled         = true;
-uint64_t g_groups_built    = 0;
-uint64_t g_anchor_fires    = 0;
-uint64_t g_follower_fires  = 0;
-int      g_log_budget      = 0;
+std::unordered_map<const ggml_tensor *, QkvPrepEntry>   g_qkv_anchors;
+std::unordered_set<const ggml_tensor *>                 g_qkv_followers;
+
+bool     g_enabled              = true;
+// Phase A1 QKV-prep is PARKED default-off: the late-anchor design (firing at
+// V_cast.idx so all output dsts are reachable) means by the time the fused
+// kernel reads `qkv_add->data`, ggml's gallocr has freed that slot (its
+// static analysis says qkv_add's last consumer is the conts, which we made
+// followers — gallocr doesn't know we deferred). The slot may have been
+// reused by a different tensor mid-graph. For vision (n_pos=729) the
+// aliasing happens to land on something benign and the output is bit-clean
+// vs A1-OFF; for text (n_pos=64) the aliasing corrupts a live tensor and
+// every encode produces NaN. The fix is a 2-kernel design:
+//   1. Anchor qkv_add: copy mm + bias into a persistent device-side scratch
+//      buffer (sized for the hottest 3*H*n_pos shape; ~10 MiB).
+//   2. Anchor V_cast: split-permute-pad-cast from scratch → Q_pad/K_cast/V_cast.
+// Saves 7 launches per block (= 9 fused → 2 kernels). Set
+// SIGLIP2_ENABLE_QKV_PREP=1 to opt in for development; do NOT ship default-on
+// until the scratch-buffer redesign lands. See HANDOFF-megakernel-v0.md
+// "Phase A1 — gallocr aliasing trap" for receipts.
+bool     g_qkv_enabled          = false;
+uint64_t g_ln_groups_built      = 0;
+uint64_t g_ln_anchor_fires      = 0;
+uint64_t g_ln_follower_fires    = 0;
+uint64_t g_qkv_groups_built     = 0;
+uint64_t g_qkv_anchor_fires     = 0;
+uint64_t g_qkv_follower_fires   = 0;
+int      g_log_budget           = 0;
 
 bool is_2d_f32_contiguous(const ggml_tensor * t) {
     if (!t) return false;
@@ -249,14 +380,142 @@ void build_ln_plan(const ggml_cgraph * cgraph) {
         g_ln_anchors[add] = e;
         g_ln_followers.insert(norm);
         g_ln_followers.insert(mul);
-        ++g_groups_built;
+        ++g_ln_groups_built;
     }
+}
 
-    if (g_log_budget > 0) {
-        std::fprintf(stderr,
-            "[siglip2-megakernel] graph_begin: built %zu LN groups (followers=%zu, total nodes=%d)\n",
-            g_ln_anchors.size(), g_ln_followers.size(), n);
-        --g_log_budget;
+void build_qkv_prep_plan(const ggml_cgraph * cgraph) {
+    g_qkv_anchors.clear();
+    g_qkv_followers.clear();
+    if (!cgraph || !g_qkv_enabled) return;
+
+    const int n = ggml_graph_n_nodes((ggml_cgraph *) cgraph);
+
+    for (int i = 0; i < n; ++i) {
+        ggml_tensor * add = ggml_graph_node((ggml_cgraph *) cgraph, i);
+        if (!add || add->op != GGML_OP_ADD) continue;
+
+        const ggml_tensor * mm = add->src[0];
+        if (!mm || mm->op != GGML_OP_MUL_MAT) continue;
+        const ggml_tensor * w = mm->src[0];
+        if (!w || !w->name[0]) continue;
+        if (!std::strstr(w->name, "attn_qkv.weight")) continue;
+
+        // qkv bias-add. ne=(3*H, n_pos), F32 contiguous.
+        if (add->type != GGML_TYPE_F32) continue;
+        if (add->ne[2] != 1 || add->ne[3] != 1) continue;
+        if (add->nb[0] != ggml_type_size(add->type)) continue;
+
+        const int64_t triH = add->ne[0];
+        if (triH % 3 != 0) continue;
+        const int H_block = (int) (triH / 3);
+        const int n_pos   = (int) add->ne[1];
+        const size_t f32_size = sizeof(float);
+
+        // Find the 3 view children of this add by walking forward.
+        const ggml_tensor * v_q = nullptr, * v_k = nullptr, * v_v = nullptr;
+        for (int j = i + 1; j < n; ++j) {
+            ggml_tensor * c = ggml_graph_node((ggml_cgraph *) cgraph, j);
+            if (!c || c->op != GGML_OP_VIEW) continue;
+            if (c->src[0] != add) continue;
+            const size_t off = c->view_offs;
+            if (off == 0 && !v_q)                        v_q = c;
+            else if (off == (size_t)(H_block * f32_size) && !v_k) v_k = c;
+            else if (off == (size_t)(2 * H_block * f32_size) && !v_v) v_v = c;
+            if (v_q && v_k && v_v) break;
+        }
+        if (!v_q || !v_k || !v_v) continue;
+
+        // For each (Q, K, V) walk: view → permute → cont → pad → optional cpy(F16).
+        // Returns true if the chain is well-formed (cont + pad reachable;
+        // cast required for K/V, must NOT exist for Q).
+        auto walk = [&](const ggml_tensor * v_node,
+                        const ggml_tensor * & perm,
+                        const ggml_tensor * & cont,
+                        const ggml_tensor * & pad,
+                        const ggml_tensor * & cast,
+                        bool                  expect_cast) -> bool {
+            perm = cont = pad = cast = nullptr;
+            const ggml_tensor * src_for_perm = v_node;
+            for (int j = i + 1; j < n; ++j) {
+                ggml_tensor * c = ggml_graph_node((ggml_cgraph *) cgraph, j);
+                if (!c) continue;
+                if (!perm && c->op == GGML_OP_PERMUTE && c->src[0] == src_for_perm) perm = c;
+                else if (!cont && c->op == GGML_OP_CONT && perm && c->src[0] == perm) cont = c;
+                else if (!pad  && c->op == GGML_OP_PAD  && cont && c->src[0] == cont) pad  = c;
+                else if (!cast && c->op == GGML_OP_CPY  && pad  && c->src[0] == pad &&
+                         c->type == GGML_TYPE_F16) {
+                    cast = c;
+                    break;
+                }
+            }
+            if (!perm || !cont || !pad) return false;
+            if (expect_cast && !cast)   return false;
+            if (!expect_cast && cast)   return false;
+            return true;
+        };
+
+        const ggml_tensor * q_perm, * q_cont, * q_pad, * q_cast;
+        const ggml_tensor * k_perm, * k_cont, * k_pad, * k_cast;
+        const ggml_tensor * v_perm, * v_cont, * v_pad, * v_cast;
+        if (!walk(v_q, q_perm, q_cont, q_pad, q_cast, /*expect_cast=*/false)) continue;
+        if (!walk(v_k, k_perm, k_cont, k_pad, k_cast, /*expect_cast=*/true))  continue;
+        if (!walk(v_v, v_perm, v_cont, v_pad, v_cast, /*expect_cast=*/true))  continue;
+
+        // Shape sanity. The view's ne is (d_head, n_head, n_pos); the pad
+        // result's ne[0] is d_pad (≥ d_head); n_pos and n_head must agree.
+        const int d_head = (int) v_q->ne[0];
+        const int n_head = (int) v_q->ne[1];
+        const int d_pad  = (int) q_pad->ne[0];
+        if (d_head <= 0 || n_head <= 0 || d_pad < d_head) continue;
+        if (q_pad->ne[1] != n_pos || q_pad->ne[2] != n_head) continue;
+        if (k_cast->ne[0] != d_pad || k_cast->ne[1] != n_pos || k_cast->ne[2] != n_head) continue;
+        if (v_cast->ne[0] != d_pad || v_cast->ne[1] != n_pos || v_cast->ne[2] != n_head) continue;
+
+        // Anchor = whichever of {q_pad, k_cast, v_cast} appears LAST in
+        // the cgraph topo order. By that point ggml has dispatched (and
+        // we've followered) every other node in the chain, and the qkv
+        // add's data is settled.
+        const ggml_tensor * anchor = nullptr;
+        int anchor_idx = -1;
+        for (int j = i + 1; j < n; ++j) {
+            ggml_tensor * c = ggml_graph_node((ggml_cgraph *) cgraph, j);
+            if (c == q_pad || c == k_cast || c == v_cast) {
+                if (j > anchor_idx) { anchor_idx = j; anchor = c; }
+            }
+        }
+        if (!anchor) continue;
+
+        // Skip if any of these nodes are already claimed by a different
+        // chain (defensive — locally unique by weight name + offset).
+        if (g_qkv_anchors.count(anchor) ||
+            g_qkv_followers.count(q_cont) || g_qkv_followers.count(q_pad) ||
+            g_qkv_followers.count(k_cont) || g_qkv_followers.count(k_pad) ||
+            g_qkv_followers.count(k_cast) ||
+            g_qkv_followers.count(v_cont) || g_qkv_followers.count(v_pad) ||
+            g_qkv_followers.count(v_cast)) {
+            continue;
+        }
+
+        QkvPrepEntry e;
+        e.qkv_node   = add;
+        e.q_pad_dst  = q_pad;
+        e.k_cast_dst = k_cast;
+        e.v_cast_dst = v_cast;
+        e.H          = H_block;
+        e.n_pos      = n_pos;
+        e.n_head     = n_head;
+        e.d_head     = d_head;
+        e.d_pad      = d_pad;
+        g_qkv_anchors[anchor] = e;
+
+        auto add_follower = [&](const ggml_tensor * t) {
+            if (t && t != anchor) g_qkv_followers.insert(t);
+        };
+        add_follower(q_cont); add_follower(q_pad);
+        add_follower(k_cont); add_follower(k_pad); add_follower(k_cast);
+        add_follower(v_cont); add_follower(v_pad); add_follower(v_cast);
+        ++g_qkv_groups_built;
     }
 }
 
@@ -271,6 +530,17 @@ extern "C" void siglip2_graph_begin_hook(
         const ggml_cgraph *         cgraph) {
     if (!g_enabled) return;
     build_ln_plan(cgraph);
+    build_qkv_prep_plan(cgraph);
+
+    if (g_log_budget > 0) {
+        const int n = cgraph ? ggml_graph_n_nodes((ggml_cgraph *) cgraph) : 0;
+        std::fprintf(stderr,
+            "[siglip2-megakernel] graph_begin: LN groups=%zu (followers=%zu) "
+            "QKV groups=%zu (followers=%zu) total_nodes=%d\n",
+            g_ln_anchors.size(),  g_ln_followers.size(),
+            g_qkv_anchors.size(), g_qkv_followers.size(), n);
+        --g_log_budget;
+    }
 }
 
 extern "C" bool siglip2_op_hook(
@@ -279,16 +549,36 @@ extern "C" bool siglip2_op_hook(
         cudaStream_t                stream) {
     if (!g_enabled || !dst) return false;
 
-    // Fast path: follower no-op. Norm and mul nodes whose work has been
-    // absorbed into the anchor's fused launch.
+    // Fast path: follower no-op (LN's norm+mul, or QKV-prep's cont/pad/cast).
     if (g_ln_followers.count(dst)) {
-        ++g_follower_fires;
+        ++g_ln_follower_fires;
+        return true;
+    }
+    if (g_qkv_followers.count(dst)) {
+        ++g_qkv_follower_fires;
         return true;
     }
 
-    // Anchor: fire fused kernel writing into dst->data (the ADD's allocated
-    // output). Resolve all source data lazily — ggml's allocator fills ->data
-    // during dispatch, not at graph-begin.
+    // QKV-prep anchor: fire fused split-permute-pad-cast kernel.
+    if (g_qkv_enabled) {
+        auto it = g_qkv_anchors.find(dst);
+        if (it != g_qkv_anchors.end()) {
+            const QkvPrepEntry & e = it->second;
+            const float * qkv = e.qkv_node ? (const float *) e.qkv_node->data : nullptr;
+            float * q_pad     = e.q_pad_dst   ? (float *) e.q_pad_dst->data   : nullptr;
+            void  * k_cast    = e.k_cast_dst  ? e.k_cast_dst->data            : nullptr;
+            void  * v_cast    = e.v_cast_dst  ? e.v_cast_dst->data            : nullptr;
+            if (!qkv || !q_pad || !k_cast || !v_cast) return false;
+
+            launch_fused_qkv_prep(qkv, q_pad, k_cast, v_cast,
+                                  e.H, e.n_pos, e.n_head, e.d_head, e.d_pad,
+                                  stream);
+            ++g_qkv_anchor_fires;
+            return true;
+        }
+    }
+
+    // LayerNorm anchor.
     auto it = g_ln_anchors.find(dst);
     if (it == g_ln_anchors.end()) return false;
 
@@ -300,7 +590,7 @@ extern "C" bool siglip2_op_hook(
     if (!x || !w || !b || !y) return false;
 
     launch_fused_layernorm_affine(x, w, b, y, e.H, e.n_pos, e.eps, stream);
-    ++g_anchor_fires;
+    ++g_ln_anchor_fires;
     return true;
 }
 
@@ -327,12 +617,17 @@ bool install() {
         if (v[0] != '\0' && std::strcmp(v, "0") != 0) g_log_budget = 5;
     }
 
+    if (const char * e = std::getenv("SIGLIP2_ENABLE_QKV_PREP")) {
+        if (e[0] != '\0' && std::strcmp(e, "0") != 0) g_qkv_enabled = true;
+    }
+
     ggml_cuda_set_graph_begin_hook(siglip2_graph_begin_hook);
     ggml_cuda_set_op_hook(siglip2_op_hook);
     s_installed = true;
 
     std::fprintf(stderr,
-        "[siglip2-megakernel] installed: fused-LN (norm+mul-w+add-b)\n");
+        "[siglip2-megakernel] installed: fused-LN%s\n",
+        g_qkv_enabled ? " + QKV-prep (DEV-ONLY, broken on text — see HANDOFF-megakernel-v0.md)" : "");
     return true;
 }
 
