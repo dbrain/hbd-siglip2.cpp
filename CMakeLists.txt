@@ -71,6 +71,34 @@ target_link_libraries(siglip2_vision PUBLIC
     Threads::Threads
 )
 
+# Text encoder library
+add_library(siglip2_text STATIC
+    src/siglip2_text.cpp
+    src/gguf_loader.cpp
+)
+target_include_directories(siglip2_text PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${GGML_DIR}/include
+)
+target_link_libraries(siglip2_text PUBLIC
+    ggml
+    Threads::Threads
+)
+
+# Image-text sigmoid scoring (CPU math; reads logit_scale/bias from GGUF)
+add_library(siglip2_score STATIC
+    src/siglip2_score.cpp
+    src/gguf_loader.cpp
+)
+target_include_directories(siglip2_score PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${GGML_DIR}/include
+)
+target_link_libraries(siglip2_score PUBLIC
+    ggml
+    Threads::Threads
+)
+
 # CLI: load GGUF + (image|pixel-values) -> embedding
 add_executable(siglip2-cli
     src/siglip2_cli.cpp
@@ -80,13 +108,22 @@ target_link_libraries(siglip2-cli PRIVATE
     siglip2_preproc
 )
 
-install(TARGETS siglip2_vision siglip2_preproc siglip2-cli
+# Text-side parity tool
+add_executable(siglip2-text-cli
+    src/siglip2_text_cli.cpp
+)
+target_link_libraries(siglip2-text-cli PRIVATE
+    siglip2_text
+)
+
+install(TARGETS siglip2_vision siglip2_text siglip2_preproc siglip2-cli siglip2-text-cli
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION bin
 )
 install(FILES
     src/siglip2_vision.h
+    src/siglip2_text.h
     src/siglip2_preproc.h
     src/gguf_loader.h
     DESTINATION include
