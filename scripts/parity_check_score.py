@@ -59,7 +59,7 @@ def main() -> int:
     p.add_argument("--cli", required=True, type=Path, help="siglip2-cli")
     p.add_argument("--text-cli", required=True, type=Path, help="siglip2-text-cli")
     p.add_argument("--max-num-patches", default=729, type=int)
-    p.add_argument("--threshold-cos", default=0.997, type=float)
+    p.add_argument("--threshold-cos", default=0.999, type=float)
     p.add_argument("--threshold-mae", default=5e-3, type=float,
                    help="Max acceptable mean-abs-error on probabilities")
     p.add_argument("--seed", default=42, type=int)

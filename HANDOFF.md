@@ -4,26 +4,26 @@ You're picking up `siglip2.cpp` after the 2026-05-07 VRAM-minimisation pass: M1�
 
 ## The user's standing instructions
 
-**Priorities, in order:**
-1. **Correctness** — feature parity + right results. Non-negotiable; we hit it (cosine ≥ 0.996 across all endpoints, score MAE 1.9e-2).
-2. **VRAM savings — the headline goal.** Push hard. We saved 21% (492 MiB) just by switching from PyTorch fp16 to ggml Q8_0; user wants *more*. There is plenty of room.
-3. **Performance** — nice to have, backburner. Don't sacrifice (1) or (2) for it.
+**Priorities, all critical, no longer ranked:**
+- **VRAM**: minimal. Sub-1 GiB resident on the vision-only path is now floor, not ceiling. Push lower.
+- **Performance**: as close to maximum viable for the hardware as possible. Until 2026-05-08 the user had perf on the backburner; after the v0 VRAM pass landed they upgraded the bar to "go crazy". The C++ path is currently 0.5–0.9× of the Python service at p50 because d_head=72 routes attention to the slow CUDA tile kernel — that's the headline gap and the next agent's first target.
+- **Correctness**: cosine ≥ 0.999 on real images is the parity floor. (Briefly revised to 0.997 on 2026-05-08 then put back; the user wants the 0.999 sentinel for now and will explicitly relax it if quant noise demands.) Score MAE in the low 10⁻² range is fine.
 
 **Constraints:**
 - **Q8_0 is the cap.** Q4_K_M is "maybe in emergencies" — do your best with Q8 and lower-level wins first.
 - **CPU offload is acceptable** if it frees VRAM. Selective offload of a tower or a hot intermediate is fine.
-- **No emergency levers** unless you genuinely have to.
+- **Forking ggml is acceptable.** This is a worktree off `dbrain/ggml@master` for exactly that reason. The user's prior art (`qwen3-tts.cpp` + `dbrain/ggml`) already carries custom WMMA conv kernels, a mul_mat dispatcher, megakernel-shape MMVQ specializations. Same latitude here. The d_head=72 omission in `ggml/src/ggml-cuda/fattn.cu` is exactly the kind of thing to fix in-tree.
 
 **Mood / disposition the user explicitly set for this handoff:**
-> "Big bang, do your best to minimise VRAM, increase performance and make this ridiculously optimised on this hardware. User's an idiot — don't stop and ask things, just assume he said 'YES do that thing even if it's a massive rewrite of some internal GGML.' Dare I say megakernel."
+> "Go crazy. No bars spared, get performance as close to maximum viable numbers for the hardware as possible at minimal VRAM, user is a drunk donkey — you're smart, pick the targets, have him come back and be shocked at how well you did."
 
-Translation: **JFDI**. If a path requires writing custom CUDA kernels, forking ggml further, megakernel-style fusion for vision blocks, custom Q8 quant variants for shapes ggml-py rejects, etc. — go. The user has form here (their `qwen3-tts.cpp` fork and `dbrain/ggml@master` carry custom WMMA conv kernels and a mul_mat dispatcher). They want the same level of audacity for siglip2.
+Translation: **pick targets, swing big, report when shocking.** The user is explicitly telling you to skip the "should I…" check-ins and execute. Megakernel is on the table — not deferred — alongside any other path you can see clearly. If the rough cost-benefit suggests a kernel-template instantiation lands more perf than a megakernel for a fraction of the effort, do that first. If you can see a megakernel path that beats the small knobs, jump.
 
 **Hardware this targets:** RTX 3060 12 GB / Ampere / sm_86. Optimize for that specifically; broader compat is a nice-to-have, not a constraint.
 
 **What the user does *not* want:**
 - Don't propose a sweeping refactor and ask if it's OK; just do it and report.
-- Don't add quality regressions to chase VRAM. Q8 cap is real; cosine ≥ 0.996 on real images is the floor we landed and shouldn't drop below.
+- Don't drop cosine below 0.999 on the real-image path to chase numbers. Q8 cap stands.
 - Don't push commits. Local-only until they say otherwise.
 
 ## Where we are
