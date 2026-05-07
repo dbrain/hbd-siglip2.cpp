@@ -2,6 +2,9 @@
 build/
 build-cuda/
 
+# Bench artifacts (one-shot result blobs)
+bench_results*.json
+
 # Forensics artifacts (scratch audio / code dumps / soak logs)
 forensics/audio/
 forensics/codes/
