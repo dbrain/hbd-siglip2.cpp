@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -68,17 +69,22 @@ ggml_tensor * build_layernorm(
 }
 
 // SigLIP2 encoder block. Same as the vision tower's, but takes an explicit
-// attention mask for padding-aware self-attention.
+// attention mask for padding-aware self-attention. Uses ggml_flash_attn_ext
+// when use_fa=true. fa_mask_f16 must be the F16 cast of attn_mask (or nullptr
+// if attn_mask is nullptr) — passed in instead of being built here so that
+// the same cast is reused across all layers.
 ggml_tensor * build_block(
     ggml_context * ctx,
     const Block &  layer,
     ggml_tensor *  inp,
-    ggml_tensor *  attn_mask,  // (n_pos, n_pos) F32 with 0/-inf, may be nullptr
+    ggml_tensor *  attn_mask,    // (n_pos_k, n_pos_q) F32 with 0/-inf, may be nullptr
+    ggml_tensor *  fa_mask_f16,  // same as attn_mask but F16-cast for FA path
     int            n_pos,
     int            d_head,
     int            n_head,
     float          ln_eps,
-    float          kq_scale) {
+    float          kq_scale,
+    bool           use_fa) {
     ggml_tensor * residual = inp;
     ggml_tensor * cur = build_layernorm(ctx, inp, layer.ln1_w, layer.ln1_b, ln_eps);
 
@@ -90,16 +96,26 @@ ggml_tensor * build_block(
     K = ggml_reshape_3d(ctx, K, d_head, n_head, n_pos);
     V = ggml_reshape_3d(ctx, V, d_head, n_head, n_pos);
 
-    Q = ggml_permute(ctx, Q, 0, 2, 1, 3);
-    K = ggml_permute(ctx, K, 0, 2, 1, 3);
-    V = ggml_cont(ctx, ggml_permute(ctx, V, 1, 2, 0, 3));
-
-    ggml_tensor * KQ = ggml_mul_mat(ctx, K, Q);
-    KQ = ggml_soft_max_ext(ctx, KQ, attn_mask, kq_scale, 0.0f);
-
-    ggml_tensor * KQV = ggml_mul_mat(ctx, V, KQ);
-    KQV = ggml_permute(ctx, KQV, 0, 2, 1, 3);
-    KQV = ggml_cont_2d(ctx, KQV, d_head * n_head, n_pos);
+    ggml_tensor * KQV;
+    if (use_fa) {
+        Q = ggml_permute(ctx, Q, 0, 2, 1, 3);
+        K = ggml_permute(ctx, K, 0, 2, 1, 3);
+        V = ggml_permute(ctx, V, 0, 2, 1, 3);          // NOT transposed under FA
+        K = ggml_cast(ctx, K, GGML_TYPE_F16);
+        V = ggml_cast(ctx, V, GGML_TYPE_F16);
+        KQV = ggml_flash_attn_ext(ctx, Q, K, V, fa_mask_f16, kq_scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(KQV, GGML_PREC_F32);
+        KQV = ggml_reshape_2d(ctx, KQV, d_head * n_head, n_pos);
+    } else {
+        Q = ggml_permute(ctx, Q, 0, 2, 1, 3);
+        K = ggml_permute(ctx, K, 0, 2, 1, 3);
+        V = ggml_cont(ctx, ggml_permute(ctx, V, 1, 2, 0, 3));
+        ggml_tensor * KQ = ggml_mul_mat(ctx, K, Q);
+        KQ = ggml_soft_max_ext(ctx, KQ, attn_mask, kq_scale, 0.0f);
+        KQV = ggml_mul_mat(ctx, V, KQ);
+        KQV = ggml_permute(ctx, KQV, 0, 2, 1, 3);
+        KQV = ggml_cont_2d(ctx, KQV, d_head * n_head, n_pos);
+    }
 
     cur = ggml_add(ctx, ggml_mul_mat(ctx, layer.o_w, KQV), layer.o_b);
     cur = ggml_add(ctx, cur, residual);
@@ -358,14 +374,21 @@ bool TextEncoder::encode(
         ggml_set_input(mask_inp);
     }
 
+    // FA path uses a F16-cast of the mask reused across all layers.
+    static const bool use_fa = std::getenv("SIGLIP2_DISABLE_FA") == nullptr;
+    ggml_tensor * fa_mask_f16 = nullptr;
+    if (use_fa && mask_inp) {
+        fa_mask_f16 = ggml_cast(ctx, mask_inp, GGML_TYPE_F16);
+    }
+
     // Token + position embedding lookups.
     ggml_tensor * x = ggml_get_rows(ctx, state_->token_embd, tok_inp);    // (H, n_pos)
     ggml_tensor * p = ggml_get_rows(ctx, state_->position_embd, pos_inp); // (H, n_pos)
     x = ggml_add(ctx, x, p);
 
     for (int il = 0; il < config_.num_hidden_layers; ++il) {
-        x = build_block(ctx, state_->blocks[il], x, mask_inp, n_pos, d_head, n_head,
-                        config_.layer_norm_eps, kq_scale);
+        x = build_block(ctx, state_->blocks[il], x, mask_inp, fa_mask_f16, n_pos, d_head, n_head,
+                        config_.layer_norm_eps, kq_scale, use_fa);
     }
 
     x = build_layernorm(ctx, x, state_->final_ln_w, state_->final_ln_b, config_.layer_norm_eps);

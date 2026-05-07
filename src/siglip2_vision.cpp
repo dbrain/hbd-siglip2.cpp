@@ -12,6 +12,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
@@ -86,6 +87,9 @@ ggml_tensor * build_layernorm(
 }
 
 // One SigLIP2 encoder block: pre-LN attention + pre-LN MLP, both with residuals.
+// Attention is fused via ggml_flash_attn_ext when use_fa=true so the per-layer
+// (n_pos, n_pos, n_head) KQ matrix is never materialized — saves activation
+// VRAM and turns the attn into one CUDA kernel launch instead of three.
 ggml_tensor * build_block(
     ggml_context * ctx,
     const Block &  layer,
@@ -94,7 +98,8 @@ ggml_tensor * build_block(
     int            d_head,
     int            n_head,
     float          ln_eps,
-    float          kq_scale) {
+    float          kq_scale,
+    bool           use_fa) {
     // Self-attention
     ggml_tensor * residual = inp;
     ggml_tensor * cur = build_layernorm(ctx, inp, layer.ln1_w, layer.ln1_b, ln_eps);
@@ -107,16 +112,27 @@ ggml_tensor * build_block(
     K = ggml_reshape_3d(ctx, K, d_head, n_head, n_pos);
     V = ggml_reshape_3d(ctx, V, d_head, n_head, n_pos);
 
-    Q = ggml_permute(ctx, Q, 0, 2, 1, 3);                     // (d_head, n_pos, n_head)
-    K = ggml_permute(ctx, K, 0, 2, 1, 3);                     // (d_head, n_pos, n_head)
-    V = ggml_cont(ctx, ggml_permute(ctx, V, 1, 2, 0, 3));     // (n_pos, d_head, n_head)
-
-    ggml_tensor * KQ = ggml_mul_mat(ctx, K, Q);
-    KQ = ggml_soft_max_ext(ctx, KQ, /*mask*/ nullptr, kq_scale, 0.0f);
-
-    ggml_tensor * KQV = ggml_mul_mat(ctx, V, KQ);             // (d_head, n_pos_q, n_head)
-    KQV = ggml_permute(ctx, KQV, 0, 2, 1, 3);                 // (d_head, n_head, n_pos)
-    KQV = ggml_cont_2d(ctx, KQV, d_head * n_head, n_pos);     // (hidden, n_pos)
+    ggml_tensor * KQV;
+    if (use_fa) {
+        Q = ggml_permute(ctx, Q, 0, 2, 1, 3);                 // (d_head, n_pos, n_head)
+        K = ggml_permute(ctx, K, 0, 2, 1, 3);                 // (d_head, n_pos, n_head)
+        V = ggml_permute(ctx, V, 0, 2, 1, 3);                 // (d_head, n_pos, n_head) — NOT transposed
+        K = ggml_cast(ctx, K, GGML_TYPE_F16);
+        V = ggml_cast(ctx, V, GGML_TYPE_F16);
+        KQV = ggml_flash_attn_ext(ctx, Q, K, V, /*mask*/ nullptr, kq_scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(KQV, GGML_PREC_F32);
+        // FA result is already permuted: ne=[d_head, n_head, n_pos, 1]
+        KQV = ggml_reshape_2d(ctx, KQV, d_head * n_head, n_pos);
+    } else {
+        Q = ggml_permute(ctx, Q, 0, 2, 1, 3);                 // (d_head, n_pos, n_head)
+        K = ggml_permute(ctx, K, 0, 2, 1, 3);                 // (d_head, n_pos, n_head)
+        V = ggml_cont(ctx, ggml_permute(ctx, V, 1, 2, 0, 3)); // (n_pos, d_head, n_head)
+        ggml_tensor * KQ = ggml_mul_mat(ctx, K, Q);
+        KQ = ggml_soft_max_ext(ctx, KQ, /*mask*/ nullptr, kq_scale, 0.0f);
+        KQV = ggml_mul_mat(ctx, V, KQ);                       // (d_head, n_pos_q, n_head)
+        KQV = ggml_permute(ctx, KQV, 0, 2, 1, 3);             // (d_head, n_head, n_pos)
+        KQV = ggml_cont_2d(ctx, KQV, d_head * n_head, n_pos); // (hidden, n_pos)
+    }
 
     cur = ggml_add(ctx, ggml_mul_mat(ctx, layer.o_w, KQV), layer.o_b);
     cur = ggml_add(ctx, cur, residual);
@@ -144,7 +160,8 @@ ggml_tensor * build_probe_head(
     int                 d_head,
     int                 n_head,
     float               ln_eps,
-    float               kq_scale) {
+    float               kq_scale,
+    bool                use_fa) {
     // Probe weight is stored (H, 1, 1) in GGUF (H is innermost). Build Q from it.
     // Treat probe as a single-token "input" of shape (H, 1).
     ggml_tensor * probe_in = ggml_reshape_2d(ctx, head.probe, H, 1);
@@ -159,16 +176,27 @@ ggml_tensor * build_probe_head(
     K = ggml_reshape_3d(ctx, K, d_head, n_head, n_pos);   // (d_head, n_head, n_pos)
     V = ggml_reshape_3d(ctx, V, d_head, n_head, n_pos);
 
-    Q = ggml_permute(ctx, Q, 0, 2, 1, 3);                 // (d_head, 1, n_head)
-    K = ggml_permute(ctx, K, 0, 2, 1, 3);                 // (d_head, n_pos, n_head)
-    V = ggml_cont(ctx, ggml_permute(ctx, V, 1, 2, 0, 3)); // (n_pos, d_head, n_head)
-
-    ggml_tensor * KQ = ggml_mul_mat(ctx, K, Q);                          // (n_pos, 1, n_head)
-    KQ = ggml_soft_max_ext(ctx, KQ, /*mask*/ nullptr, kq_scale, 0.0f);
-
-    ggml_tensor * KQV = ggml_mul_mat(ctx, V, KQ);                        // (d_head, 1, n_head)
-    KQV = ggml_permute(ctx, KQV, 0, 2, 1, 3);                            // (d_head, n_head, 1)
-    KQV = ggml_cont_2d(ctx, KQV, d_head * n_head, 1);                    // (H, 1)
+    ggml_tensor * KQV;
+    if (use_fa) {
+        Q = ggml_permute(ctx, Q, 0, 2, 1, 3);             // (d_head, 1, n_head)
+        K = ggml_permute(ctx, K, 0, 2, 1, 3);             // (d_head, n_pos, n_head)
+        V = ggml_permute(ctx, V, 0, 2, 1, 3);             // (d_head, n_pos, n_head) — NOT transposed
+        K = ggml_cast(ctx, K, GGML_TYPE_F16);
+        V = ggml_cast(ctx, V, GGML_TYPE_F16);
+        KQV = ggml_flash_attn_ext(ctx, Q, K, V, /*mask*/ nullptr, kq_scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(KQV, GGML_PREC_F32);
+        // FA result: ne=[d_head, n_head, 1, 1]
+        KQV = ggml_reshape_2d(ctx, KQV, d_head * n_head, 1);
+    } else {
+        Q = ggml_permute(ctx, Q, 0, 2, 1, 3);             // (d_head, 1, n_head)
+        K = ggml_permute(ctx, K, 0, 2, 1, 3);             // (d_head, n_pos, n_head)
+        V = ggml_cont(ctx, ggml_permute(ctx, V, 1, 2, 0, 3));  // (n_pos, d_head, n_head)
+        ggml_tensor * KQ = ggml_mul_mat(ctx, K, Q);                       // (n_pos, 1, n_head)
+        KQ = ggml_soft_max_ext(ctx, KQ, /*mask*/ nullptr, kq_scale, 0.0f);
+        KQV = ggml_mul_mat(ctx, V, KQ);                                   // (d_head, 1, n_head)
+        KQV = ggml_permute(ctx, KQV, 0, 2, 1, 3);                         // (d_head, n_head, 1)
+        KQV = ggml_cont_2d(ctx, KQV, d_head * n_head, 1);                 // (H, 1)
+    }
 
     ggml_tensor * attn = ggml_add(ctx, ggml_mul_mat(ctx, head.o_w, KQV), head.o_b);  // (H, 1)
 
@@ -475,8 +503,15 @@ bool VisionEncoder::encode(
     }
     x = ggml_add(ctx, x, pos_embd);
 
+    // Flash attention is enabled by default — saves the per-layer KQ activation
+    // (n_pos² × n_head × 4 bytes). For SigLIP2's d_head=72 the CUDA dispatcher
+    // routes to the tile kernel (MMA paths skip 72), but it's still a clear win
+    // on activation memory and end-to-end perf vs vanilla 3-op attention.
+    // SIGLIP2_DISABLE_FA=1 falls back if a parity issue surfaces.
+    static const bool use_fa = std::getenv("SIGLIP2_DISABLE_FA") == nullptr;
+
     for (int il = 0; il < config_.num_hidden_layers; ++il) {
-        x = build_block(ctx, state_->blocks[il], x, n_pos, d_head, n_head, config_.layer_norm_eps, kq_scale);
+        x = build_block(ctx, state_->blocks[il], x, n_pos, d_head, n_head, config_.layer_norm_eps, kq_scale, use_fa);
     }
 
     x = build_layernorm(ctx, x, state_->post_ln_w, state_->post_ln_b, config_.layer_norm_eps);
@@ -489,7 +524,7 @@ bool VisionEncoder::encode(
     } else { // PROBE
         pooled = build_probe_head(
             ctx, state_->head, x,
-            n_pos, H, d_head, n_head, config_.layer_norm_eps, kq_scale);
+            n_pos, H, d_head, n_head, config_.layer_norm_eps, kq_scale, use_fa);
     }
     ggml_set_name(pooled, "pooled");
     ggml_set_output(pooled);
