@@ -9,9 +9,7 @@ Tensor naming (siglip2.cpp convention, distinct from clip.cpp's `v.blk.*`):
     v.patch_embd.{weight,bias}            <- vision_model.embeddings.patch_embedding.*
     v.position_embd.weight                <- vision_model.embeddings.position_embedding.weight
     v.blk.{i}.ln1.{weight,bias}           <- vision_model.encoder.layers.{i}.layer_norm1.*
-    v.blk.{i}.attn_q.{weight,bias}        <- vision_model.encoder.layers.{i}.self_attn.q_proj.*
-    v.blk.{i}.attn_k.{weight,bias}
-    v.blk.{i}.attn_v.{weight,bias}
+    v.blk.{i}.attn_qkv.{weight,bias}      <- concat([q_proj, k_proj, v_proj], out-dim) for layer i
     v.blk.{i}.attn_o.{weight,bias}        <- self_attn.out_proj.*
     v.blk.{i}.ln2.{weight,bias}           <- layer_norm2.*
     v.blk.{i}.ffn_up.{weight,bias}        <- mlp.fc1.*
@@ -29,7 +27,7 @@ Tensor naming (siglip2.cpp convention, distinct from clip.cpp's `v.blk.*`):
   Text tower:
     t.token_embd.weight                   <- text_model.embeddings.token_embedding.weight
     t.position_embd.weight                <- text_model.embeddings.position_embedding.weight
-    t.blk.{i}.{ln1,attn_q,attn_k,attn_v,attn_o,ln2,ffn_up,ffn_down}.{weight,bias}
+    t.blk.{i}.{ln1,attn_qkv,attn_o,ln2,ffn_up,ffn_down}.{weight,bias}
     t.final_ln.{weight,bias}              <- text_model.final_layer_norm.*
     t.head.{weight,bias}                  <- text_model.head.* (Linear projection)
   Top-level:
@@ -140,17 +138,15 @@ class Siglip2Converter:
     @staticmethod
     def _map_block(rest: str) -> str | None:
         # rest is e.g. "self_attn.q_proj.weight", "layer_norm1.bias", "mlp.fc1.weight"
+        # NOTE: q_proj/k_proj/v_proj are intentionally NOT mapped here. They get
+        # concatenated into a single fused `attn_qkv.{weight,bias}` tensor at
+        # convert() time so the encoder runs one mul_mat instead of three per
+        # layer (≈108 fewer kernel launches across both towers).
         m = {
             "layer_norm1.weight": "ln1.weight",
             "layer_norm1.bias": "ln1.bias",
             "layer_norm2.weight": "ln2.weight",
             "layer_norm2.bias": "ln2.bias",
-            "self_attn.q_proj.weight": "attn_q.weight",
-            "self_attn.q_proj.bias": "attn_q.bias",
-            "self_attn.k_proj.weight": "attn_k.weight",
-            "self_attn.k_proj.bias": "attn_k.bias",
-            "self_attn.v_proj.weight": "attn_v.weight",
-            "self_attn.v_proj.bias": "attn_v.bias",
             "self_attn.out_proj.weight": "attn_o.weight",
             "self_attn.out_proj.bias": "attn_o.bias",
             "mlp.fc1.weight": "ffn_up.weight",
@@ -318,11 +314,61 @@ class Siglip2Converter:
         head_in_proj_weight: torch.Tensor | None = None
         head_in_proj_bias: torch.Tensor | None = None
 
+        # Per-layer Q/K/V buffer for the QKV fusion path. Indexed by
+        # (tower, layer_idx) -> {"q.w": ..., "q.b": ..., ...}. Once all three
+        # weights and three biases are seen for a layer we emit one fused
+        # attn_qkv.weight + attn_qkv.bias and drop the partials.
+        qkv_buf: dict[tuple[str, int], dict[str, torch.Tensor]] = {}
+
         n_written = 0
         n_skipped = 0
         unmapped: list[str] = []
 
         H = self.vision_cfg.get("hidden_size", HIDDEN_SIZE_DEFAULT)
+
+        def maybe_flush_qkv(tower: str, idx: int):
+            """If all six Q/K/V weight+bias parts are present for this layer,
+            stack them along output dim and emit a single fused tensor."""
+            nonlocal n_written
+            key = (tower, idx)
+            slot = qkv_buf.get(key)
+            if not slot:
+                return
+            need = {"q.w", "k.w", "v.w", "q.b", "k.b", "v.b"}
+            if not need.issubset(slot.keys()):
+                return
+            # Stack [q,k,v] along out-axis (axis 0 in HF (out, in) convention).
+            qkv_w = torch.cat([slot["q.w"], slot["k.w"], slot["v.w"]], dim=0)
+            qkv_b = torch.cat([slot["q.b"], slot["k.b"], slot["v.b"]], dim=0)
+            base = f"{tower}.blk.{idx}.attn_qkv"
+            wd, wt = self._convert_dtype(qkv_w.contiguous(), f"{base}.weight")
+            bd, bt = self._convert_dtype(qkv_b.contiguous(), f"{base}.bias")
+            writer.add_tensor(f"{base}.weight", wd, raw_dtype=wt)
+            writer.add_tensor(f"{base}.bias",   bd, raw_dtype=bt)
+            n_written += 2
+            qkv_buf.pop(key)
+
+        # HF block paths look like vision_model.encoder.layers.{i}.self_attn.{q,k,v}_proj.{weight,bias}
+        def parse_qkv(hf_name: str) -> tuple[str, int, str] | None:
+            for hf_prefix, tower in (("vision_model.encoder.layers.", "v"),
+                                     ("text_model.encoder.layers.",   "t")):
+                if not hf_name.startswith(hf_prefix):
+                    continue
+                if (tower == "v" and not self.include_vision) or \
+                   (tower == "t" and not self.include_text):
+                    return None
+                rest = hf_name[len(hf_prefix):]
+                parts = rest.split(".")
+                if len(parts) < 4:
+                    continue
+                idx = int(parts[0])
+                # parts: [idx, "self_attn", "{q|k|v}_proj", "{weight|bias}"]
+                if parts[1] != "self_attn" or parts[2] not in ("q_proj", "k_proj", "v_proj"):
+                    continue
+                qkv_letter = parts[2][0]                # 'q'|'k'|'v'
+                wb         = "w" if parts[3] == "weight" else "b"
+                return tower, idx, f"{qkv_letter}.{wb}"
+            return None
 
         for hf_name, tensor in tqdm(list(self._iter_tensors()), desc="convert"):
             if hf_name == "vision_model.head.attention.in_proj_weight":
@@ -332,6 +378,13 @@ class Siglip2Converter:
             if hf_name == "vision_model.head.attention.in_proj_bias":
                 if self.include_vision:
                     head_in_proj_bias = tensor
+                continue
+
+            qkv = parse_qkv(hf_name)
+            if qkv is not None:
+                tower, idx, slot_key = qkv
+                qkv_buf.setdefault((tower, idx), {})[slot_key] = tensor
+                maybe_flush_qkv(tower, idx)
                 continue
 
             ggml_name = self._map_name(hf_name)
@@ -348,6 +401,11 @@ class Siglip2Converter:
             data, dtype = self._convert_dtype(tensor, ggml_name)
             writer.add_tensor(ggml_name, data, raw_dtype=dtype)
             n_written += 1
+
+        # Sanity: every buffered layer must have flushed.
+        if qkv_buf:
+            keys = ", ".join(f"{t}.blk.{i}" for (t, i) in sorted(qkv_buf.keys()))
+            raise RuntimeError(f"Unflushed QKV buffers (incomplete attn weights): {keys}")
 
         # Split + write the probe head's packed in_proj
         if self.include_vision:

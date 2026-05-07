@@ -39,9 +39,10 @@ std::string blk_name(int il, const char * suffix) {
 
 struct Block {
     ggml_tensor * ln1_w  = nullptr; ggml_tensor * ln1_b  = nullptr;
-    ggml_tensor * q_w    = nullptr; ggml_tensor * q_b    = nullptr;
-    ggml_tensor * k_w    = nullptr; ggml_tensor * k_b    = nullptr;
-    ggml_tensor * v_w    = nullptr; ggml_tensor * v_b    = nullptr;
+    // Fused Q/K/V: weight is (H, 3*H), bias is (3*H,). Replaces three separate
+    // q/k/v projections with one wider mul_mat that we slice into Q, K, V views
+    // before the attention. Saves 2 launches per layer.
+    ggml_tensor * qkv_w  = nullptr; ggml_tensor * qkv_b  = nullptr;
     ggml_tensor * o_w    = nullptr; ggml_tensor * o_b    = nullptr;
     ggml_tensor * ln2_w  = nullptr; ggml_tensor * ln2_b  = nullptr;
     ggml_tensor * up_w   = nullptr; ggml_tensor * up_b   = nullptr;
@@ -88,13 +89,20 @@ ggml_tensor * build_block(
     ggml_tensor * residual = inp;
     ggml_tensor * cur = build_layernorm(ctx, inp, layer.ln1_w, layer.ln1_b, ln_eps);
 
-    ggml_tensor * Q = ggml_add(ctx, ggml_mul_mat(ctx, layer.q_w, cur), layer.q_b);
-    ggml_tensor * K = ggml_add(ctx, ggml_mul_mat(ctx, layer.k_w, cur), layer.k_b);
-    ggml_tensor * V = ggml_add(ctx, ggml_mul_mat(ctx, layer.v_w, cur), layer.v_b);
-
-    Q = ggml_reshape_3d(ctx, Q, d_head, n_head, n_pos);
-    K = ggml_reshape_3d(ctx, K, d_head, n_head, n_pos);
-    V = ggml_reshape_3d(ctx, V, d_head, n_head, n_pos);
+    // Fused Q/K/V: one mul_mat over weight (H, 3*H), one bias add over (3*H,).
+    // Result has ne=[3*H, n_pos]. Q/K/V are 3D *strided* views into it (no
+    // ggml_reshape — the views aren't contiguous along positions because Q/K/V
+    // are interleaved in the OUT axis). The downstream ggml_cont before
+    // ggml_pad materializes them contiguously, same as the pre-fusion path.
+    const int    H  = d_head * n_head;
+    const size_t es = sizeof(float);  // qkv is F32 (mul_mat output)
+    ggml_tensor * qkv = ggml_add(ctx, ggml_mul_mat(ctx, layer.qkv_w, cur), layer.qkv_b);
+    ggml_tensor * Q = ggml_view_3d(ctx, qkv, d_head, n_head, n_pos,
+        /*nb1=*/d_head * es, /*nb2=*/3 * H * es, /*offset=*/0 * H * es);
+    ggml_tensor * K = ggml_view_3d(ctx, qkv, d_head, n_head, n_pos,
+        /*nb1=*/d_head * es, /*nb2=*/3 * H * es, /*offset=*/1 * H * es);
+    ggml_tensor * V = ggml_view_3d(ctx, qkv, d_head, n_head, n_pos,
+        /*nb1=*/d_head * es, /*nb2=*/3 * H * es, /*offset=*/2 * H * es);
 
     ggml_tensor * KQV;
     if (use_fa) {
@@ -275,14 +283,12 @@ bool TextEncoder::load(const std::string & gguf_path) {
         Block & b = state_->blocks[il];
         struct entry { ggml_tensor ** dst; const char * suffix; };
         entry entries[] = {
-            {&b.ln1_w,  "ln1.weight"},   {&b.ln1_b,  "ln1.bias"},
-            {&b.q_w,    "attn_q.weight"},{&b.q_b,    "attn_q.bias"},
-            {&b.k_w,    "attn_k.weight"},{&b.k_b,    "attn_k.bias"},
-            {&b.v_w,    "attn_v.weight"},{&b.v_b,    "attn_v.bias"},
-            {&b.o_w,    "attn_o.weight"},{&b.o_b,    "attn_o.bias"},
-            {&b.ln2_w,  "ln2.weight"},   {&b.ln2_b,  "ln2.bias"},
-            {&b.up_w,   "ffn_up.weight"},{&b.up_b,   "ffn_up.bias"},
-            {&b.down_w, "ffn_down.weight"},{&b.down_b,"ffn_down.bias"},
+            {&b.ln1_w,  "ln1.weight"},      {&b.ln1_b,  "ln1.bias"},
+            {&b.qkv_w,  "attn_qkv.weight"}, {&b.qkv_b,  "attn_qkv.bias"},
+            {&b.o_w,    "attn_o.weight"},   {&b.o_b,    "attn_o.bias"},
+            {&b.ln2_w,  "ln2.weight"},      {&b.ln2_b,  "ln2.bias"},
+            {&b.up_w,   "ffn_up.weight"},   {&b.up_b,   "ffn_up.bias"},
+            {&b.down_w, "ffn_down.weight"}, {&b.down_b, "ffn_down.bias"},
         };
         for (auto & e : entries) {
             std::string nm = blk_name(il, e.suffix);
