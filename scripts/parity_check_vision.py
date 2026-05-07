@@ -40,6 +40,12 @@ def main() -> int:
     p.add_argument("--cli", required=True, type=Path,
                    help="Path to siglip2-cli binary")
     p.add_argument("--seed", default=42, type=int)
+    p.add_argument("--pooling", choices=["mean", "probe"], default="probe",
+                   help="probe = matches HF outputs.pooler_output (default); "
+                        "mean = matches outputs.last_hidden_state.mean(dim=1)")
+    p.add_argument("--shape", type=str, default=None,
+                   help="non-square patch grid as H,W (e.g. 24,16 for a 24x16=384 patch image). "
+                        "Default: native square grid from config.num_patches.")
     p.add_argument("--threshold", default=0.999, type=float,
                    help="Minimum cosine similarity for pass (default 0.999)")
     p.add_argument("--keep-tmp", action="store_true",
@@ -59,28 +65,36 @@ def main() -> int:
     ).eval()
 
     cfg = model.config
-    n_patches = cfg.num_patches  # 256 for so400m-naflex
     feat = 3 * cfg.patch_size * cfg.patch_size  # 768
 
-    print(f"[parity] num_patches={n_patches} patch_size={cfg.patch_size} hidden={cfg.hidden_size}")
+    if args.shape:
+        h_str, w_str = args.shape.split(",")
+        n_h, n_w = int(h_str), int(w_str)
+    else:
+        side = int(round(cfg.num_patches ** 0.5))
+        n_h, n_w = side, side
+    n_patches = n_h * n_w
+    print(f"[parity] grid={n_h}x{n_w} ({n_patches} patches) patch_size={cfg.patch_size} hidden={cfg.hidden_size}")
 
     # Deterministic random pixel_values (already-rescaled+normalized range).
     g = torch.Generator().manual_seed(args.seed)
     pixel_values = torch.randn(1, n_patches, feat, generator=g, dtype=torch.float32)
     pixel_attention_mask = torch.ones(1, n_patches, dtype=torch.long)
-    side = int(round(n_patches ** 0.5))
-    assert side * side == n_patches, "M1 expects square native patch grid"
-    spatial_shapes = torch.tensor([[side, side]], dtype=torch.long)
+    spatial_shapes = torch.tensor([[n_h, n_w]], dtype=torch.long)
 
-    print("[parity] running HF forward")
+    print(f"[parity] running HF forward (pooling={args.pooling})")
     with torch.no_grad():
         out = model(
             pixel_values=pixel_values,
             pixel_attention_mask=pixel_attention_mask,
             spatial_shapes=spatial_shapes,
         )
-    last_hidden = out.last_hidden_state.squeeze(0)  # [n_patches, H]
-    hf_emb = last_hidden.mean(dim=0).cpu().numpy().astype(np.float32)
+    if args.pooling == "mean":
+        hf_emb = out.last_hidden_state.squeeze(0).mean(dim=0).cpu().numpy().astype(np.float32)
+    else:  # probe
+        if out.pooler_output is None:
+            sys.exit("HF model did not produce pooler_output (vision_use_head=False?)")
+        hf_emb = out.pooler_output.squeeze(0).cpu().numpy().astype(np.float32)
 
     with tempfile.TemporaryDirectory() as td_str:
         td = Path(td_str)
@@ -98,7 +112,8 @@ def main() -> int:
             str(args.cli),
             "--model", str(args.gguf),
             "--pixel-values", str(pv_path),
-            "--n-patches", str(n_patches),
+            "--shape", f"{n_h},{n_w}",
+            "--pooling", args.pooling,
             "--out", str(cpp_path),
         ]
         print("[parity] running C++:", " ".join(cmd))

@@ -45,7 +45,19 @@ set(CMAKE_BUILD_RPATH_USE_ORIGIN TRUE)
 set(GGML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml")
 add_subdirectory(${GGML_DIR})
 
-# Vision encoder library (M1: stub; will hold the SigLIP2 ViT graph)
+# Image preprocessor library (NaFlex resize + patchify; stb_image for I/O)
+add_library(siglip2_preproc STATIC
+    src/siglip2_preproc.cpp
+)
+target_include_directories(siglip2_preproc PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/vendor
+)
+target_link_libraries(siglip2_preproc PUBLIC
+    Threads::Threads
+)
+
+# Vision encoder library (graph + ggml backend)
 add_library(siglip2_vision STATIC
     src/siglip2_vision.cpp
     src/gguf_loader.cpp
@@ -59,21 +71,23 @@ target_link_libraries(siglip2_vision PUBLIC
     Threads::Threads
 )
 
-# CLI: load GGUF + image -> 1152-d embedding stdout
+# CLI: load GGUF + (image|pixel-values) -> embedding
 add_executable(siglip2-cli
     src/siglip2_cli.cpp
 )
 target_link_libraries(siglip2-cli PRIVATE
     siglip2_vision
+    siglip2_preproc
 )
 
-install(TARGETS siglip2_vision siglip2-cli
+install(TARGETS siglip2_vision siglip2_preproc siglip2-cli
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION bin
 )
 install(FILES
     src/siglip2_vision.h
+    src/siglip2_preproc.h
     src/gguf_loader.h
     DESTINATION include
 )

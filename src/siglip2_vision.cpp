@@ -47,6 +47,21 @@ struct Block {
     ggml_tensor * down_w = nullptr; ggml_tensor * down_b = nullptr;
 };
 
+// Siglip2MultiheadAttentionPoolingHead weights.
+// HF uses nn.MultiheadAttention with packed in_proj_{weight,bias}; the converter
+// splits these into separate q/k/v tensors so we can use the same attention
+// pattern as encoder blocks.
+struct ProbeHead {
+    ggml_tensor * probe   = nullptr; // [1, 1, H]
+    ggml_tensor * q_w     = nullptr; ggml_tensor * q_b     = nullptr;
+    ggml_tensor * k_w     = nullptr; ggml_tensor * k_b     = nullptr;
+    ggml_tensor * v_w     = nullptr; ggml_tensor * v_b     = nullptr;
+    ggml_tensor * o_w     = nullptr; ggml_tensor * o_b     = nullptr;
+    ggml_tensor * ln_w    = nullptr; ggml_tensor * ln_b    = nullptr;
+    ggml_tensor * up_w    = nullptr; ggml_tensor * up_b    = nullptr;
+    ggml_tensor * down_w  = nullptr; ggml_tensor * down_b  = nullptr;
+};
+
 ggml_tensor * dup_meta(
     ggml_context *      dst_ctx,
     ggml_context *      meta_ctx,
@@ -117,6 +132,57 @@ ggml_tensor * build_block(
     return cur;
 }
 
+// MultiheadAttentionPoolingHead. Cross-attention with a learnable probe (n_pos_q=1)
+// against the last_hidden_state (n_pos_k=n_patches). Then layernorm + MLP residual.
+// Returns the single pooled vector of shape (H, 1).
+ggml_tensor * build_probe_head(
+    ggml_context *      ctx,
+    const ProbeHead &   head,
+    ggml_tensor *       last_hidden,  // (H, n_pos)
+    int                 n_pos,
+    int                 H,
+    int                 d_head,
+    int                 n_head,
+    float               ln_eps,
+    float               kq_scale) {
+    // Probe weight is stored (H, 1, 1) in GGUF (H is innermost). Build Q from it.
+    // Treat probe as a single-token "input" of shape (H, 1).
+    ggml_tensor * probe_in = ggml_reshape_2d(ctx, head.probe, H, 1);
+
+    // Q = probe_in @ q_w.T + q_b  -> (H, 1)
+    ggml_tensor * Q = ggml_add(ctx, ggml_mul_mat(ctx, head.q_w, probe_in), head.q_b);
+    // K, V from last_hidden -> (H, n_pos)
+    ggml_tensor * K = ggml_add(ctx, ggml_mul_mat(ctx, head.k_w, last_hidden), head.k_b);
+    ggml_tensor * V = ggml_add(ctx, ggml_mul_mat(ctx, head.v_w, last_hidden), head.v_b);
+
+    Q = ggml_reshape_3d(ctx, Q, d_head, n_head, 1);       // (d_head, n_head, 1)
+    K = ggml_reshape_3d(ctx, K, d_head, n_head, n_pos);   // (d_head, n_head, n_pos)
+    V = ggml_reshape_3d(ctx, V, d_head, n_head, n_pos);
+
+    Q = ggml_permute(ctx, Q, 0, 2, 1, 3);                 // (d_head, 1, n_head)
+    K = ggml_permute(ctx, K, 0, 2, 1, 3);                 // (d_head, n_pos, n_head)
+    V = ggml_cont(ctx, ggml_permute(ctx, V, 1, 2, 0, 3)); // (n_pos, d_head, n_head)
+
+    ggml_tensor * KQ = ggml_mul_mat(ctx, K, Q);                          // (n_pos, 1, n_head)
+    KQ = ggml_soft_max_ext(ctx, KQ, /*mask*/ nullptr, kq_scale, 0.0f);
+
+    ggml_tensor * KQV = ggml_mul_mat(ctx, V, KQ);                        // (d_head, 1, n_head)
+    KQV = ggml_permute(ctx, KQV, 0, 2, 1, 3);                            // (d_head, n_head, 1)
+    KQV = ggml_cont_2d(ctx, KQV, d_head * n_head, 1);                    // (H, 1)
+
+    ggml_tensor * attn = ggml_add(ctx, ggml_mul_mat(ctx, head.o_w, KQV), head.o_b);  // (H, 1)
+
+    // Per HF: residual = attn (no layernorm before MHA); LayerNorm wraps the post-MHA value;
+    //         output = residual + MLP(LN(attn))
+    ggml_tensor * normed = build_layernorm(ctx, attn, head.ln_w, head.ln_b, ln_eps);
+    normed = ggml_add(ctx, ggml_mul_mat(ctx, head.up_w, normed), head.up_b);
+    normed = ggml_gelu(ctx, normed);
+    normed = ggml_add(ctx, ggml_mul_mat(ctx, head.down_w, normed), head.down_b);
+
+    ggml_tensor * out = ggml_add(ctx, attn, normed);   // (H, 1)
+    return out;
+}
+
 } // anonymous namespace
 
 struct VisionEncoder::State {
@@ -136,6 +202,7 @@ struct VisionEncoder::State {
     ggml_tensor * post_ln_b    = nullptr;
 
     std::vector<Block> blocks;
+    ProbeHead          head;
 
     ~State() {
         if (sched) {
@@ -249,6 +316,30 @@ bool VisionEncoder::load(const std::string & gguf_path) {
         return false;
     }
 
+    // Probe pooling head tensors (optional — only present in full SigLIP2 models).
+    {
+        ProbeHead & h = state_->head;
+        struct entry { ggml_tensor ** dst; const char * name; };
+        entry entries[] = {
+            {&h.probe,  "v.head.probe"},
+            {&h.q_w,    "v.head.attn_q.weight"},   {&h.q_b,    "v.head.attn_q.bias"},
+            {&h.k_w,    "v.head.attn_k.weight"},   {&h.k_b,    "v.head.attn_k.bias"},
+            {&h.v_w,    "v.head.attn_v.weight"},   {&h.v_b,    "v.head.attn_v.bias"},
+            {&h.o_w,    "v.head.attn_o.weight"},   {&h.o_b,    "v.head.attn_o.bias"},
+            {&h.ln_w,   "v.head.ln.weight"},       {&h.ln_b,   "v.head.ln.bias"},
+            {&h.up_w,   "v.head.ffn_up.weight"},   {&h.up_b,   "v.head.ffn_up.bias"},
+            {&h.down_w, "v.head.ffn_down.weight"}, {&h.down_b, "v.head.ffn_down.bias"},
+        };
+        for (auto & e : entries) {
+            *e.dst = dup_meta(state_->weights_ctx, meta, e.name);
+            if (!add(*e.dst, e.name)) {
+                delete state_;
+                state_ = nullptr;
+                return false;
+            }
+        }
+    }
+
     state_->blocks.resize(config_.num_hidden_layers);
     for (int il = 0; il < config_.num_hidden_layers; ++il) {
         Block & b = state_->blocks[il];
@@ -314,30 +405,28 @@ bool VisionEncoder::load(const std::string & gguf_path) {
 
 bool VisionEncoder::encode(
     const float *        pixel_values,
-    int                  n_patches,
+    int                  n_patches_h,
+    int                  n_patches_w,
     Pooling              pooling,
     std::vector<float> & out_embedding) {
     if (!state_) {
         error_msg_ = "VisionEncoder not loaded";
         return false;
     }
-    if (n_patches != config_.num_patches) {
-        char buf[256];
-        snprintf(buf, sizeof(buf),
-            "M1 fixed-resolution path requires n_patches=%d (got %d). NaFlex variable resolution lands in M2.",
-            config_.num_patches, n_patches);
-        error_msg_ = buf;
+    if (n_patches_h <= 0 || n_patches_w <= 0) {
+        error_msg_ = "n_patches_h and n_patches_w must be positive";
         return false;
     }
-    if (pooling != Pooling::MEAN) {
-        error_msg_ = "M1 supports MEAN pooling only; PROBE pooling lands in M2";
+    const int n_per_side = (int)std::round(std::sqrt((double)config_.num_patches));
+    if (n_per_side * n_per_side != config_.num_patches) {
+        error_msg_ = "config.num_patches must be a perfect square (native grid)";
         return false;
     }
 
     const int   H        = config_.hidden_size;
     const int   n_head   = config_.num_attention_heads;
     const int   d_head   = H / n_head;
-    const int   n_pos    = n_patches;
+    const int   n_pos    = n_patches_h * n_patches_w;
     const int   feat     = config_.num_channels * config_.patch_size * config_.patch_size;
     const float kq_scale = 1.0f / std::sqrt((float)d_head);
 
@@ -368,8 +457,23 @@ bool VisionEncoder::encode(
     ggml_tensor * x = ggml_mul_mat(ctx, state_->patch_embd_w, inp);
     x = ggml_add(ctx, x, state_->patch_embd_b);
 
-    // Positional embedding (M1: native 16x16 grid, no resize).
-    x = ggml_add(ctx, x, state_->pos_embd);
+    // Position embedding: bilinear interpolate from native (n_per_side, n_per_side, H)
+    // to target (n_patches_w, n_patches_h, H), then add. Skip the interpolation when
+    // the target matches native (avoids small numerical noise from the resampler).
+    ggml_tensor * pos_embd = state_->pos_embd; // (H, num_patches)
+    if (n_patches_h != n_per_side || n_patches_w != n_per_side) {
+        pos_embd = ggml_reshape_3d(ctx, pos_embd, H, n_per_side, n_per_side);
+        pos_embd = ggml_permute(ctx, pos_embd, 2, 0, 1, 3);              // (n_per_side, n_per_side, H)
+        // BILINEAR + ANTIALIAS matches HF Siglip2VisionEmbeddings.resize_positional_embeddings
+        // exactly (which uses F.interpolate(mode='bilinear', antialias=True)).
+        pos_embd = ggml_interpolate(
+            ctx, pos_embd,
+            n_patches_w, n_patches_h, H, 1,
+            GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS);       // (n_w, n_h, H)
+        pos_embd = ggml_permute(ctx, pos_embd, 1, 2, 0, 3);              // (H, n_w, n_h)
+        pos_embd = ggml_cont_2d(ctx, pos_embd, H, n_pos);                // (H, n_pos)
+    }
+    x = ggml_add(ctx, x, pos_embd);
 
     for (int il = 0; il < config_.num_hidden_layers; ++il) {
         x = build_block(ctx, state_->blocks[il], x, n_pos, d_head, n_head, config_.layer_norm_eps, kq_scale);
@@ -377,9 +481,16 @@ bool VisionEncoder::encode(
 
     x = build_layernorm(ctx, x, state_->post_ln_w, state_->post_ln_b, config_.layer_norm_eps);
 
-    // Mean-pool over patches: x is (H, n_pos); transpose to (n_pos, H) so ggml_mean reduces n_pos.
-    ggml_tensor * pooled = ggml_cont(ctx, ggml_transpose(ctx, x));
-    pooled = ggml_mean(ctx, pooled);
+    ggml_tensor * pooled = nullptr;
+    if (pooling == Pooling::MEAN) {
+        // Mean-pool over patches: x is (H, n_pos); transpose to (n_pos, H) so ggml_mean reduces n_pos.
+        pooled = ggml_cont(ctx, ggml_transpose(ctx, x));
+        pooled = ggml_mean(ctx, pooled);
+    } else { // PROBE
+        pooled = build_probe_head(
+            ctx, state_->head, x,
+            n_pos, H, d_head, n_head, config_.layer_norm_eps, kq_scale);
+    }
     ggml_set_name(pooled, "pooled");
     ggml_set_output(pooled);
 

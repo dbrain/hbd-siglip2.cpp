@@ -27,12 +27,13 @@ struct VisionConfig {
 
 // SigLIP2 vision encoder.
 //
-// M1: fixed-resolution path. Caller must pre-patchify the image to exactly
-// `n_patches = num_patches` rows of `num_channels * patch_size^2` fp32 features.
-// Pooling fixed to MEAN for M1.
+// NaFlex (variable-resolution) path: caller supplies pre-patchified pixel_values
+// alongside the spatial grid (n_patches_h, n_patches_w). The encoder bilinearly
+// interpolates the native (16x16) position embedding to the target grid in-graph
+// and runs the ViT.
 //
-// M2 will add NaFlex variable-resolution + bilinear pos-embed interp,
-// attention masks for padded patches, and the PROBE pooling head.
+// M2 simplification: no padding. n_patches must equal n_patches_h * n_patches_w
+// (snap-to-exact-grid). Padded inputs + attention masks land later if needed.
 class VisionEncoder {
 public:
     VisionEncoder();
@@ -45,10 +46,13 @@ public:
     const std::string  & last_error() const { return error_msg_; }
 
     // pixel_values: contiguous fp32 of shape [n_patches, num_channels*patch_size^2]
+    //               where n_patches == n_patches_h * n_patches_w.
+    // n_patches_h, n_patches_w: spatial grid for pos-embed interpolation.
     // out_embedding: resized to hidden_size on success.
     bool encode(
         const float *        pixel_values,
-        int                  n_patches,
+        int                  n_patches_h,
+        int                  n_patches_w,
         Pooling              pooling,
         std::vector<float> & out_embedding);
 

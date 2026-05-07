@@ -1,6 +1,8 @@
 #include "siglip2_vision.h"
+#include "siglip2_preproc.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -12,20 +14,18 @@ namespace {
 
 void print_usage(const char * argv0) {
     fprintf(stderr,
-        "siglip2-cli (M1 vision-only)\n"
+        "siglip2-cli (vision encoder)\n"
         "\n"
-        "Usage: %s --model <path.gguf> --pixel-values <path.bin> [--n-patches N] [--out <path.bin>]\n"
+        "Usage: %s --model <path.gguf> [--image <img>|--pixel-values <bin>] [opts]\n"
         "\n"
-        "  --model         GGUF file produced by scripts/convert_siglip2_to_gguf.py\n"
-        "  --pixel-values  raw fp32 buffer of shape [n_patches, num_channels*patch_size^2]\n"
-        "                  (preprocess via HF Siglip2ImageProcessor; pickle-free for parity tests)\n"
-        "  --n-patches     number of patches in the buffer; defaults to GGUF native (256)\n"
-        "  --out           write embedding to this file as raw fp32; default: stdout text\n"
-        "\n"
-        "Stdout (when --out omitted):\n"
-        "  embedding[H]:\n"
-        "    [0]=...\n"
-        "    ...\n",
+        "  --model            GGUF file from scripts/convert_siglip2_to_gguf.py\n"
+        "  --image            image file (jpg/png/bmp/...) — preprocess in-process\n"
+        "  --pixel-values     raw fp32 buffer of shape [n_patches, num_channels*patch_size^2]\n"
+        "  --n-patches        with --pixel-values: number of patches in the buffer\n"
+        "  --shape H,W        spatial patch grid (rows, cols); defaults to native square\n"
+        "  --max-num-patches  with --image: cap on patches (HF default 256; kobbler 729)\n"
+        "  --pooling          'probe' (default; matches HF pooler_output) or 'mean'\n"
+        "  --out              write embedding to this file as raw fp32; default: stdout text\n",
         argv0);
 }
 
@@ -57,16 +57,38 @@ bool write_file(const std::string & path, const void * data, size_t bytes, std::
 int main(int argc, char ** argv) {
     std::string model_path;
     std::string pixel_path;
+    std::string image_path;
     std::string out_path;
+    std::string pooling_str = "probe";
     int         n_patches = -1; // default: use config.num_patches
+    int         n_h = -1;
+    int         n_w = -1;
+    int         max_num_patches = 256;
 
     for (int i = 1; i < argc; ++i) {
         if ((!strcmp(argv[i], "--model") || !strcmp(argv[i], "-m")) && i + 1 < argc) {
             model_path = argv[++i];
         } else if (!strcmp(argv[i], "--pixel-values") && i + 1 < argc) {
             pixel_path = argv[++i];
+        } else if (!strcmp(argv[i], "--image") && i + 1 < argc) {
+            image_path = argv[++i];
+        } else if (!strcmp(argv[i], "--max-num-patches") && i + 1 < argc) {
+            max_num_patches = std::atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--n-patches") && i + 1 < argc) {
             n_patches = std::atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--shape") && i + 1 < argc) {
+            // "--shape H,W" specifies non-square patch grids for naflex
+            const char * s = argv[++i];
+            char * comma = const_cast<char *>(strchr(s, ','));
+            if (!comma) {
+                fprintf(stderr, "--shape expects H,W (got: %s)\n", s);
+                return 2;
+            }
+            *comma = '\0';
+            n_h = std::atoi(s);
+            n_w = std::atoi(comma + 1);
+        } else if (!strcmp(argv[i], "--pooling") && i + 1 < argc) {
+            pooling_str = argv[++i];
         } else if (!strcmp(argv[i], "--out") && i + 1 < argc) {
             out_path = argv[++i];
         } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
@@ -79,7 +101,19 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (model_path.empty() || pixel_path.empty()) {
+    siglip2::Pooling pooling;
+    if (pooling_str == "mean") {
+        pooling = siglip2::Pooling::MEAN;
+    } else if (pooling_str == "probe") {
+        pooling = siglip2::Pooling::PROBE;
+    } else {
+        fprintf(stderr, "Unknown --pooling: %s (use 'probe' or 'mean')\n", pooling_str.c_str());
+        return 2;
+    }
+
+    if (model_path.empty() || (pixel_path.empty() && image_path.empty()) ||
+        (!pixel_path.empty() && !image_path.empty())) {
+        fprintf(stderr, "must supply --model and exactly one of --image / --pixel-values\n");
         print_usage(argv[0]);
         return 2;
     }
@@ -91,25 +125,59 @@ int main(int argc, char ** argv) {
     }
 
     const auto & cfg = enc.config();
-    if (n_patches < 0) n_patches = cfg.num_patches;
     const int feat = cfg.num_channels * cfg.patch_size * cfg.patch_size;
 
-    std::vector<uint8_t> raw;
     std::string err;
-    if (!read_file(pixel_path, raw, err)) {
-        fprintf(stderr, "%s\n", err.c_str());
-        return 1;
-    }
-    const size_t expected = sizeof(float) * (size_t)n_patches * feat;
-    if (raw.size() != expected) {
-        fprintf(stderr,
-            "pixel buffer size mismatch: got %zu bytes, expected %zu (n_patches=%d feat=%d sizeof(float)=%zu)\n",
-            raw.size(), expected, n_patches, feat, sizeof(float));
-        return 1;
+    std::vector<float> pixel_buf;
+    if (!image_path.empty()) {
+        siglip2::PreprocResult pp;
+        float mean[3] = {0.5f, 0.5f, 0.5f};
+        float std_v[3] = {0.5f, 0.5f, 0.5f};
+        if (!siglip2::preprocess_image_file(
+                image_path, max_num_patches, cfg.patch_size,
+                1.0f / 255.0f, mean, std_v, pp, err)) {
+            fprintf(stderr, "preprocess failed: %s\n", err.c_str());
+            return 1;
+        }
+        pixel_buf = std::move(pp.pixel_values);
+        n_h = pp.n_patches_h;
+        n_w = pp.n_patches_w;
+        fprintf(stderr, "preprocessed: grid=%dx%d (%d patches, max=%d)\n",
+            n_h, n_w, n_h * n_w, max_num_patches);
+    } else {
+        if (n_h < 0 && n_w < 0) {
+            const int side = (int)(std::round(std::sqrt((double)cfg.num_patches)));
+            n_h = side;
+            n_w = side;
+        } else if (n_h < 0 || n_w < 0) {
+            fprintf(stderr, "--shape must specify both H and W\n");
+            return 2;
+        }
+        const int n_patches_inferred = n_h * n_w;
+        if (n_patches < 0) n_patches = n_patches_inferred;
+        if (n_patches != n_patches_inferred) {
+            fprintf(stderr, "--n-patches=%d disagrees with --shape %d,%d (=%d).\n",
+                n_patches, n_h, n_w, n_patches_inferred);
+            return 2;
+        }
+        std::vector<uint8_t> raw;
+        if (!read_file(pixel_path, raw, err)) {
+            fprintf(stderr, "%s\n", err.c_str());
+            return 1;
+        }
+        const size_t expected = sizeof(float) * (size_t)n_patches * feat;
+        if (raw.size() != expected) {
+            fprintf(stderr,
+                "pixel buffer size mismatch: got %zu bytes, expected %zu (n_patches=%d feat=%d)\n",
+                raw.size(), expected, n_patches, feat);
+            return 1;
+        }
+        pixel_buf.assign(reinterpret_cast<const float *>(raw.data()),
+                         reinterpret_cast<const float *>(raw.data()) + raw.size() / sizeof(float));
     }
 
     std::vector<float> emb;
-    if (!enc.encode(reinterpret_cast<const float *>(raw.data()), n_patches, siglip2::Pooling::MEAN, emb)) {
+    if (!enc.encode(pixel_buf.data(), n_h, n_w, pooling, emb)) {
         fprintf(stderr, "encode failed: %s\n", enc.last_error().c_str());
         return 1;
     }
