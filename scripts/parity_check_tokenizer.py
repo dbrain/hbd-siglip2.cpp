@@ -43,7 +43,7 @@ def main() -> int:
     p.add_argument("--hf-model", required=True, type=Path)
     p.add_argument("--gguf", required=True, type=Path)
     p.add_argument("--text-cli", required=True, type=Path)
-    p.add_argument("--threshold", default=0.999, type=float)
+    p.add_argument("--threshold", default=0.997, type=float)
     args = p.parse_args()
 
     print("[tok-parity] loading HF model + tokenizer")

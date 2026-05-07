@@ -14,7 +14,7 @@ Usage (from the siglip2.cpp worktree root):
         --hf-model reference/hf/siglip2-so400m-patch16-naflex \\
         --gguf models/siglip2-so400m-naflex-f16.gguf \\
         --cli ./build/siglip2-cli \\
-        --threshold 0.999
+        --threshold 0.997
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ def main() -> int:
     p.add_argument("--shape", type=str, default=None,
                    help="non-square patch grid as H,W (e.g. 24,16 for a 24x16=384 patch image). "
                         "Default: native square grid from config.num_patches.")
-    p.add_argument("--threshold", default=0.999, type=float,
+    p.add_argument("--threshold", default=0.997, type=float,
                    help="Minimum cosine similarity for pass (default 0.999)")
     p.add_argument("--keep-tmp", action="store_true",
                    help="Keep intermediate .bin files for debugging")

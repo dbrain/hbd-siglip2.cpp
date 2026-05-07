@@ -98,13 +98,29 @@ ggml_tensor * build_block(
 
     ggml_tensor * KQV;
     if (use_fa) {
+        // d_head=72 needs zero-padding to 80 to be tensor-core MMA eligible.
+        // ggml's CUDA pad op only takes F32, so we pad before the F16 cast.
+        constexpr int FA_TC_ALIGN = 16;
+        const int d_pad = (d_head + FA_TC_ALIGN - 1) & ~(FA_TC_ALIGN - 1);
+        const int pad   = d_pad - d_head;
+
         Q = ggml_permute(ctx, Q, 0, 2, 1, 3);
         K = ggml_permute(ctx, K, 0, 2, 1, 3);
         V = ggml_permute(ctx, V, 0, 2, 1, 3);          // NOT transposed under FA
-        K = ggml_cast(ctx, K, GGML_TYPE_F16);
-        V = ggml_cast(ctx, V, GGML_TYPE_F16);
-        KQV = ggml_flash_attn_ext(ctx, Q, K, V, fa_mask_f16, kq_scale, 0.0f, 0.0f);
+        if (pad > 0) {
+            Q = ggml_pad(ctx, ggml_cont(ctx, Q), pad, 0, 0, 0);
+            K = ggml_pad(ctx, ggml_cont(ctx, K), pad, 0, 0, 0);
+            V = ggml_pad(ctx, ggml_cont(ctx, V), pad, 0, 0, 0);
+        }
+        ggml_tensor * K_f16 = ggml_cast(ctx, K, GGML_TYPE_F16);
+        ggml_tensor * V_f16 = ggml_cast(ctx, V, GGML_TYPE_F16);
+        KQV = ggml_flash_attn_ext(ctx, Q, K_f16, V_f16, fa_mask_f16, kq_scale, 0.0f, 0.0f);
         ggml_flash_attn_ext_set_prec(KQV, GGML_PREC_F32);
+        if (pad > 0) {
+            // Slice ne[0]=d_pad back to real d_head and rebuild contiguous.
+            KQV = ggml_view_3d(ctx, KQV, d_head, n_head, n_pos, KQV->nb[1], KQV->nb[2], 0);
+            KQV = ggml_cont(ctx, KQV);
+        }
         KQV = ggml_reshape_2d(ctx, KQV, d_head * n_head, n_pos);
     } else {
         Q = ggml_permute(ctx, Q, 0, 2, 1, 3);

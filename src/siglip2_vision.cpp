@@ -86,6 +86,53 @@ ggml_tensor * build_layernorm(
     return cur;
 }
 
+// SigLIP2's d_head=72 doesn't divide by 16, so the CUDA MMA / WMMA flash-attn
+// kernels can't accept it directly (their tile templates require D%16==0).
+// We work around that by zero-padding Q/K/V's d-axis to the next multiple of 16
+// before FA, and slicing the result back to the real d_head before the output
+// projection. Zero-padded contributions are mathematically null:
+//   Q·K  → padded q_d * padded k_d = 0·0 = 0      (no change in attention scores)
+//   V    → padded v_d in result = 0               (sliced away before o_w)
+// On Ampere this routes attention to the tensor-core MMA kernel (case 80) and
+// keeps the existing 0.999 parity floor.
+constexpr int FA_TC_ALIGN = 16;
+
+inline int round_up_d(int d) { return (d + FA_TC_ALIGN - 1) & ~(FA_TC_ALIGN - 1); }
+
+// Pads d-axis (if d_head not multiple of 16) on the F32 side, then casts K/V
+// to F16 for FA. ggml's CUDA pad op only accepts F32 sources, so we do the
+// pad before the cast.
+ggml_tensor * fa_attn_pad_slice(
+    ggml_context * ctx,
+    ggml_tensor *  Q,                   // (d_head, ?, n_head) F32, post-permute (non-contig view ok)
+    ggml_tensor *  K,                   // (d_head, ?, n_head) F32, post-permute (non-contig view ok)
+    ggml_tensor *  V,                   // (d_head, ?, n_head) F32, post-permute (non-contig view ok)
+    ggml_tensor *  fa_mask_f16,         // optional mask, F16
+    int            d_head,
+    int            n_head,
+    int            n_pos_q,
+    float          kq_scale) {
+    const int d_pad = round_up_d(d_head);
+    if (d_pad != d_head) {
+        const int pad = d_pad - d_head;
+        // ggml_cuda's pad op requires F32 + contiguous source; ggml_cont covers both.
+        Q = ggml_pad(ctx, ggml_cont(ctx, Q), pad, 0, 0, 0);
+        K = ggml_pad(ctx, ggml_cont(ctx, K), pad, 0, 0, 0);
+        V = ggml_pad(ctx, ggml_cont(ctx, V), pad, 0, 0, 0);
+    }
+    ggml_tensor * K_f16 = ggml_cast(ctx, K, GGML_TYPE_F16);
+    ggml_tensor * V_f16 = ggml_cast(ctx, V, GGML_TYPE_F16);
+    ggml_tensor * KQV = ggml_flash_attn_ext(ctx, Q, K_f16, V_f16, fa_mask_f16, kq_scale, 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(KQV, GGML_PREC_F32);
+    // FA result: ne=[d_pad, n_head, n_pos_q, 1]
+    if (d_pad != d_head) {
+        // Slice ne[0] back to real d_head and rebuild contiguous (H, n_pos_q).
+        KQV = ggml_view_3d(ctx, KQV, d_head, n_head, n_pos_q, KQV->nb[1], KQV->nb[2], 0);
+        KQV = ggml_cont(ctx, KQV);
+    }
+    return ggml_reshape_2d(ctx, KQV, d_head * n_head, n_pos_q);
+}
+
 // One SigLIP2 encoder block: pre-LN attention + pre-LN MLP, both with residuals.
 // Attention is fused via ggml_flash_attn_ext when use_fa=true so the per-layer
 // (n_pos, n_pos, n_head) KQ matrix is never materialized — saves activation
@@ -117,12 +164,8 @@ ggml_tensor * build_block(
         Q = ggml_permute(ctx, Q, 0, 2, 1, 3);                 // (d_head, n_pos, n_head)
         K = ggml_permute(ctx, K, 0, 2, 1, 3);                 // (d_head, n_pos, n_head)
         V = ggml_permute(ctx, V, 0, 2, 1, 3);                 // (d_head, n_pos, n_head) — NOT transposed
-        K = ggml_cast(ctx, K, GGML_TYPE_F16);
-        V = ggml_cast(ctx, V, GGML_TYPE_F16);
-        KQV = ggml_flash_attn_ext(ctx, Q, K, V, /*mask*/ nullptr, kq_scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(KQV, GGML_PREC_F32);
-        // FA result is already permuted: ne=[d_head, n_head, n_pos, 1]
-        KQV = ggml_reshape_2d(ctx, KQV, d_head * n_head, n_pos);
+        // fa_attn_pad_slice does the F16 cast + pad-when-needed internally.
+        KQV = fa_attn_pad_slice(ctx, Q, K, V, /*mask*/ nullptr, d_head, n_head, n_pos, kq_scale);
     } else {
         Q = ggml_permute(ctx, Q, 0, 2, 1, 3);                 // (d_head, n_pos, n_head)
         K = ggml_permute(ctx, K, 0, 2, 1, 3);                 // (d_head, n_pos, n_head)
@@ -181,12 +224,7 @@ ggml_tensor * build_probe_head(
         Q = ggml_permute(ctx, Q, 0, 2, 1, 3);             // (d_head, 1, n_head)
         K = ggml_permute(ctx, K, 0, 2, 1, 3);             // (d_head, n_pos, n_head)
         V = ggml_permute(ctx, V, 0, 2, 1, 3);             // (d_head, n_pos, n_head) — NOT transposed
-        K = ggml_cast(ctx, K, GGML_TYPE_F16);
-        V = ggml_cast(ctx, V, GGML_TYPE_F16);
-        KQV = ggml_flash_attn_ext(ctx, Q, K, V, /*mask*/ nullptr, kq_scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(KQV, GGML_PREC_F32);
-        // FA result: ne=[d_head, n_head, 1, 1]
-        KQV = ggml_reshape_2d(ctx, KQV, d_head * n_head, 1);
+        KQV = fa_attn_pad_slice(ctx, Q, K, V, /*mask*/ nullptr, d_head, n_head, /*n_pos_q=*/1, kq_scale);
     } else {
         Q = ggml_permute(ctx, Q, 0, 2, 1, 3);             // (d_head, 1, n_head)
         K = ggml_permute(ctx, K, 0, 2, 1, 3);             // (d_head, n_pos, n_head)

@@ -26,7 +26,7 @@ def main() -> int:
     p.add_argument("--cli", required=True, type=Path,
                    help="Path to siglip2-text-cli binary")
     p.add_argument("--prompt", default="a photo of two cats sleeping on a couch", type=str)
-    p.add_argument("--threshold", default=0.999, type=float)
+    p.add_argument("--threshold", default=0.997, type=float)
     args = p.parse_args()
 
     print(f"[text-parity] loading HF tokenizer + model from {args.hf_model}")

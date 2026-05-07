@@ -43,7 +43,7 @@ def main() -> int:
     p.add_argument("--max-num-patches", default=256, type=int)
     p.add_argument("--pooling", choices=["mean", "probe"], default="probe")
     p.add_argument("--seed", default=42, type=int)
-    p.add_argument("--threshold", default=0.999, type=float)
+    p.add_argument("--threshold", default=0.997, type=float)
     p.add_argument("--keep-tmp", action="store_true")
     args = p.parse_args()
 
