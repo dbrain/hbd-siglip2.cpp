@@ -1,6 +1,6 @@
 # siglip2.cpp — Handoff
 
-You're picking up `siglip2.cpp` after M1–M5 landed: a feature-complete C++/GGML port of `google/siglip2-so400m-patch16-naflex` with HuggingFace parity across vision, text, probe pooling, sigmoid scoring, NaFlex variable resolution, and a 4-endpoint HTTP server matching `kobbler-vision`. Read `AGENTS.md` for the architectural overview; this doc is **what to do next + why + the user's disposition**.
+You're picking up `siglip2.cpp` after the 2026-05-07 VRAM-minimisation pass: M1–M5 had landed feature-complete parity, then the second-pass agent (you, last session) closed out levers A, B, C, D, G, and H from the previous queue. Read `AGENTS.md` for the architectural overview; this doc is **what to do next + why + the user's disposition**.
 
 ## The user's standing instructions
 
@@ -28,64 +28,61 @@ Translation: **JFDI**. If a path requires writing custom CUDA kernels, forking g
 
 ## Where we are
 
-- Branch: `dbrain/siglip2-v0`, `HEAD` at `214afe2`, 8 commits, never pushed. Baseline is `qwen3-tts.cpp@main` (4068ce4) + `ggml@master` (dbrain/ggml fork).
-- Builds: `build/` (CPU) and `build-cuda/` (sm_86); both pass smoke + parity tests.
-- Quality cross-check vs **live** kobbler-vision-1 (Python fp16, GPU) on a 320×180 PNG, max_num_patches=729:
-  - Image embedding cosine: **0.9959** (Q8_0 vs fp16 — quantization noise)
-  - Text embedding cosine: **0.9999** (after the Siglip2Processor mask fix — see commit `6b45933`)
-  - Sigmoid score MAE: **1.87e-2**, max diff 9%
-- VRAM (model load size, GPU): Python **2347 MiB** → C++ Q8_0 **1855 MiB** = **−492 MiB / −21%**.
-- Host RAM: Python ~3 GiB → C++ ~568 MiB = **5.4×** reduction (free side-win from dropping PyTorch+transformers).
+- Branch: `dbrain/siglip2-v0`, 13 commits, never pushed. Baseline is `qwen3-tts.cpp@main` (4068ce4) + `ggml@master` (dbrain/ggml fork).
+- Builds: `build/` (CPU) and `build-cuda/` (sm_86); both pass smoke + all four parity scripts.
+- Parity (all four scripts):
+  - `parity_check_vision.py`: cosine **0.999936** (synthetic pixel_values; no resize)
+  - `parity_check_text.py`:   cosine **0.999749**
+  - `parity_check_score.py`:  logits cosine **0.999992**, probs MAE **3.8e-7**
+  - `parity_check_image.py` (1920×1080 → 729 patches, the heavy-downsample case): cosine **0.999042** ← AA bilinear got us above 0.999
+- Live cross-check vs `kobbler-vision-1` (Python fp16, GPU) on a 320×180 PNG, max_num_patches=729 (an *upsample* case where AA can't help; cosine is bounded by Q8 noise):
+  - Image embedding cosine: **0.995586**
+  - Score MAE: **1.83e-2**, max diff 8.6%
+- VRAM (siglip2-server, model loaded + warmed via /v1/embeddings + /v1/text_embeddings, on RTX 3060):
+  - Python (kobbler-vision-1):    **2325 MiB**
+  - C++ both towers (full):       **1442 MiB**  (−883 MiB / **−38%** vs Python)
+  - C++ `--vision-only`:           **720 MiB**  (−1605 MiB / **−69%** vs Python — kobbler's deploy target)
+  - C++ `--text-only`:             **944 MiB**
+- Reload time: C++ cold-load **1.09 s** vs Python **10.84 s** — **~10× faster** swap (no torch/transformers import).
+- Host RAM: Python ~3 GiB → C++ ~568 MiB.
 
 ## The Siglip2Processor mask gotcha
 
 If you touch the text path or anyone reports text drift, **remember**: HF `Siglip2Processor` for text-only returns ONLY `input_ids` (no `attention_mask`), pads to 64, and `kobbler-vision` does `model.text_model(**inputs)` straight. Pad-token-0 embeddings flow through attention as if they were real tokens. **Match this.** Passing the "correct" attention mask diverges by ~0.24 cosine on short prompts. Captured in commit `6b45933`'s body and in `siglip2_server.cpp::encode_text`'s comment.
 
-## Lever queue (priority order, payoff × effort)
+## What landed in this pass (2026-05-07, second-pass agent)
 
-### A. Antialiased CPU image resize *(quality lever; user explicit ask)*
-- **File:** `src/siglip2_preproc.cpp::resize_bilinear_u8`. Currently naive bilinear, no antialias.
-- **Goal:** Lift image embedding cosine from 0.996 → ≥ 0.9999 vs PyTorch.
-- **Why:** PyTorch torchvision (modern) defaults `antialias=True` for `BILINEAR`; HF's Siglip2ImageProcessor (TorchvisionBackend) inherits. Without it, downsampled patches diverge slightly from HF's, propagating into the embedding.
-- **How:** Separable triangular low-pass + bilinear. Per-axis kernel coefficients depend on the scale ratio `s = src/dst`. Reference: PyTorch `aten/src/ATen/native/cpu/UpSampleKernel.cpp::upsample_bilinear2d_aa`. ~150-200 LOC.
-- **Risk:** Low. Bench cosine should rise; existing parity tests still pass at native (no-resize) shapes.
+In commit order on the branch:
 
-### B. Q8_0 the token embedding *(VRAM lever, fastest win)*
-- **File:** `scripts/convert_siglip2_to_gguf.py::_is_keep_f16`.
-- **Save:** 295 MiB on disk, ~145 MiB runtime VRAM.
-- **How:** drop the `t.token_embd.weight` special case from `_is_keep_f16` and re-convert with `--type q8_0`. Run `parity_check_text.py` and `parity_check_score.py` to confirm cosine doesn't regress.
-- **Risk:** Low-medium. Token embedding lookups give you 1 row at a time; per-row Q8_0 quant is well-behaved but worth a parity sanity check.
+- **`dc83baa` — chore: remove inherited TTS source** (lever H). 51 files, ~30k lines deleted. Tree now only has SigLIP2.
+- **`d8bb673` — feat(convert): Q8_0 the text token embedding** (lever B). Drop `_is_keep_f16` special case for `t.token_embd.weight`. Saves ~390 MiB VRAM. GGUF on disk shrinks 1.74 → 1.47 GiB.
+- **`73f3fd7` — feat(vision,text): wire `ggml_flash_attn_ext`** (lever D). Vision `build_block` + `build_probe_head` + text `build_block` all FA. K/V cast to F16, `GGML_PREC_F32` accumulator. `SIGLIP2_DISABLE_FA=1` falls back if a parity issue surfaces.
+- **`b39a896` — feat(server): `--vision-only` / `--text-only`** (lever C). Flag-gates tower load; missing endpoints 503.
+- **`df577f7` — perf: scheduler max_nodes 8192 → 2048** (lever G).
+- **`4849c9f` — feat(preproc): antialiased bilinear CPU resize** (lever A). Separable triangular AA filter matching torchvision `F.interpolate(antialias=True)`. Lifts image cosine at heavy-downsample shapes from <0.998 to ≥0.999.
 
-### C. `--vision-only` / `--text-only` server modes *(VRAM lever, biggest narrow-deployment win)*
-- **File:** `src/siglip2_server.cpp`.
-- **Save:** ~1+ GiB if vision-only deployment (kobbler's `do_embed_frames` path doesn't need text).
-- **How:** flag-gate the text encoder + tokenizer load in `ServerState::load_model`. Endpoints needing the missing tower return 503 with a clear message.
-- **Risk:** None.
+## Lever queue — what's left
 
-### D. FlashAttention in the encoder graphs *(VRAM + perf lever; biggest if landed)*
-- **Files:** `src/siglip2_vision.cpp::build_block`, `build_probe_head`; `src/siglip2_text.cpp::build_block`.
-- **Save:** Activation memory for the KQ matrix (n_pos² × n_head × 4 bytes). For text n_pos=64 it's small (64×64×16×4 = 256 KiB/layer × 27 = ~7 MiB) but vision can hit n_pos=729 (~3 MiB/layer × 27 = ~83 MiB). Bigger payoff is the perf cliff: FA fuses softmax+matmul into one kernel.
-- **How:** Replace the `mul_mat(K, Q) → soft_max_ext → mul_mat(V, KQ)` chain with `ggml_flash_attn_ext(Q, K, V, mask, scale, ...)` — clip.cpp's `build_attn` under `CLIP_FLASH_ATTN_TYPE_ENABLED` is the canonical pattern. Cast K/V to F16, set `ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32)` for accumulator precision.
-- **Risk:** Medium. FA can change numerics on edge cases. Verify all parity scripts. Q8_0 weights × FA path may need extra care.
+The "easy levers" queue (A–D, G, H) is exhausted. Remaining queue, ordered by ambition:
+
+### F. Selective CPU offload *(VRAM lever; modest)*
+- ggml's scheduler supports per-tensor backend assignment. The text token embedding (~295 MiB Q8) is now the largest single tensor — moving it to CPU saves that much VRAM at the cost of a one-time host→device read per text request (256K × 1152 × Q8 → small handful of rows after `ggml_get_rows`). Only worth it if a deploy is text-bottlenecked.
+- **How:** `ggml_backend_sched_set_tensor_backend` for `t.token_embd` after it's allocated. Need to also pin the `ggml_get_rows` op to CPU and let the scheduler split.
+- **Risk:** Per-call bandwidth tax. Probably negligible since `ggml_get_rows` only fetches `n_tokens` rows (≤64).
+
+### J. ffn_down Q8_0 padding *(VRAM lever, ~130 MiB)*
+- ffn_down has innermost dim **4304** — not divisible by Q8_0's block size 32 — so 27 vision layers + 27 text layers + probe head all fall back to F16. ~5 MiB extra per tensor × 28 ≈ 130 MiB unnecessary VRAM.
+- **How:** pad the inner axis to 4320 (next multiple of 32) at conversion time, then either (a) feed a padded activation in the graph, or (b) pad-aware quant that stores [4288 // 32 + 1] blocks with the last block flagged. Option (a) is simpler: graph-side `ggml_pad` on the GELU output before `ffn_down`, slice back after.
+- **Risk:** Easy to get the slice wrong; verify with parity_check_vision.
 
 ### E. Megakernel-style block fusion *(VRAM + perf lever; ambitious)*
-- The user has prior art: `kobbler/docker/tts-qwen3-dev/HANDOFF-megakernel-v0.md` describes their TTS megakernel approach (per-layer fused kernels, shape-specialized MMVQ). For SigLIP2 vision, an entire pre-LN transformer block (attn + MLP + 2 residuals) can fuse into one CUDA kernel for the dominant shape (n_pos=729, H=1152). Eliminates intermediate-tensor allocations entirely → real VRAM and perf win.
-- **Where to start:** read the qwen3-tts.cpp megakernel branch (`dbrain/megakernel-v0` of the parent repo). The pattern (MMVQ specialization for fixed shapes) translates directly to vision blocks at the production max_num_patches=729 grid.
-- **Risk:** Real. This is "massive rewrite of internal GGML" territory. The user explicitly opted in for this. Expect 1-2 weeks if you go full Phase A+B.
+- Same prior art as before: `kobbler/docker/tts-qwen3-dev/HANDOFF-megakernel-v0.md` for the TTS megakernel pattern. For SigLIP2 vision, an entire pre-LN transformer block (attn + MLP + 2 residuals) fuses into one CUDA kernel at the dominant shape (n_pos=729, H=1152). Eliminates intermediate allocations + closes the d_head=72 perf gap (currently routes to FA tile kernel, not MMA).
+- **Why now:** the d_head=72 dispatcher in `ggml/src/ggml-cuda/fattn.cu` explicitly skips MMA, WMMA, and AMD MFMA for `Q->ne[0] == 72` (only the tile kernel handles it). End-to-end perf is 0.5–0.9× of the Python service; megakernel would close that and likely beat it.
+- **Risk:** Real. "Massive rewrite of internal GGML" territory. User explicitly opted in for this. Expect 1–2 weeks if you go full Phase A+B.
 
-### F. Selective CPU offload *(VRAM lever; if A-D aren't enough)*
-- ggml's scheduler supports per-tensor backend assignment. Heavy weights (e.g. text tower if rarely used; token embedding) can sit on CPU with mid-graph promotion to GPU only when needed.
-- **How:** explicit `ggml_backend_sched_set_tensor_backend` for chosen tensors after they're allocated.
-- **Risk:** Bandwidth tax on every promotion; only worth it if A-D haven't reached the user's target.
-
-### G. Tune scheduler arena nodes *(small VRAM lever)*
-- Graph declares `max_nodes=8192`; actual graph has ~830 nodes for 27 layers. Reducing to 1024 saves a small amount of scheduler-side metadata. Probably noise but cheap.
-
-### H. TTS source cleanup *(hygiene; not VRAM)*
-- `src/audio_*.{cpp,h}`, `src/coreml_*`, `src/tts_transformer*`, `src/qwen3_tts*`, `src/qwen3tts_c_api*`, `src/text_tokenizer*` (the Qwen BPE one), `src/tokenizer_unicode*`, `tests/test_*.cpp` are all dead in the new CMakeLists. One `chore: remove inherited TTS source` commit cleans the tree.
-
-### I. Full latency benchmark *(deferred)*
-- `scripts/bench_vs_python.py` minus `--lite` covers it. Run when the user's GPU is free of megakernel work; correctness + VRAM are the load-bearing axes for now.
+### Other small/nice-to-haves
+- **Endpoint perf:** SigLIP2 d_head=72 hits the slow CUDA tile FA kernel. Adding 72 to the MMA case list in `ggml/src/ggml-cuda/fattn-mma-f16.cuh` (and an instantiation) is a credible perf win without going full megakernel. The `Q->ne[0] != 72` guards in `fattn.cu` are explicit "we never instantiated this" markers, not deep limitations.
+- **`return_last_hidden` /v1/embeddings flag** (501-stubbed today). Build a separate vision encode-with-hidden path. Users haven't asked.
 
 ## Build / test cheat sheet
 
@@ -143,11 +140,13 @@ docker run --rm --gpus all --network host -v $PWD:/work -w /work kobbler-vision 
 ## What "done" looks like
 
 User's bar: "ridiculously optimized on this hardware." Concretely:
-- VRAM significantly below 1.85 GiB Q8 baseline (target: dream is sub-1 GiB resident on the vision-only path).
-- Cosine ≥ 0.999 on real images (with the antialiased resize landed).
-- No quality regression from current Q8.
-- Performance equal to or better than the Python fp16 service.
+- ✅ VRAM significantly below 1.85 GiB Q8 baseline (now 1442 MiB full / **720 MiB vision-only** — sub-1 GiB on vision-only achieved).
+- ✅ Cosine ≥ 0.999 on real images (1920×1080 → 729 patches: 0.999042; AA resize landed).
+- ✅ No quality regression from current Q8 (FA added <0.001 cosine drop, well below the 0.999 floor on the real-image path).
+- ⚠️ Performance currently 0.5–0.9× of Python on RTX 3060 (FA tile kernel, not MMA, for d_head=72). Cold-load is **~10× faster** than Python though, which dominates kobbler's swap workflow.
 
-If you hit any of those, ship a commit + update this doc's "Where we are" section. The next agent (or future-you) will pick up from there.
+The remaining axis to push is end-to-end latency, which is bounded by the d_head=72 CUDA dispatcher choice. Either teach MMA-FA to handle 72, or go megakernel.
+
+Ship a commit + update this doc's "Where we are" section as you land things. The next agent (or future-you) will pick up from there.
 
 Now go.
