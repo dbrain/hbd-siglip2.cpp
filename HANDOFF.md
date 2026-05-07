@@ -19,8 +19,8 @@ Stay above 0.999 cosine on the real-image path. Everything else is fair game.
 ## The user's standing instructions
 
 **Priorities, all critical, no longer ranked:**
-- **VRAM**: minimal. Sub-1 GiB resident on the vision-only path is now floor, not ceiling. Push lower.
-- **Performance**: as close to maximum viable for the hardware as possible. Until 2026-05-08 the user had perf on the backburner; after the v0 VRAM pass landed they upgraded the bar to "go crazy". The C++ path is currently 0.5–0.9× of the Python service at p50 because d_head=72 routes attention to the slow CUDA tile kernel — that's the headline gap and the next agent's first target.
+- **VRAM**: minimal, **measured against full-tower deploy mode** (both vision and text loaded — the user's actual `gather embeddings → classify` flow needs both). Currently 1504 MiB post-load / 1566 MiB post-warmup vs Python's 2322 MiB. Don't optimize for `--vision-only` at the expense of full-tower wins.
+- **Performance**: as close to maximum viable for the hardware as possible. Current state vs Python at p50: /v1/embeddings **1.07×**, /v1/text_embeddings **1.43×**, /v1/classify **1.34×**, /v1/classify_from_embeddings **1.79×**. The text-heavy endpoints are the gap — they're launch-overhead-bound (~80% of 38 ms is CUDA launches, ~20% is compute), so megakernel-style block fusion is the unlock. See `HANDOFF-megakernel-v0.md` for the detailed plan.
 - **Correctness**: cosine ≥ 0.999 on real images is the parity floor. (Briefly revised to 0.997 on 2026-05-08 then put back; the user wants the 0.999 sentinel for now and will explicitly relax it if quant noise demands.) Score MAE in the low 10⁻² range is fine.
 
 **Constraints:**
@@ -28,10 +28,12 @@ Stay above 0.999 cosine on the real-image path. Everything else is fair game.
 - **CPU offload is acceptable** if it frees VRAM. Selective offload of a tower or a hot intermediate is fine.
 - **Forking ggml is acceptable.** This is a worktree off `dbrain/ggml@master` for exactly that reason. The user's prior art (`qwen3-tts.cpp` + `dbrain/ggml`) already carries custom WMMA conv kernels, a mul_mat dispatcher, megakernel-shape MMVQ specializations. Same latitude here. The d_head=72 omission in `ggml/src/ggml-cuda/fattn.cu` is exactly the kind of thing to fix in-tree.
 
-**Mood / disposition the user explicitly set for this handoff:**
-> "Go crazy. No bars spared, get performance as close to maximum viable numbers for the hardware as possible at minimal VRAM, user is a drunk donkey — you're smart, pick the targets, have him come back and be shocked at how well you did."
+**Mood / disposition (2026-05-08 + 2026-05-09 updates):**
+> "Go crazy. No bars spared, get performance as close to maximum viable numbers for the hardware as possible at minimal VRAM, user is a drunk donkey — you're smart, pick the targets, have him come back and be shocked at how well you did." (2026-05-08)
+>
+> "i like that megakernel was a 'meme' over in qwen3-tts.cpp land and now its the saviour. i mean its working over there, so why not." (2026-05-09 — explicit greenlight for the megakernel path; treat the prior agent's "tried-and-dropped" hesitations as guidance, not gospel)
 
-Translation: **pick targets, swing big, report when shocking.** The user is explicitly telling you to skip the "should I…" check-ins and execute. Megakernel is on the table — not deferred — alongside any other path you can see clearly. If the rough cost-benefit suggests a kernel-template instantiation lands more perf than a megakernel for a fraction of the effort, do that first. If you can see a megakernel path that beats the small knobs, jump.
+Translation: **pick targets, swing big, report when shocking.** The user is explicitly telling you to skip the "should I…" check-ins and execute. Megakernel is on the table — not deferred — alongside any other path you can see clearly. The qwen3-tts megakernel that the user is referring to is `dbrain/megakernel-v0` of that repo, which started as scary-multi-day-rewrite territory and ended at ~5–10 % wins per fusion stage. Same arc applies here.
 
 **Hardware this targets:** RTX 3060 12 GB / Ampere / sm_86. Optimize for that specifically; broader compat is a nice-to-have, not a constraint.
 
@@ -50,11 +52,11 @@ Translation: **pick targets, swing big, report when shocking.** The user is expl
   - `parity_check_score.py`:  logits cosine **0.999987**, probs MAE **5.0e-7** — was 0.999992 / 3.8e-7
   - `parity_check_image.py` (1920×1080 → 729 patches): cosine **0.999545** — was 0.999054 (**+491 µcos**, real improvement; fused matmul has slightly better numerics than three independent ones)
 - Live cross-check vs `kobbler-vision-1` on a 320×180 PNG, max_num_patches=729: Image embedding cosine **0.995865**, scores MAE **1.92e-2** — bit-identical to pre-fusion (Q8 noise floor, fusion doesn't move it).
-- VRAM (siglip2-server, model loaded + warmed, RTX 3060):
-  - Python (kobbler-vision-1):    **2325 MiB**
-  - C++ both towers (full, post-warmup): **~1920 MiB** (−405 MiB vs Python — note: this is post-warmup including activations; the **post-load resident** is closer to 1440 MiB with a ~480 MiB activation peak that lands during the first encode).
-  - C++ `--vision-only`:           **720 MiB** post-load (−1605 MiB / **−69%** vs Python — kobbler's deploy target)
-  - C++ `--text-only`:             **944 MiB**
+- VRAM, full-tower deploy mode (both vision + text loaded, the user's actual flow):
+  - Python (kobbler-vision-1):    **2322 MiB** post-warmup
+  - C++ post-load (idle):         **1504 MiB** (**−818 MiB / −35 %** vs Python)
+  - C++ post-warmup:              **1566 MiB** (after first `/v1/embeddings` + `/v1/text_embeddings`; +62 MiB of compute-pool activations relative to post-load)
+  - For reference: `--vision-only` is **664 MiB** post-load and `--text-only` would be **~944 MiB**, but **the user's real deploy uses both towers**, so optimize for the full-tower number.
 - Endpoint p50 (30 runs, both servers warmed, GPU shared with kobbler-vision + tts-qwen3 + dev iter container so wobble is real):
   - `/v1/embeddings`:               C++ ~58 ms vs Python ~54 ms (cpp **1.07×** — was 1.10× pre-QKV-fusion)
   - `/v1/text_embeddings`:          C++ ~38 ms vs Python ~26 ms (cpp **1.43×** — was **1.71×**, **−14% absolute**)
@@ -209,10 +211,10 @@ docker run --rm --gpus all --network host -v $PWD:/work -w /work kobbler-vision 
 ## What "done" looks like
 
 User's bar: "ridiculously optimized on this hardware." Concretely:
-- ✅ VRAM significantly below 1.85 GiB Q8 baseline (now 1438 MiB full / **720 MiB vision-only** — sub-1 GiB on vision-only achieved).
-- ✅ Cosine ≥ 0.999 on real images (1920×1080 → 729 patches: 0.999054; AA resize + padded MMA-FA both clean).
-- ✅ No quality regression from Q8 + FA + padded-MMA (all parity scripts pass at the 0.999 floor).
-- 🟡 Performance: padded MMA-FA closed the easy slice of the gap (+14–23 % across endpoints). Remaining gap is **graph-setup overhead on small-batch paths** (text, classify_from_embeddings) and **per-block kernel-launch + intermediate-allocation overhead** (vision). Graph caching attacks the first; megakernel attacks the second. Land both and you should be at or above Python.
+- ✅ Full-tower VRAM well below Python (now **1504 MiB** post-load vs Python **2322 MiB** — −35 %).
+- ✅ Cosine ≥ 0.999 on real images (1920×1080 → 729 patches: **0.999545** post-QKV-fusion).
+- ✅ No quality regression from Q8 + FA + padded-MMA + QKV-fusion (all parity scripts pass at the 0.999 floor).
+- 🟡 Performance: padded MMA-FA + QKV fusion have closed the easier slices of the gap. Remaining gap is **CUDA launch-overhead on text-heavy endpoints** (~80 % of text encode time is launches, not compute). Megakernel is the unblock — see `HANDOFF-megakernel-v0.md`. Land it and text should drop to ≤1× Python.
 - ✅ Cold-load: ~16× faster than Python.
 
 Ship a commit + update this doc's "Where we are" section as you land things. The next agent (or future-you) will pick up from there.
