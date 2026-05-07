@@ -40,7 +40,7 @@ Quantization policy:
   - Layer norms (.ln*, .final_ln, .post_ln, .ffn_norm)  -> F32
   - Biases                                              -> F32
   - Tiny tensors (probe, logit_scale, logit_bias, position_embd) -> F32
-  - Token embedding (256K x H)                          -> F16 (Q8 lookup is finicky; 280MB @ F16 acceptable)
+  - Token embedding (256K x H)                          -> output_type (Q8_0 verified parity-safe; ~145 MiB VRAM win vs F16)
   - All other 2D weights                                -> output_type (F16 / Q8_0)
 """
 
@@ -207,9 +207,10 @@ class Siglip2Converter:
         return False
 
     def _is_keep_f16(self, ggml_name: str) -> bool:
-        # Token embedding stays F16 even when output_type=q8_0 (lookup quality)
-        if ggml_name == "t.token_embd.weight":
-            return True
+        # Currently no tensors are forced to F16. The token embedding was previously
+        # kept F16 out of caution about per-row Q8 lookup noise; parity check shows
+        # Q8_0 holds (cosine ≥ 0.999 vs HF), so we let it ride at output_type.
+        del ggml_name
         return False
 
     def _convert_dtype(self, t: torch.Tensor, ggml_name: str) -> tuple[np.ndarray, gguf.GGMLQuantizationType]:
