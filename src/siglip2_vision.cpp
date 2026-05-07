@@ -1,0 +1,412 @@
+#include "siglip2_vision.h"
+
+#include "gguf_loader.h"
+
+#include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
+#include "gguf.h"
+
+#include <algorithm>
+#include <cassert>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace siglip2 {
+
+namespace {
+
+constexpr const char * KV_HIDDEN     = "siglip2.vision.embedding_length";
+constexpr const char * KV_INTER      = "siglip2.vision.feed_forward_length";
+constexpr const char * KV_HEADS      = "siglip2.vision.attention.head_count";
+constexpr const char * KV_LAYERS     = "siglip2.vision.block_count";
+constexpr const char * KV_PATCH      = "siglip2.vision.patch_size";
+constexpr const char * KV_NUM_PATCH  = "siglip2.vision.num_patches";
+constexpr const char * KV_NUM_CHAN   = "siglip2.vision.num_channels";
+constexpr const char * KV_LN_EPS     = "siglip2.vision.layer_norm_eps";
+
+std::string blk_name(int il, const char * suffix) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "v.blk.%d.%s", il, suffix);
+    return buf;
+}
+
+struct Block {
+    ggml_tensor * ln1_w  = nullptr; ggml_tensor * ln1_b  = nullptr;
+    ggml_tensor * q_w    = nullptr; ggml_tensor * q_b    = nullptr;
+    ggml_tensor * k_w    = nullptr; ggml_tensor * k_b    = nullptr;
+    ggml_tensor * v_w    = nullptr; ggml_tensor * v_b    = nullptr;
+    ggml_tensor * o_w    = nullptr; ggml_tensor * o_b    = nullptr;
+    ggml_tensor * ln2_w  = nullptr; ggml_tensor * ln2_b  = nullptr;
+    ggml_tensor * up_w   = nullptr; ggml_tensor * up_b   = nullptr;
+    ggml_tensor * down_w = nullptr; ggml_tensor * down_b = nullptr;
+};
+
+ggml_tensor * dup_meta(
+    ggml_context *      dst_ctx,
+    ggml_context *      meta_ctx,
+    const std::string & name) {
+    ggml_tensor * meta = ggml_get_tensor(meta_ctx, name.c_str());
+    if (!meta) return nullptr;
+    ggml_tensor * out = ggml_dup_tensor(dst_ctx, meta);
+    ggml_set_name(out, name.c_str());
+    return out;
+}
+
+ggml_tensor * build_layernorm(
+    ggml_context * ctx,
+    ggml_tensor *  cur,
+    ggml_tensor *  weight,
+    ggml_tensor *  bias,
+    float          eps) {
+    cur = ggml_norm(ctx, cur, eps);
+    if (weight) cur = ggml_mul(ctx, cur, weight);
+    if (bias)   cur = ggml_add(ctx, cur, bias);
+    return cur;
+}
+
+// One SigLIP2 encoder block: pre-LN attention + pre-LN MLP, both with residuals.
+ggml_tensor * build_block(
+    ggml_context * ctx,
+    const Block &  layer,
+    ggml_tensor *  inp,
+    int            n_pos,
+    int            d_head,
+    int            n_head,
+    float          ln_eps,
+    float          kq_scale) {
+    // Self-attention
+    ggml_tensor * residual = inp;
+    ggml_tensor * cur = build_layernorm(ctx, inp, layer.ln1_w, layer.ln1_b, ln_eps);
+
+    ggml_tensor * Q = ggml_add(ctx, ggml_mul_mat(ctx, layer.q_w, cur), layer.q_b);
+    ggml_tensor * K = ggml_add(ctx, ggml_mul_mat(ctx, layer.k_w, cur), layer.k_b);
+    ggml_tensor * V = ggml_add(ctx, ggml_mul_mat(ctx, layer.v_w, cur), layer.v_b);
+
+    Q = ggml_reshape_3d(ctx, Q, d_head, n_head, n_pos);
+    K = ggml_reshape_3d(ctx, K, d_head, n_head, n_pos);
+    V = ggml_reshape_3d(ctx, V, d_head, n_head, n_pos);
+
+    Q = ggml_permute(ctx, Q, 0, 2, 1, 3);                     // (d_head, n_pos, n_head)
+    K = ggml_permute(ctx, K, 0, 2, 1, 3);                     // (d_head, n_pos, n_head)
+    V = ggml_cont(ctx, ggml_permute(ctx, V, 1, 2, 0, 3));     // (n_pos, d_head, n_head)
+
+    ggml_tensor * KQ = ggml_mul_mat(ctx, K, Q);
+    KQ = ggml_soft_max_ext(ctx, KQ, /*mask*/ nullptr, kq_scale, 0.0f);
+
+    ggml_tensor * KQV = ggml_mul_mat(ctx, V, KQ);             // (d_head, n_pos_q, n_head)
+    KQV = ggml_permute(ctx, KQV, 0, 2, 1, 3);                 // (d_head, n_head, n_pos)
+    KQV = ggml_cont_2d(ctx, KQV, d_head * n_head, n_pos);     // (hidden, n_pos)
+
+    cur = ggml_add(ctx, ggml_mul_mat(ctx, layer.o_w, KQV), layer.o_b);
+    cur = ggml_add(ctx, cur, residual);
+    residual = cur;
+
+    // MLP
+    cur = build_layernorm(ctx, cur, layer.ln2_w, layer.ln2_b, ln_eps);
+    cur = ggml_add(ctx, ggml_mul_mat(ctx, layer.up_w, cur), layer.up_b);
+    cur = ggml_gelu(ctx, cur); // matches gelu_pytorch_tanh
+    cur = ggml_add(ctx, ggml_mul_mat(ctx, layer.down_w, cur), layer.down_b);
+
+    cur = ggml_add(ctx, cur, residual);
+    return cur;
+}
+
+} // anonymous namespace
+
+struct VisionEncoder::State {
+    qwen3_tts::GGUFLoader loader;
+
+    ggml_backend_t        backend     = nullptr;
+    ggml_backend_t        backend_cpu = nullptr; // scheduler fallback when backend != CPU
+    ggml_backend_buffer_t weights_buf = nullptr;
+    ggml_context *        weights_ctx = nullptr;
+    ggml_backend_sched_t  sched       = nullptr;
+
+    // Weight tensors (in weights_ctx)
+    ggml_tensor * patch_embd_w = nullptr;
+    ggml_tensor * patch_embd_b = nullptr;
+    ggml_tensor * pos_embd     = nullptr;
+    ggml_tensor * post_ln_w    = nullptr;
+    ggml_tensor * post_ln_b    = nullptr;
+
+    std::vector<Block> blocks;
+
+    ~State() {
+        if (sched) {
+            ggml_backend_sched_free(sched);
+        }
+        if (weights_buf) {
+            ggml_backend_buffer_free(weights_buf);
+        }
+        if (weights_ctx) {
+            ggml_free(weights_ctx);
+        }
+        if (backend_cpu && backend_cpu != backend) {
+            ggml_backend_free(backend_cpu);
+        }
+        if (backend) {
+            qwen3_tts::release_preferred_backend(backend);
+        }
+    }
+};
+
+VisionEncoder::VisionEncoder() = default;
+
+VisionEncoder::~VisionEncoder() {
+    close();
+}
+
+void VisionEncoder::close() {
+    if (state_) {
+        delete state_;
+        state_ = nullptr;
+    }
+}
+
+bool VisionEncoder::load(const std::string & gguf_path) {
+    close();
+    state_ = new State{};
+
+    if (!state_->loader.open(gguf_path)) {
+        error_msg_ = state_->loader.get_error();
+        delete state_;
+        state_ = nullptr;
+        return false;
+    }
+
+    config_.hidden_size         = state_->loader.get_u32(KV_HIDDEN, 1152);
+    config_.intermediate_size   = state_->loader.get_u32(KV_INTER,  4304);
+    config_.num_attention_heads = state_->loader.get_u32(KV_HEADS,  16);
+    config_.num_hidden_layers   = state_->loader.get_u32(KV_LAYERS, 27);
+    config_.patch_size          = state_->loader.get_u32(KV_PATCH,  16);
+    config_.num_patches         = state_->loader.get_u32(KV_NUM_PATCH, 256);
+    config_.num_channels        = state_->loader.get_u32(KV_NUM_CHAN, 3);
+    config_.layer_norm_eps      = state_->loader.get_f32(KV_LN_EPS, 1e-6f);
+
+    if (config_.hidden_size <= 0 || config_.num_hidden_layers <= 0) {
+        error_msg_ = "GGUF metadata missing required vision config keys";
+        delete state_;
+        state_ = nullptr;
+        return false;
+    }
+
+    state_->backend = qwen3_tts::init_preferred_backend("siglip2-vision", &error_msg_);
+    if (!state_->backend) {
+        delete state_;
+        state_ = nullptr;
+        return false;
+    }
+    if (ggml_backend_dev_type(ggml_backend_get_device(state_->backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        state_->backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    } else {
+        state_->backend_cpu = state_->backend;
+    }
+
+    const int64_t n_total = state_->loader.get_n_tensors();
+    struct ggml_init_params wp = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * (size_t)(n_total + 16),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    state_->weights_ctx = ggml_init(wp);
+    if (!state_->weights_ctx) {
+        error_msg_ = "ggml_init for weights_ctx failed";
+        delete state_;
+        state_ = nullptr;
+        return false;
+    }
+
+    ggml_context * meta = state_->loader.get_meta_ctx();
+    std::map<std::string, ggml_tensor *> tmap;
+
+    auto add = [&](ggml_tensor * t, const char * name) -> bool {
+        if (!t) {
+            error_msg_ = std::string("Missing tensor in GGUF: ") + name;
+            return false;
+        }
+        tmap[name] = t;
+        return true;
+    };
+
+    state_->patch_embd_w = dup_meta(state_->weights_ctx, meta, "v.patch_embd.weight");
+    state_->patch_embd_b = dup_meta(state_->weights_ctx, meta, "v.patch_embd.bias");
+    state_->pos_embd     = dup_meta(state_->weights_ctx, meta, "v.position_embd.weight");
+    state_->post_ln_w    = dup_meta(state_->weights_ctx, meta, "v.post_ln.weight");
+    state_->post_ln_b    = dup_meta(state_->weights_ctx, meta, "v.post_ln.bias");
+    if (!add(state_->patch_embd_w, "v.patch_embd.weight") ||
+        !add(state_->patch_embd_b, "v.patch_embd.bias") ||
+        !add(state_->pos_embd,     "v.position_embd.weight") ||
+        !add(state_->post_ln_w,    "v.post_ln.weight") ||
+        !add(state_->post_ln_b,    "v.post_ln.bias")) {
+        delete state_;
+        state_ = nullptr;
+        return false;
+    }
+
+    state_->blocks.resize(config_.num_hidden_layers);
+    for (int il = 0; il < config_.num_hidden_layers; ++il) {
+        Block & b = state_->blocks[il];
+        struct entry { ggml_tensor ** dst; const char * suffix; };
+        entry entries[] = {
+            {&b.ln1_w,  "ln1.weight"},   {&b.ln1_b,  "ln1.bias"},
+            {&b.q_w,    "attn_q.weight"},{&b.q_b,    "attn_q.bias"},
+            {&b.k_w,    "attn_k.weight"},{&b.k_b,    "attn_k.bias"},
+            {&b.v_w,    "attn_v.weight"},{&b.v_b,    "attn_v.bias"},
+            {&b.o_w,    "attn_o.weight"},{&b.o_b,    "attn_o.bias"},
+            {&b.ln2_w,  "ln2.weight"},   {&b.ln2_b,  "ln2.bias"},
+            {&b.up_w,   "ffn_up.weight"},{&b.up_b,   "ffn_up.bias"},
+            {&b.down_w, "ffn_down.weight"},{&b.down_b,"ffn_down.bias"},
+        };
+        for (auto & e : entries) {
+            std::string nm = blk_name(il, e.suffix);
+            *e.dst = dup_meta(state_->weights_ctx, meta, nm);
+            if (!add(*e.dst, nm.c_str())) {
+                delete state_;
+                state_ = nullptr;
+                return false;
+            }
+        }
+    }
+
+    // Allocate backend buffer + load weight data.
+    if (!qwen3_tts::load_tensor_data_from_file(
+            gguf_path,
+            state_->loader.get_ctx(),
+            state_->weights_ctx,
+            tmap,
+            state_->weights_buf,
+            error_msg_,
+            ggml_backend_dev_type(ggml_backend_get_device(state_->backend)))) {
+        delete state_;
+        state_ = nullptr;
+        return false;
+    }
+
+    // Compute scheduler.
+    {
+        std::vector<ggml_backend_t> backends;
+        backends.push_back(state_->backend);
+        if (state_->backend_cpu && state_->backend_cpu != state_->backend) {
+            backends.push_back(state_->backend_cpu);
+        }
+        std::vector<ggml_backend_buffer_type_t> bufts;
+        for (auto b : backends) bufts.push_back(ggml_backend_get_default_buffer_type(b));
+        const int max_nodes = 8192;
+        state_->sched = ggml_backend_sched_new(
+            backends.data(), bufts.data(), (int)backends.size(),
+            max_nodes, /*parallel=*/false, /*op_offload=*/true);
+        if (!state_->sched) {
+            error_msg_ = "ggml_backend_sched_new failed";
+            delete state_;
+            state_ = nullptr;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool VisionEncoder::encode(
+    const float *        pixel_values,
+    int                  n_patches,
+    Pooling              pooling,
+    std::vector<float> & out_embedding) {
+    if (!state_) {
+        error_msg_ = "VisionEncoder not loaded";
+        return false;
+    }
+    if (n_patches != config_.num_patches) {
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+            "M1 fixed-resolution path requires n_patches=%d (got %d). NaFlex variable resolution lands in M2.",
+            config_.num_patches, n_patches);
+        error_msg_ = buf;
+        return false;
+    }
+    if (pooling != Pooling::MEAN) {
+        error_msg_ = "M1 supports MEAN pooling only; PROBE pooling lands in M2";
+        return false;
+    }
+
+    const int   H        = config_.hidden_size;
+    const int   n_head   = config_.num_attention_heads;
+    const int   d_head   = H / n_head;
+    const int   n_pos    = n_patches;
+    const int   feat     = config_.num_channels * config_.patch_size * config_.patch_size;
+    const float kq_scale = 1.0f / std::sqrt((float)d_head);
+
+    const int    max_nodes = 8192;
+    const size_t arena_sz  =
+        ggml_tensor_overhead() * 4096 +
+        ggml_graph_overhead_custom(max_nodes, false);
+    std::vector<uint8_t> arena(arena_sz);
+    struct ggml_init_params gp = {
+        /*.mem_size   =*/ arena.size(),
+        /*.mem_buffer =*/ arena.data(),
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(gp);
+    if (!ctx) {
+        error_msg_ = "ggml_init for graph_ctx failed";
+        return false;
+    }
+
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, max_nodes, false);
+
+    // Input: pixel_values [feat, n_pos] in ggml convention (ne[0]=feat innermost).
+    ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, feat, n_pos);
+    ggml_set_name(inp, "pixel_values");
+    ggml_set_input(inp);
+
+    // Patch embed: Linear(feat -> H). Weight stored (feat, H); mul_mat -> (H, n_pos).
+    ggml_tensor * x = ggml_mul_mat(ctx, state_->patch_embd_w, inp);
+    x = ggml_add(ctx, x, state_->patch_embd_b);
+
+    // Positional embedding (M1: native 16x16 grid, no resize).
+    x = ggml_add(ctx, x, state_->pos_embd);
+
+    for (int il = 0; il < config_.num_hidden_layers; ++il) {
+        x = build_block(ctx, state_->blocks[il], x, n_pos, d_head, n_head, config_.layer_norm_eps, kq_scale);
+    }
+
+    x = build_layernorm(ctx, x, state_->post_ln_w, state_->post_ln_b, config_.layer_norm_eps);
+
+    // Mean-pool over patches: x is (H, n_pos); transpose to (n_pos, H) so ggml_mean reduces n_pos.
+    ggml_tensor * pooled = ggml_cont(ctx, ggml_transpose(ctx, x));
+    pooled = ggml_mean(ctx, pooled);
+    ggml_set_name(pooled, "pooled");
+    ggml_set_output(pooled);
+
+    ggml_build_forward_expand(gf, pooled);
+
+    if (!ggml_backend_sched_alloc_graph(state_->sched, gf)) {
+        ggml_free(ctx);
+        error_msg_ = "ggml_backend_sched_alloc_graph failed";
+        return false;
+    }
+
+    ggml_backend_tensor_set(inp, pixel_values, 0, sizeof(float) * (size_t)feat * n_pos);
+
+    enum ggml_status st = ggml_backend_sched_graph_compute(state_->sched, gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        ggml_backend_sched_reset(state_->sched);
+        ggml_free(ctx);
+        error_msg_ = std::string("graph compute failed status=") + std::to_string((int)st);
+        return false;
+    }
+
+    out_embedding.assign((size_t)H, 0.0f);
+    ggml_backend_tensor_get(pooled, out_embedding.data(), 0, sizeof(float) * (size_t)H);
+
+    ggml_backend_sched_reset(state_->sched);
+    ggml_free(ctx);
+    return true;
+}
+
+} // namespace siglip2

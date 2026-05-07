@@ -54,3 +54,8 @@ Thumbs.db
 debug_*.bin
 reference/decoder_debug/
 reference/debug/
+
+# Local HF model snapshot (copied from docker volume; thrown away post-GGUF)
+/reference/hf/
+/reference/llama.cpp/
+/reference/transformers/
