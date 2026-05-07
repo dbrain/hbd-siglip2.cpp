@@ -47,6 +47,11 @@ struct ServerConfig {
     int         default_max_num_patches = 729;
     int         idle_unload_seconds = 0;     // 0 = never
     bool        lazy_load = false;
+    // Narrow-deployment switches: each saves ~1 GiB Q8 by skipping the
+    // unused tower at load. Endpoints that require the missing tower
+    // return 503.
+    bool        vision_only = false;
+    bool        text_only   = false;
 };
 
 ServerConfig parse_args(int argc, char ** argv) {
@@ -55,14 +60,19 @@ ServerConfig parse_args(int argc, char ** argv) {
         const char * v = std::getenv(key);
         return v ? std::string(v) : std::string(def);
     };
+    auto bool_env = [&](const char * key) {
+        std::string v = env(key, "");
+        return !v.empty() && v != "0" && v != "false";
+    };
     c.model_path     = env("MODEL_PATH", "");
     c.tokenizer_path = env("TOKENIZER_PATH", "");
     c.host           = env("HOST", "0.0.0.0");
     c.port           = std::atoi(env("PORT", "8890").c_str());
     c.default_max_num_patches = std::atoi(env("DEFAULT_MAX_NUM_PATCHES", "729").c_str());
     c.idle_unload_seconds     = std::atoi(env("IDLE_UNLOAD_SECONDS", "0").c_str());
-    c.lazy_load               = !env("LAZY_LOAD", "").empty() &&
-                                env("LAZY_LOAD", "") != "0" && env("LAZY_LOAD", "") != "false";
+    c.lazy_load               = bool_env("LAZY_LOAD");
+    c.vision_only             = bool_env("VISION_ONLY");
+    c.text_only               = bool_env("TEXT_ONLY");
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -76,15 +86,23 @@ ServerConfig parse_args(int argc, char ** argv) {
         else if (a == "--port" && i + 1 < argc) c.port = std::atoi(argv[++i]);
         else if (a == "--default-max-num-patches" && i + 1 < argc) c.default_max_num_patches = std::atoi(argv[++i]);
         else if (a == "--idle-unload-seconds"     && i + 1 < argc) c.idle_unload_seconds     = std::atoi(argv[++i]);
-        else if (a == "--lazy-load") c.lazy_load = true;
+        else if (a == "--lazy-load")   c.lazy_load   = true;
+        else if (a == "--vision-only") c.vision_only = true;
+        else if (a == "--text-only")   c.text_only   = true;
         else if (a == "--help" || a == "-h") {
             fprintf(stderr,
                 "siglip2-server — kobbler-vision-compatible HTTP service\n\n"
                 "Usage: %s --model <gguf> --tokenizer <spm.model> [--port 8890] [--lazy-load]\n"
-                "Env: MODEL_PATH TOKENIZER_PATH HOST PORT DEFAULT_MAX_NUM_PATCHES IDLE_UNLOAD_SECONDS LAZY_LOAD\n",
+                "         [--vision-only | --text-only]\n"
+                "Env: MODEL_PATH TOKENIZER_PATH HOST PORT DEFAULT_MAX_NUM_PATCHES\n"
+                "     IDLE_UNLOAD_SECONDS LAZY_LOAD VISION_ONLY TEXT_ONLY\n",
                 argv[0]);
             std::exit(0);
         }
+    }
+    if (c.vision_only && c.text_only) {
+        fprintf(stderr, "--vision-only and --text-only are mutually exclusive\n");
+        std::exit(2);
     }
     return c;
 }
@@ -113,30 +131,45 @@ struct ServerState {
     bool load_model(std::string & err) {
         std::lock_guard<std::mutex> lock(encode_mutex);
         if (loaded.load()) return true;
-        if (cfg.model_path.empty() || cfg.tokenizer_path.empty()) {
-            err = "model and tokenizer paths required";
+        if (cfg.model_path.empty()) {
+            err = "model path required";
             return false;
         }
-        vision    = std::make_unique<siglip2::VisionEncoder>();
-        text      = std::make_unique<siglip2::TextEncoder>();
-        tokenizer = std::make_unique<siglip2::Tokenizer>();
-        if (!vision->load(cfg.model_path)) {
-            err = "vision load: " + vision->last_error();
+        const bool need_text = !cfg.vision_only;
+        if (need_text && cfg.tokenizer_path.empty()) {
+            err = "tokenizer path required (or pass --vision-only)";
             return false;
         }
-        if (!text->load(cfg.model_path)) {
-            err = "text load: " + text->last_error();
-            return false;
+        if (!cfg.text_only) {
+            vision = std::make_unique<siglip2::VisionEncoder>();
+            if (!vision->load(cfg.model_path)) {
+                err = "vision load: " + vision->last_error();
+                return false;
+            }
         }
-        if (!tokenizer->load(cfg.tokenizer_path)) {
-            err = "tokenizer load: " + tokenizer->last_error();
-            return false;
+        if (need_text) {
+            text      = std::make_unique<siglip2::TextEncoder>();
+            tokenizer = std::make_unique<siglip2::Tokenizer>();
+            if (!text->load(cfg.model_path)) {
+                err = "text load: " + text->last_error();
+                return false;
+            }
+            if (!tokenizer->load(cfg.tokenizer_path)) {
+                err = "tokenizer load: " + tokenizer->last_error();
+                return false;
+            }
         }
-        if (!siglip2::read_score_params(cfg.model_path, score_params, err)) {
-            return false;
+        // Score params (logit_scale/bias) are only needed when both towers are
+        // present (classify endpoints); they're always cheap to read either way.
+        if (!cfg.vision_only && !cfg.text_only) {
+            if (!siglip2::read_score_params(cfg.model_path, score_params, err)) {
+                return false;
+            }
         }
         loaded.store(true);
-        fprintf(stderr, "[siglip2-server] model loaded: %s\n", cfg.model_path.c_str());
+        const char * mode = cfg.vision_only ? " (vision-only)" :
+                            cfg.text_only   ? " (text-only)"   : "";
+        fprintf(stderr, "[siglip2-server] model loaded: %s%s\n", cfg.model_path.c_str(), mode);
         return true;
     }
 
@@ -258,8 +291,12 @@ void send_json(httplib::Response & res, int status, const json & body) {
 
 int main(int argc, char ** argv) {
     ServerConfig cfg = parse_args(argc, argv);
-    if (cfg.model_path.empty() || cfg.tokenizer_path.empty()) {
-        fprintf(stderr, "Both --model and --tokenizer (or MODEL_PATH/TOKENIZER_PATH env) are required.\n");
+    if (cfg.model_path.empty()) {
+        fprintf(stderr, "--model (or MODEL_PATH env) is required.\n");
+        return 2;
+    }
+    if (!cfg.vision_only && cfg.tokenizer_path.empty()) {
+        fprintf(stderr, "--tokenizer (or TOKENIZER_PATH env) is required unless --vision-only.\n");
         return 2;
     }
     ServerState st;
@@ -306,9 +343,32 @@ int main(int argc, char ** argv) {
         return true;
     };
 
+    auto require_vision = [&](httplib::Response & res) -> bool {
+        if (!st.vision) {
+            send_json(res, 503, json{{"error", "vision tower not loaded (server started with --text-only)"}});
+            return false;
+        }
+        return true;
+    };
+    auto require_text = [&](httplib::Response & res) -> bool {
+        if (!st.text || !st.tokenizer) {
+            send_json(res, 503, json{{"error", "text tower not loaded (server started with --vision-only)"}});
+            return false;
+        }
+        return true;
+    };
+    auto require_score = [&](httplib::Response & res) -> bool {
+        if (!st.vision || !st.text || !st.tokenizer) {
+            send_json(res, 503, json{{"error", "classify requires both towers loaded"}});
+            return false;
+        }
+        return true;
+    };
+
     // -- /v1/embeddings
     srv.Post("/v1/embeddings", [&](const httplib::Request & req, httplib::Response & res) {
         if (!ensure(res)) return;
+        if (!require_vision(res)) return;
         auto images = req.get_file_values("images");
         if (images.empty()) {
             send_json(res, 400, json{{"error", "No images provided"}});
@@ -350,6 +410,7 @@ int main(int argc, char ** argv) {
     // -- /v1/text_embeddings
     srv.Post("/v1/text_embeddings", [&](const httplib::Request & req, httplib::Response & res) {
         if (!ensure(res)) return;
+        if (!require_text(res)) return;
         // Accept multiple `prompts` form fields per kobbler-vision (FastAPI list[str] = Form(...)).
         std::vector<std::string> prompts = collect_field(req, "prompts");
         if (prompts.empty()) { send_json(res, 400, json{{"error", "No prompts provided"}}); return; }
@@ -375,6 +436,7 @@ int main(int argc, char ** argv) {
     // -- /v1/classify
     srv.Post("/v1/classify", [&](const httplib::Request & req, httplib::Response & res) {
         if (!ensure(res)) return;
+        if (!require_score(res)) return;
         auto images = req.get_file_values("images");
         std::vector<std::string> prompts = collect_field(req, "prompts");
         if (images.empty())  { send_json(res, 400, json{{"error", "No images provided"}}); return; }
@@ -433,6 +495,14 @@ int main(int argc, char ** argv) {
     // -- /v1/classify_from_embeddings (JSON body)
     srv.Post("/v1/classify_from_embeddings", [&](const httplib::Request & req, httplib::Response & res) {
         if (!ensure(res)) return;
+        // image embeddings are supplied by the client, but we still need text + score.
+        if (!require_text(res)) return;
+        if (!st.vision) {
+            // /classify_from_embeddings doesn't need vision graph, but score_params
+            // are gated on full load — refuse cleanly so the error is unambiguous.
+            send_json(res, 503, json{{"error", "classify requires the model loaded with both towers"}});
+            return;
+        }
         json body;
         try {
             body = json::parse(req.body);
