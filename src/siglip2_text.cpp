@@ -70,6 +70,30 @@ ggml_tensor * build_layernorm(
     return cur;
 }
 
+} // anonymous namespace (re-opened after pad_x_to_w)
+
+// Q4_K K-padding helper. Q4_K's super-block is 256 elements; siglip2's
+// in_features (== W's innermost dim, ne[0]) for the hot tensors is 1152
+// or 4304, neither of which divides 256. The conversion script
+// (tools/siglip2-quantize) zero-pads W's K to the next multiple of 256.
+// This helper zero-pads the matching activation if W's ne[0] exceeds x's.
+// On Q8_0/F16 weights (block-32 or no block), W's ne[0] equals the original
+// K and this is a no-op.
+//
+// Outside the anonymous namespace + static so it's reachable from both the
+// build_block functions (TU-local) AND TextEncoder::encode/encode_batch.
+static ggml_tensor * pad_x_to_w(
+    ggml_context * ctx, ggml_tensor * x, ggml_tensor * w) {
+    const int64_t k_w = w->ne[0];
+    const int64_t k_x = x->ne[0];
+    if (k_w == k_x) return x;
+    GGML_ASSERT(k_w > k_x && "K-padded W must have larger ne[0] than activation");
+    const int pad = (int) (k_w - k_x);
+    return ggml_pad(ctx, ggml_cont(ctx, x), pad, 0, 0, 0);
+}
+
+namespace {
+
 // SigLIP2 encoder block. Same as the vision tower's, but takes an explicit
 // attention mask for padding-aware self-attention. Uses ggml_flash_attn_ext
 // when use_fa=true. fa_mask_f16 must be the F16 cast of attn_mask (or nullptr
@@ -97,7 +121,9 @@ ggml_tensor * build_block(
     // ggml_pad materializes them contiguously, same as the pre-fusion path.
     const int    H  = d_head * n_head;
     const size_t es = sizeof(float);  // qkv is F32 (mul_mat output)
-    ggml_tensor * qkv = ggml_add(ctx, ggml_mul_mat(ctx, layer.qkv_w, cur), layer.qkv_b);
+    ggml_tensor * qkv = ggml_add(ctx,
+        ggml_mul_mat(ctx, layer.qkv_w, pad_x_to_w(ctx, cur, layer.qkv_w)),
+        layer.qkv_b);
     ggml_tensor * Q = ggml_view_3d(ctx, qkv, d_head, n_head, n_pos,
         /*nb1=*/d_head * es, /*nb2=*/3 * H * es, /*offset=*/0 * H * es);
     ggml_tensor * K = ggml_view_3d(ctx, qkv, d_head, n_head, n_pos,
@@ -142,14 +168,20 @@ ggml_tensor * build_block(
         KQV = ggml_cont_2d(ctx, KQV, d_head * n_head, n_pos);
     }
 
-    cur = ggml_add(ctx, ggml_mul_mat(ctx, layer.o_w, KQV), layer.o_b);
+    cur = ggml_add(ctx,
+        ggml_mul_mat(ctx, layer.o_w, pad_x_to_w(ctx, KQV, layer.o_w)),
+        layer.o_b);
     cur = ggml_add(ctx, cur, residual);
     residual = cur;
 
     cur = build_layernorm(ctx, cur, layer.ln2_w, layer.ln2_b, ln_eps);
-    cur = ggml_add(ctx, ggml_mul_mat(ctx, layer.up_w, cur), layer.up_b);
+    cur = ggml_add(ctx,
+        ggml_mul_mat(ctx, layer.up_w, pad_x_to_w(ctx, cur, layer.up_w)),
+        layer.up_b);
     cur = ggml_gelu(ctx, cur);
-    cur = ggml_add(ctx, ggml_mul_mat(ctx, layer.down_w, cur), layer.down_b);
+    cur = ggml_add(ctx,
+        ggml_mul_mat(ctx, layer.down_w, pad_x_to_w(ctx, cur, layer.down_w)),
+        layer.down_b);
 
     cur = ggml_add(ctx, cur, residual);
     return cur;
@@ -182,7 +214,9 @@ ggml_tensor * build_block_batched(
     ggml_tensor * residual = inp;
     ggml_tensor * cur = build_layernorm(ctx, inp, layer.ln1_w, layer.ln1_b, ln_eps);
 
-    ggml_tensor * qkv = ggml_add(ctx, ggml_mul_mat(ctx, layer.qkv_w, cur), layer.qkv_b);
+    ggml_tensor * qkv = ggml_add(ctx,
+        ggml_mul_mat(ctx, layer.qkv_w, pad_x_to_w(ctx, cur, layer.qkv_w)),
+        layer.qkv_b);
     // qkv: (3*H, n_pos, n_batch). Q/K/V are 4D strided views into it.
     ggml_tensor * Q = ggml_view_4d(ctx, qkv, d_head, n_head, n_pos, n_batch,
         d_head * es, 3 * H * es, 3 * H * (size_t)n_pos * es, 0 * H * es);
@@ -229,14 +263,20 @@ ggml_tensor * build_block_batched(
         KQV = ggml_reshape_3d(ctx, KQV, d_head * n_head, n_pos, n_batch);
     }
 
-    cur = ggml_add(ctx, ggml_mul_mat(ctx, layer.o_w, KQV), layer.o_b);
+    cur = ggml_add(ctx,
+        ggml_mul_mat(ctx, layer.o_w, pad_x_to_w(ctx, KQV, layer.o_w)),
+        layer.o_b);
     cur = ggml_add(ctx, cur, residual);
     residual = cur;
 
     cur = build_layernorm(ctx, cur, layer.ln2_w, layer.ln2_b, ln_eps);
-    cur = ggml_add(ctx, ggml_mul_mat(ctx, layer.up_w, cur), layer.up_b);
+    cur = ggml_add(ctx,
+        ggml_mul_mat(ctx, layer.up_w, pad_x_to_w(ctx, cur, layer.up_w)),
+        layer.up_b);
     cur = ggml_gelu(ctx, cur);
-    cur = ggml_add(ctx, ggml_mul_mat(ctx, layer.down_w, cur), layer.down_b);
+    cur = ggml_add(ctx,
+        ggml_mul_mat(ctx, layer.down_w, pad_x_to_w(ctx, cur, layer.down_w)),
+        layer.down_b);
 
     cur = ggml_add(ctx, cur, residual);
     return cur;
@@ -555,6 +595,13 @@ bool TextEncoder::encode(
         }
 
         ggml_tensor * x = ggml_get_rows(e.ctx, state_->token_embd, e.tok_inp);
+        // K-padded token_embd: get_rows produced (K_padded, n_pos); slice to
+        // (H, n_pos) before adding position_embd (which stays F32 at H wide).
+        // Slice is a strided view; the downstream add wants contiguous, so cont.
+        if (x->ne[0] != H) {
+            GGML_ASSERT(x->ne[0] > H);
+            x = ggml_cont(e.ctx, ggml_view_2d(e.ctx, x, H, x->ne[1], x->nb[1], 0));
+        }
         ggml_tensor * p = ggml_get_rows(e.ctx, state_->position_embd, e.pos_inp);
         x = ggml_add(e.ctx, x, p);
 
@@ -570,7 +617,9 @@ bool TextEncoder::encode(
         ggml_set_input(e.pool_idx);
         ggml_tensor * pooled = ggml_get_rows(e.ctx, ggml_cont(e.ctx, x), e.pool_idx);
 
-        e.proj_out = ggml_add(e.ctx, ggml_mul_mat(e.ctx, state_->head_w, pooled), state_->head_b);
+        e.proj_out = ggml_add(e.ctx,
+            ggml_mul_mat(e.ctx, state_->head_w, pad_x_to_w(e.ctx, pooled, state_->head_w)),
+            state_->head_b);
         ggml_set_name(e.proj_out, "text_embed");
         ggml_set_output(e.proj_out);
         ggml_build_forward_expand(e.gf, e.proj_out);
@@ -732,6 +781,12 @@ bool TextEncoder::encode_batch(
         ggml_set_input(e.pos_inp);
 
         ggml_tensor * x = ggml_get_rows(e.ctx, state_->token_embd, e.tok_inp);
+        // K-padded token_embd: get_rows produced (K_padded, n_pos*n_batch); slice
+        // to (H, n_pos*n_batch) and cont before reshape into 3D + add.
+        if (x->ne[0] != H) {
+            GGML_ASSERT(x->ne[0] > H);
+            x = ggml_cont(e.ctx, ggml_view_2d(e.ctx, x, H, x->ne[1], x->nb[1], 0));
+        }
         ggml_tensor * p = ggml_get_rows(e.ctx, state_->position_embd, e.pos_inp);
         x = ggml_reshape_3d(e.ctx, x, H, n_pos, n_batch);
         p = ggml_reshape_3d(e.ctx, p, H, n_pos, n_batch);
@@ -751,7 +806,9 @@ bool TextEncoder::encode_batch(
         ggml_tensor * pooled = ggml_get_rows(e.ctx, ggml_cont(e.ctx, x), e.pool_idx);
         pooled = ggml_reshape_2d(e.ctx, pooled, H, n_batch);
 
-        e.proj_out = ggml_add(e.ctx, ggml_mul_mat(e.ctx, state_->head_w, pooled), state_->head_b);
+        e.proj_out = ggml_add(e.ctx,
+            ggml_mul_mat(e.ctx, state_->head_w, pad_x_to_w(e.ctx, pooled, state_->head_w)),
+            state_->head_b);
         ggml_set_name(e.proj_out, "text_embed_batch");
         ggml_set_output(e.proj_out);
         ggml_build_forward_expand(e.gf, e.proj_out);

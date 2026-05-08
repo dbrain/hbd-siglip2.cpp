@@ -39,7 +39,22 @@ Quantization policy:
   - Biases                                              -> F32
   - Tiny tensors (probe, logit_scale, logit_bias, position_embd) -> F32
   - Token embedding (256K x H)                          -> output_type (Q8_0 verified parity-safe; ~145 MiB VRAM win vs F16)
-  - All other 2D weights                                -> output_type (F16 / Q8_0)
+  - All other 2D weights                                -> output_type (F16 / Q8_0 / Q4_K_M)
+
+K-padding (Q4_K_M / Q4_0 only):
+  Q4_K (super-block 256) and Q4_0 (block 32) both require the innermost dim
+  (== K, == in_features in HF Linear convention) to be a multiple of the
+  quant block size. siglip2-so400m-naflex's hot tensor shapes:
+    attn_qkv/o, ffn_up : K = 1152  (1152 % 256 = 128, NOT aligned to Q4_K)
+    ffn_down           : K = 4304  (4304 % 32  = 16,  NOT aligned to Q4_0/Q4_K)
+    t.token_embd       : K = 1152  (same)
+  The converter zero-pads K to the next multiple of the block size before
+  calling gguf.quants.quantize. The PADDED K is what gets stored in the
+  GGUF tensor metadata; the runtime sees the padded shape and is responsible
+  for matching activation shapes (zero-fill the K_pad - K_orig elements).
+  Storage cost: K=1152 -> 1280 is +11.1% on those tensors; K=4304 -> 4352
+  is +1.1%. Net file-size change vs Q8_0 is dominated by the bits-per-weight
+  drop (8.5 -> ~4.5), not the padding.
 """
 
 from __future__ import annotations
@@ -209,6 +224,21 @@ class Siglip2Converter:
         del ggml_name
         return False
 
+    @staticmethod
+    def _pad_innermost(data: np.ndarray, multiple: int) -> tuple[np.ndarray, int, int]:
+        """Zero-pad the innermost (axis -1) dim to the next multiple of `multiple`.
+
+        Returns (padded_data, K_orig, K_padded). If already aligned, returns
+        the input array unchanged with K_padded == K_orig.
+        """
+        k_orig = data.shape[-1]
+        if k_orig % multiple == 0:
+            return data, k_orig, k_orig
+        k_padded = ((k_orig + multiple - 1) // multiple) * multiple
+        pad_width = [(0, 0)] * data.ndim
+        pad_width[-1] = (0, k_padded - k_orig)
+        return np.pad(data, pad_width, mode="constant"), k_orig, k_padded
+
     def _convert_dtype(self, t: torch.Tensor, ggml_name: str) -> tuple[np.ndarray, gguf.GGMLQuantizationType]:
         if t.dtype == torch.bfloat16:
             data = t.float().numpy()
@@ -236,6 +266,27 @@ class Siglip2Converter:
                 logger.warning("Q8_0 failed for %s: %s; falling back to F16", ggml_name, e)
                 return data.astype(np.float16), gguf.GGMLQuantizationType.F16
 
+        if self.output_type == "q4_k_m":
+            # Q4_K super-block is 256 elements. Pad innermost K to the next
+            # multiple of 256 with zeros (the runtime knows to align activations
+            # to the padded K via zero-extension).
+            data = data.astype(np.float32)
+            data, k_orig, k_padded = self._pad_innermost(data, 256)
+            if k_padded != k_orig:
+                logger.info("  K-pad: %s  K %d -> %d (+%d zeros)",
+                            ggml_name, k_orig, k_padded, k_padded - k_orig)
+            try:
+                quantized = gguf.quants.quantize(data, gguf.GGMLQuantizationType.Q4_K)
+                return quantized, gguf.GGMLQuantizationType.Q4_K
+            except Exception as e:
+                logger.warning("Q4_K failed for %s: %s; falling back to F16", ggml_name, e)
+                # If we padded above, slice back to original for the F16 fallback.
+                if k_padded != k_orig:
+                    sl = [slice(None)] * data.ndim
+                    sl[-1] = slice(0, k_orig)
+                    data = data[tuple(sl)]
+                return data.astype(np.float16), gguf.GGMLQuantizationType.F16
+
         raise ValueError(f"unknown output_type: {self.output_type}")
 
     # -- tensor iteration -----------------------------------------------------
@@ -257,9 +308,10 @@ class Siglip2Converter:
         w.add_type(gguf.GGUFType.MODEL)
 
         ftype = {
-            "f32": gguf.LlamaFileType.ALL_F32,
-            "f16": gguf.LlamaFileType.MOSTLY_F16,
-            "q8_0": gguf.LlamaFileType.MOSTLY_Q8_0,
+            "f32":    gguf.LlamaFileType.ALL_F32,
+            "f16":    gguf.LlamaFileType.MOSTLY_F16,
+            "q8_0":   gguf.LlamaFileType.MOSTLY_Q8_0,
+            "q4_k_m": gguf.LlamaFileType.MOSTLY_Q4_K_M,
         }[self.output_type]
         w.add_file_type(ftype)
         w.add_quantization_version(gguf.GGML_QUANT_VERSION)
@@ -444,8 +496,10 @@ def main():
     p = argparse.ArgumentParser(description="Convert HF SigLIP2 to GGUF")
     p.add_argument("--input", "-i", type=Path, required=True, help="HF model directory")
     p.add_argument("--output", "-o", type=Path, required=True, help="Output .gguf path")
-    p.add_argument("--type", "-t", choices=["f16", "f32", "q8_0"], default="f16",
-                   help="Output dtype for matmul weights (default: f16)")
+    p.add_argument("--type", "-t", choices=["f16", "f32", "q8_0", "q4_k_m"], default="f16",
+                   help="Output dtype for matmul weights (default: f16). q4_k_m zero-pads "
+                        "innermost K to a multiple of 256 (the Q4_K super-block size); the "
+                        "runtime is responsible for zero-extending matching activations.")
     p.add_argument("--vision-only", action="store_true", help="Skip text tower")
     p.add_argument("--text-only", action="store_true", help="Skip vision tower")
     args = p.parse_args()

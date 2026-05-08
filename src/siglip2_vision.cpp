@@ -86,6 +86,26 @@ ggml_tensor * build_layernorm(
     return cur;
 }
 
+} // anonymous namespace (re-opened after pad_x_to_w)
+
+// Q4_K K-padding helper (mirrors siglip2_text.cpp's). Inserts ggml_pad on
+// the activation when W's innermost dim was K-padded by tools/siglip2-quantize.
+// No-op for Q8_0/F16 weights.
+//
+// Outside the anonymous namespace + static so it's reachable from both the
+// build_block functions (TU-local) AND VisionEncoder::encode.
+static ggml_tensor * pad_x_to_w(
+    ggml_context * ctx, ggml_tensor * x, ggml_tensor * w) {
+    const int64_t k_w = w->ne[0];
+    const int64_t k_x = x->ne[0];
+    if (k_w == k_x) return x;
+    GGML_ASSERT(k_w > k_x && "K-padded W must have larger ne[0] than activation");
+    const int pad = (int) (k_w - k_x);
+    return ggml_pad(ctx, ggml_cont(ctx, x), pad, 0, 0, 0);
+}
+
+namespace {
+
 // SigLIP2's d_head=72 doesn't divide by 16, so the CUDA MMA / WMMA flash-attn
 // kernels can't accept it directly (their tile templates require D%16==0).
 // We work around that by zero-padding Q/K/V's d-axis to the next multiple of 16
@@ -154,7 +174,9 @@ ggml_tensor * build_block(
     // Fused QKV mul_mat (saves 2 mul_mats + 2 bias-adds per layer × 27 layers).
     const int    H  = d_head * n_head;
     const size_t es = sizeof(float);
-    ggml_tensor * qkv = ggml_add(ctx, ggml_mul_mat(ctx, layer.qkv_w, cur), layer.qkv_b);
+    ggml_tensor * qkv = ggml_add(ctx,
+        ggml_mul_mat(ctx, layer.qkv_w, pad_x_to_w(ctx, cur, layer.qkv_w)),
+        layer.qkv_b);
     ggml_tensor * Q = ggml_view_3d(ctx, qkv, d_head, n_head, n_pos,
         /*nb1=*/d_head * es, /*nb2=*/3 * H * es, /*offset=*/0 * H * es);
     ggml_tensor * K = ggml_view_3d(ctx, qkv, d_head, n_head, n_pos,
@@ -180,15 +202,21 @@ ggml_tensor * build_block(
         KQV = ggml_cont_2d(ctx, KQV, d_head * n_head, n_pos); // (hidden, n_pos)
     }
 
-    cur = ggml_add(ctx, ggml_mul_mat(ctx, layer.o_w, KQV), layer.o_b);
+    cur = ggml_add(ctx,
+        ggml_mul_mat(ctx, layer.o_w, pad_x_to_w(ctx, KQV, layer.o_w)),
+        layer.o_b);
     cur = ggml_add(ctx, cur, residual);
     residual = cur;
 
     // MLP
     cur = build_layernorm(ctx, cur, layer.ln2_w, layer.ln2_b, ln_eps);
-    cur = ggml_add(ctx, ggml_mul_mat(ctx, layer.up_w, cur), layer.up_b);
+    cur = ggml_add(ctx,
+        ggml_mul_mat(ctx, layer.up_w, pad_x_to_w(ctx, cur, layer.up_w)),
+        layer.up_b);
     cur = ggml_gelu(ctx, cur); // matches gelu_pytorch_tanh
-    cur = ggml_add(ctx, ggml_mul_mat(ctx, layer.down_w, cur), layer.down_b);
+    cur = ggml_add(ctx,
+        ggml_mul_mat(ctx, layer.down_w, pad_x_to_w(ctx, cur, layer.down_w)),
+        layer.down_b);
 
     cur = ggml_add(ctx, cur, residual);
     return cur;
@@ -213,10 +241,16 @@ ggml_tensor * build_probe_head(
     ggml_tensor * probe_in = ggml_reshape_2d(ctx, head.probe, H, 1);
 
     // Q = probe_in @ q_w.T + q_b  -> (H, 1)
-    ggml_tensor * Q = ggml_add(ctx, ggml_mul_mat(ctx, head.q_w, probe_in), head.q_b);
+    ggml_tensor * Q = ggml_add(ctx,
+        ggml_mul_mat(ctx, head.q_w, pad_x_to_w(ctx, probe_in, head.q_w)),
+        head.q_b);
     // K, V from last_hidden -> (H, n_pos)
-    ggml_tensor * K = ggml_add(ctx, ggml_mul_mat(ctx, head.k_w, last_hidden), head.k_b);
-    ggml_tensor * V = ggml_add(ctx, ggml_mul_mat(ctx, head.v_w, last_hidden), head.v_b);
+    ggml_tensor * K = ggml_add(ctx,
+        ggml_mul_mat(ctx, head.k_w, pad_x_to_w(ctx, last_hidden, head.k_w)),
+        head.k_b);
+    ggml_tensor * V = ggml_add(ctx,
+        ggml_mul_mat(ctx, head.v_w, pad_x_to_w(ctx, last_hidden, head.v_w)),
+        head.v_b);
 
     Q = ggml_reshape_3d(ctx, Q, d_head, n_head, 1);       // (d_head, n_head, 1)
     K = ggml_reshape_3d(ctx, K, d_head, n_head, n_pos);   // (d_head, n_head, n_pos)
@@ -239,14 +273,20 @@ ggml_tensor * build_probe_head(
         KQV = ggml_cont_2d(ctx, KQV, d_head * n_head, 1);                 // (H, 1)
     }
 
-    ggml_tensor * attn = ggml_add(ctx, ggml_mul_mat(ctx, head.o_w, KQV), head.o_b);  // (H, 1)
+    ggml_tensor * attn = ggml_add(ctx,
+        ggml_mul_mat(ctx, head.o_w, pad_x_to_w(ctx, KQV, head.o_w)),
+        head.o_b);  // (H, 1)
 
     // Per HF: residual = attn (no layernorm before MHA); LayerNorm wraps the post-MHA value;
     //         output = residual + MLP(LN(attn))
     ggml_tensor * normed = build_layernorm(ctx, attn, head.ln_w, head.ln_b, ln_eps);
-    normed = ggml_add(ctx, ggml_mul_mat(ctx, head.up_w, normed), head.up_b);
+    normed = ggml_add(ctx,
+        ggml_mul_mat(ctx, head.up_w, pad_x_to_w(ctx, normed, head.up_w)),
+        head.up_b);
     normed = ggml_gelu(ctx, normed);
-    normed = ggml_add(ctx, ggml_mul_mat(ctx, head.down_w, normed), head.down_b);
+    normed = ggml_add(ctx,
+        ggml_mul_mat(ctx, head.down_w, pad_x_to_w(ctx, normed, head.down_w)),
+        head.down_b);
 
     ggml_tensor * out = ggml_add(ctx, attn, normed);   // (H, 1)
     return out;
@@ -556,7 +596,8 @@ bool VisionEncoder::encode(
         ggml_set_name(e.inp, "pixel_values");
         ggml_set_input(e.inp);
 
-        ggml_tensor * x = ggml_mul_mat(e.ctx, state_->patch_embd_w, e.inp);
+        ggml_tensor * x = ggml_mul_mat(e.ctx, state_->patch_embd_w,
+                                       pad_x_to_w(e.ctx, e.inp, state_->patch_embd_w));
         x = ggml_add(e.ctx, x, state_->patch_embd_b);
 
         ggml_tensor * pos_embd = state_->pos_embd;

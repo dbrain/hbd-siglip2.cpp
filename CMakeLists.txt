@@ -218,6 +218,12 @@ if(GGML_CUDA)
     )
 endif()
 
+# siglip2-quantize: re-quantize a F16 GGUF to Q4_K_M (with K-padding) etc.
+# Plain ggml dependency, no CUDA needed.
+add_executable(siglip2-quantize tools/siglip2-quantize/main.cpp)
+target_link_libraries(siglip2-quantize PRIVATE ggml)
+target_include_directories(siglip2-quantize PRIVATE ${GGML_DIR}/include)
+
 install(TARGETS siglip2_vision siglip2_text siglip2_preproc siglip2_tokenizer siglip2_score siglip2_megakernel siglip2-cli siglip2-text-cli
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
