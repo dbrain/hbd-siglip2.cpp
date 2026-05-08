@@ -29,8 +29,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace siglip2_megakernel {
 
@@ -500,46 +502,105 @@ struct QkvPrepEntry {
     int n_batch = 1;
 };
 
-// Persistent device scratch — sized for the hottest (3*H, n_pos) F32 shape.
-// Lazy-allocated on first qkv-prep anchor fire; freed at process exit. The
-// 9.6 MiB it costs (3 * 1152 * 729 * 4) is dwarfed by the launch savings
-// across 27 layers per encode. Single buffer reused across all blocks
-// because the CUDA stream is sequential per encode and siglip2_server's
-// encode_mutex serializes encodes.
-struct QkvScratch {
-    float * d_ptr  = nullptr;
-    size_t  cap_b  = 0;
-    bool ensure(size_t need_b) {
-        if (cap_b >= need_b && d_ptr) return true;
-        if (d_ptr) { cudaFree(d_ptr); d_ptr = nullptr; }
-        if (cudaMalloc(&d_ptr, need_b) != cudaSuccess) {
-            d_ptr = nullptr;
-            return false;
-        }
-        cap_b = need_b;
-        return true;
-    }
+// ─── Per-anchor op profiling state ──────────────────────────────────────────
+//
+// SIGLIP2_PROFILE_OPS=1 → record a cudaEvent at every megakernel anchor fire
+// (before the fused launch). With CUDA graphs on, those records get captured
+// into the graph and re-fire on every replay with fresh timestamps. After
+// graph_compute returns, profile_after_encode() syncs the last event, walks
+// the recorded ranges, and dumps an aggregate breakdown by anchor type.
+//
+// Event pool is monotonically-grown per-thread; each encode resets the index
+// to 0 and reuses the same event objects for the same logical position. The
+// captured graph references those exact event objects, so timing data stays
+// consistent across replays of the same shape.
+//
+// Tags:
+//   0 = LN, 1 = QKV-copy, 2 = QKV-split, 3 = post-FA cont,
+//   4 = tail-bias+residual, 5 = tail-bias+gelu, -1 = end-marker
+constexpr int kProfTagLN        = 0;
+constexpr int kProfTagQkvCopy   = 1;
+constexpr int kProfTagQkvSplit  = 2;
+constexpr int kProfTagPostFA    = 3;
+constexpr int kProfTagTailResid = 4;
+constexpr int kProfTagTailGelu  = 5;
+constexpr int kProfTagEnd       = 6;
+constexpr int kProfNumTags      = 7;
+
+struct ProfileState {
+    bool                          enabled = false;
+    bool                          checked = false;
+    std::vector<cudaEvent_t>      events;
+    std::vector<int>              tags;
+    size_t                        used    = 0;
 };
+
+thread_local ProfileState g_profile;
+
+bool profile_enabled_check() {
+    if (!g_profile.checked) {
+        g_profile.checked = true;
+        const char * v = std::getenv("SIGLIP2_PROFILE_OPS");
+        g_profile.enabled = v && v[0] != '\0' && std::strcmp(v, "0") != 0;
+    }
+    return g_profile.enabled;
+}
+
+inline void profile_record_inline(int tag, cudaStream_t stream) {
+    if (!profile_enabled_check()) return;
+    if (g_profile.used >= g_profile.events.size()) {
+        cudaEvent_t e = nullptr;
+        if (cudaEventCreate(&e) != cudaSuccess) return;
+        g_profile.events.push_back(e);
+        g_profile.tags.push_back(tag);
+    } else {
+        g_profile.tags[g_profile.used] = tag;
+    }
+    cudaEventRecord(g_profile.events[g_profile.used], stream);
+    ++g_profile.used;
+}
+
+// QKV-prep scratch — provided by the encoder, registered per host thread via
+// siglip2_megakernel::set_active_qkv_scratch before each graph_compute. Each
+// encoder owns one slab pre-allocated to its worst-case (3*H, n_pos_max,
+// n_batch_max) at load() time; the slab lives as long as the encoder's
+// captured CUDA graphs do. Per-thread storage handles the dual-tower
+// concurrency in /v1/classify (vision + text run on different OS threads
+// with their own private streams) without any global pool.
+//
+// Falling back is graceful: if the active slab is too small for the current
+// encode (n_batch larger than what the encoder pre-sized for, etc.) the
+// QKV-prep anchors return false and ggml's split path runs as if the
+// fusion were disabled.
+thread_local void *  g_active_qkv_scratch_dptr = nullptr;
+thread_local size_t  g_active_qkv_scratch_cap  = 0;
 
 namespace {
 
-std::unordered_map<const ggml_tensor *, LayerNormEntry> g_ln_anchors;
-std::unordered_set<const ggml_tensor *>                 g_ln_followers;
+// All anchor + follower maps are thread_local because /v1/classify runs
+// vision encode + text encode concurrently on private streams — each
+// encode owns one host thread, both call graph_begin_hook → build_*_plan
+// (which clears + rebuilds), then op_hook (which reads). Globals would
+// race on clear/insert from two threads at once and corrupt the bucket
+// structure (deterministic SIGSEGV on first /v1/classify after /unload,
+// non-deterministic glitches under load). Per-thread maps eliminate the
+// race because each compute is single-threaded end-to-end.
+thread_local std::unordered_map<const ggml_tensor *, LayerNormEntry> g_ln_anchors;
+thread_local std::unordered_set<const ggml_tensor *>                 g_ln_followers;
 
 // Two anchor maps: one for the copy-to-scratch kernel (anchored on
 // qkv_add), one for the split-from-scratch kernel (anchored on the last
 // of {q_pad, k_cast, v_cast}). Plan-builder populates both with the same
 // QkvPrepEntry so the dispatcher reads from one map per anchor lookup.
-std::unordered_map<const ggml_tensor *, QkvPrepEntry>   g_qkv_copy_anchors;
-std::unordered_map<const ggml_tensor *, QkvPrepEntry>   g_qkv_split_anchors;
-std::unordered_set<const ggml_tensor *>                 g_qkv_followers;
-QkvScratch                                              g_qkv_scratch;
+thread_local std::unordered_map<const ggml_tensor *, QkvPrepEntry>   g_qkv_copy_anchors;
+thread_local std::unordered_map<const ggml_tensor *, QkvPrepEntry>   g_qkv_split_anchors;
+thread_local std::unordered_set<const ggml_tensor *>                 g_qkv_followers;
 
-std::unordered_map<const ggml_tensor *, BiasResidualEntry> g_br_anchors;
-std::unordered_map<const ggml_tensor *, BiasGeluEntry>     g_bg_anchors;
-std::unordered_set<const ggml_tensor *>                    g_tail_followers;
+thread_local std::unordered_map<const ggml_tensor *, BiasResidualEntry> g_br_anchors;
+thread_local std::unordered_map<const ggml_tensor *, BiasGeluEntry>     g_bg_anchors;
+thread_local std::unordered_set<const ggml_tensor *>                    g_tail_followers;
 
-std::unordered_map<const ggml_tensor *, PostFaContEntry>   g_post_fa_anchors;
+thread_local std::unordered_map<const ggml_tensor *, PostFaContEntry>   g_post_fa_anchors;
 
 bool     g_enabled              = true;
 // QKV-prep — 2-kernel form: anchor 1 on qkv_add copies mm+bias into a
@@ -565,18 +626,21 @@ bool     g_tail_enabled         = true;
 // count (1) as the existing cont, but skips ggml-cuda's generic-cpy dispatch
 // path. Default ON; SIGLIP2_DISABLE_POST_FA_CONT=1 to fall back to ggml's cpy.
 bool     g_post_fa_enabled      = true;
-uint64_t g_ln_groups_built      = 0;
-uint64_t g_ln_anchor_fires      = 0;
-uint64_t g_ln_follower_fires    = 0;
-uint64_t g_qkv_groups_built     = 0;
-uint64_t g_qkv_anchor_fires     = 0;
-uint64_t g_qkv_follower_fires   = 0;
-uint64_t g_br_groups_built      = 0;
-uint64_t g_bg_groups_built      = 0;
-uint64_t g_tail_anchor_fires    = 0;
-uint64_t g_tail_follower_fires  = 0;
-uint64_t g_post_fa_groups_built = 0;
-uint64_t g_post_fa_anchor_fires = 0;
+// Per-thread counters paired with the per-thread anchor maps. Diagnostics
+// printed via SIGLIP2_MEGAKERNEL_VERBOSE only see the calling thread's
+// counts — fine, they're best-effort logging, not metrics.
+thread_local uint64_t g_ln_groups_built      = 0;
+thread_local uint64_t g_ln_anchor_fires      = 0;
+thread_local uint64_t g_ln_follower_fires    = 0;
+thread_local uint64_t g_qkv_groups_built     = 0;
+thread_local uint64_t g_qkv_anchor_fires     = 0;
+thread_local uint64_t g_qkv_follower_fires   = 0;
+thread_local uint64_t g_br_groups_built      = 0;
+thread_local uint64_t g_bg_groups_built      = 0;
+thread_local uint64_t g_tail_anchor_fires    = 0;
+thread_local uint64_t g_tail_follower_fires  = 0;
+thread_local uint64_t g_post_fa_groups_built = 0;
+thread_local uint64_t g_post_fa_anchor_fires = 0;
 int      g_log_budget           = 0;
 
 bool is_2d_f32_contiguous(const ggml_tensor * t) {
@@ -1123,9 +1187,11 @@ extern "C" bool siglip2_op_hook(
             const int triH = 3 * e.H;
             const size_t need_b = (size_t) triH * (size_t) e.n_pos
                                 * (size_t) e.n_batch * sizeof(float);
-            if (!g_qkv_scratch.ensure(need_b)) return false;
+            float * scratch = (float *) g_active_qkv_scratch_dptr;
+            if (!scratch || g_active_qkv_scratch_cap < need_b) return false;
 
-            launch_qkv_copy_to_scratch(mm, bias, g_qkv_scratch.d_ptr,
+            profile_record_inline(kProfTagQkvCopy, stream);
+            launch_qkv_copy_to_scratch(mm, bias, scratch,
                                        triH, e.n_pos, e.n_batch, stream);
             ++g_qkv_anchor_fires;
             return true;
@@ -1137,9 +1203,11 @@ extern "C" bool siglip2_op_hook(
             float * q_pad  = e.q_pad_dst   ? (float *) e.q_pad_dst->data   : nullptr;
             void  * k_cast = e.k_cast_dst  ? e.k_cast_dst->data            : nullptr;
             void  * v_cast = e.v_cast_dst  ? e.v_cast_dst->data            : nullptr;
-            if (!q_pad || !k_cast || !v_cast || !g_qkv_scratch.d_ptr) return false;
+            float * scratch = (float *) g_active_qkv_scratch_dptr;
+            if (!q_pad || !k_cast || !v_cast || !scratch) return false;
 
-            launch_fused_qkv_prep(g_qkv_scratch.d_ptr, q_pad, k_cast, v_cast,
+            profile_record_inline(kProfTagQkvSplit, stream);
+            launch_fused_qkv_prep(scratch, q_pad, k_cast, v_cast,
                                   e.H, e.n_pos, e.n_head, e.d_head, e.d_pad,
                                   e.n_batch, stream);
             ++g_qkv_anchor_fires;
@@ -1157,6 +1225,7 @@ extern "C" bool siglip2_op_hook(
             const float * fa_out = e.fa_out_node ? (const float *) e.fa_out_node->data : nullptr;
             float       * y      = (float *) dst->data;
             if (!fa_out || !y) return false;
+            profile_record_inline(kProfTagPostFA, stream);
             launch_fused_post_fa_cont(fa_out, y, e.d_head, e.d_pad, e.n_head, e.n_pos, e.n_batch, stream);
             ++g_post_fa_anchor_fires;
             return true;
@@ -1177,6 +1246,7 @@ extern "C" bool siglip2_op_hook(
             const float * res  = e.residual_node ? (const float *) e.residual_node->data : nullptr;
             float       * y    = (float *) dst->data;
             if (!mm || !bias || !res || !y) return false;
+            profile_record_inline(kProfTagTailResid, stream);
             launch_fused_bias_residual(mm, bias, res, y, e.H, e.n_pos, stream);
             ++g_tail_anchor_fires;
             return true;
@@ -1188,6 +1258,7 @@ extern "C" bool siglip2_op_hook(
             const float * bias = e.bias_node ? (const float *) e.bias_node->data : nullptr;
             float       * y    = (float *) dst->data;
             if (!mm || !bias || !y) return false;
+            profile_record_inline(kProfTagTailGelu, stream);
             launch_fused_bias_gelu(mm, bias, y, e.H, e.n_pos, stream);
             ++g_tail_anchor_fires;
             return true;
@@ -1204,6 +1275,7 @@ extern "C" bool siglip2_op_hook(
     const float * b = e.b_node ? (const float *) e.b_node->data : nullptr;
     float       * y = (float *) dst->data;
     if (!x || !w || !b || !y) return false;
+    profile_record_inline(kProfTagLN, stream);
 
     launch_fused_layernorm_affine(x, w, b, y, e.H, e.n_pos, e.eps, stream);
     ++g_ln_anchor_fires;
@@ -1219,6 +1291,91 @@ bool s_installed = false;
 }
 
 bool is_installed() { return s_installed; }
+
+void set_active_qkv_scratch(void * dptr, std::size_t cap_bytes) {
+    g_active_qkv_scratch_dptr = dptr;
+    g_active_qkv_scratch_cap  = cap_bytes;
+}
+
+void clear_active_qkv_scratch() {
+    g_active_qkv_scratch_dptr = nullptr;
+    g_active_qkv_scratch_cap  = 0;
+}
+
+bool profile_enabled() { return profile_enabled_check(); }
+
+void log_device_stream_priority_range() {
+    int least = 0, greatest = 0;
+    if (cudaDeviceGetStreamPriorityRange(&least, &greatest) != cudaSuccess) {
+        std::fprintf(stderr, "[siglip2-megakernel] stream priority range: query failed\n");
+        return;
+    }
+    // CUDA convention: LOWER int = HIGHER priority. `least` = least priority,
+    // `greatest` = greatest priority (most negative).
+    std::fprintf(stderr,
+        "[siglip2-megakernel] stream priority range: [%d, %d] (greatest..least; %s)\n",
+        greatest, least,
+        greatest == least
+            ? "single-priority device — HIGH/LOW hints are no-ops"
+            : "multi-priority — HIGH wins SM contention");
+}
+
+void profile_after_encode(const char * label, void * /*stream_v*/) {
+    if (!profile_enabled_check()) return;
+    // Even on a graph-replay (where op_hook didn't fire and so used==0 this
+    // call), the events we captured into the graph DID fire and got fresh
+    // timestamps. So we don't gate on used==0 — instead we use the SIZE of
+    // the events vector as the total count to walk. This way every replay
+    // gets a fresh dump.
+    const size_t n = g_profile.events.size();
+    if (n < 2) return;
+
+    cudaEventSynchronize(g_profile.events[n - 1]);
+
+    struct Bucket { double sum_ms = 0; int count = 0; };
+    Bucket buckets[kProfNumTags];
+    double total_ms = 0;
+    int    fail_count = 0;
+    cudaError_t last_err = cudaSuccess;
+    for (size_t i = 0; i + 1 < n; ++i) {
+        float dt = 0;
+        cudaError_t e = cudaEventElapsedTime(&dt, g_profile.events[i], g_profile.events[i+1]);
+        if (e != cudaSuccess) {
+            ++fail_count;
+            last_err = e;
+            continue;
+        }
+        const int t = g_profile.tags[i];
+        if (t >= 0 && t < kProfNumTags) {
+            buckets[t].sum_ms += dt;
+            buckets[t].count++;
+            total_ms += dt;
+        }
+    }
+
+    static const char * tag_name[kProfNumTags] = {
+        "LN          ", "QKV-copy    ", "QKV-split   ", "post-FA cont",
+        "tail-bias+rs", "tail-bias+gl", "<end>       ",
+    };
+    std::fprintf(stderr,
+        "[profile %s] anchored=%.3f ms across %zu segments (failed=%d, last_err=%s)\n",
+        label, total_ms, n - 1, fail_count,
+        fail_count > 0 ? cudaGetErrorString(last_err) : "ok");
+    for (int t = 0; t < kProfNumTags - 1; ++t) {
+        if (buckets[t].count == 0) continue;
+        std::fprintf(stderr,
+            "  %s  sum=%.3f ms  fires=%4d  avg=%.4f ms/fire  share=%.1f%%\n",
+            tag_name[t], buckets[t].sum_ms, buckets[t].count,
+            buckets[t].sum_ms / buckets[t].count,
+            total_ms > 0 ? 100.0 * buckets[t].sum_ms / total_ms : 0.0);
+    }
+
+    // Reset used so the NEXT encode (whether warmup or replay) starts at
+    // index 0. Events themselves stay alive: warmup-1/warmup-2 calls into
+    // op_hook will re-record them in place; replays bypass op_hook but the
+    // captured graph re-fires the same event objects, refreshing timestamps.
+    g_profile.used = 0;
+}
 
 bool install() {
     if (s_installed) return false;

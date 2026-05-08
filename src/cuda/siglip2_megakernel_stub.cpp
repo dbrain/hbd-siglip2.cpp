@@ -10,4 +10,11 @@ namespace siglip2_megakernel {
 bool install()       { return false; }
 bool is_installed()  { return false; }
 
+void set_active_qkv_scratch(void * /*dptr*/, std::size_t /*cap_bytes*/) {}
+void clear_active_qkv_scratch() {}
+
+bool profile_enabled() { return false; }
+void profile_after_encode(const char * /*label*/, void * /*stream*/) {}
+void log_device_stream_priority_range() {}
+
 }  // namespace siglip2_megakernel

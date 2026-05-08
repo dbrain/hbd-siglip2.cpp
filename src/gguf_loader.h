@@ -81,6 +81,19 @@ bool load_tensor_data_from_file(
 ggml_backend_t init_preferred_backend(const char * component_name, std::string * error_msg);
 void release_preferred_backend(ggml_backend_t backend);
 
+// Like init_preferred_backend but bypasses the process-wide singleton — every
+// call returns a fresh backend with its own CUDA stream(s). Intended for
+// concurrent encoders that want overlapping GPU execution (siglip2 server's
+// /v1/classify runs vision + text on private streams). Free with
+// release_preferred_backend (already handles the non-shared case).
+//
+// stream_priority hint matches ggml_cuda_stream_priority:
+//    0 = DEFAULT, 1 = LOW, -1 = HIGH. Non-CUDA backends ignore it. On
+// devices with a single priority level (consumer Ampere has [-5,0], so LOW
+// is a no-op there; HIGH wins) the hint is best-effort.
+ggml_backend_t init_separate_backend(const char * component_name, std::string * error_msg,
+                                     int stream_priority = 0);
+
 // Helper function to free model resources
 void free_ggml_resources(struct ggml_context * ctx, ggml_backend_buffer_t buffer);
 

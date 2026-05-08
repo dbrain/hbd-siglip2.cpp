@@ -1,6 +1,7 @@
 #include "siglip2_text.h"
 
 #include "gguf_loader.h"
+#include "cuda/siglip2_megakernel.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -94,6 +95,18 @@ static ggml_tensor * pad_x_to_w(
 
 namespace {
 
+// SIGLIP2_DISABLE_FA_PAD=1 routes d_head=72 directly to ggml's tile FA kernel
+// (which has a native `case 72`) instead of padding to d_pad=80 + slicing
+// after MMA. See siglip2_vision.cpp for the rationale; keep both encoders'
+// gates in sync.
+inline bool fa_pad_disabled_env() {
+    static const bool v = []{
+        const char * s = std::getenv("SIGLIP2_DISABLE_FA_PAD");
+        return s && s[0] != '\0' && std::strcmp(s, "0") != 0;
+    }();
+    return v;
+}
+
 // SigLIP2 encoder block. Same as the vision tower's, but takes an explicit
 // attention mask for padding-aware self-attention. Uses ggml_flash_attn_ext
 // when use_fa=true. fa_mask_f16 must be the F16 cast of attn_mask (or nullptr
@@ -133,11 +146,15 @@ ggml_tensor * build_block(
 
     ggml_tensor * KQV;
     if (use_fa) {
-        // d_head=72 needs zero-padding to 80 to be tensor-core MMA eligible.
-        // ggml's CUDA pad op only takes F32, so we pad before the F16 cast.
+        // d_head=72 not a multiple of 16 → MMA-FA tile templates don't accept
+        // it. Default path zero-pads to d_pad=80 to land on `case 80`. With
+        // SIGLIP2_DISABLE_FA_PAD=1 we skip the pad and let ggml's dispatcher
+        // route d=72 to the tile kernel which has a native `case 72`.
         constexpr int FA_TC_ALIGN = 16;
-        const int d_pad = (d_head + FA_TC_ALIGN - 1) & ~(FA_TC_ALIGN - 1);
-        const int pad   = d_pad - d_head;
+        const bool no_pad = fa_pad_disabled_env();
+        const int  d_pad = no_pad ? d_head
+                                  : (d_head + FA_TC_ALIGN - 1) & ~(FA_TC_ALIGN - 1);
+        const int  pad   = d_pad - d_head;
 
         Q = ggml_permute(ctx, Q, 0, 2, 1, 3);
         K = ggml_permute(ctx, K, 0, 2, 1, 3);
@@ -228,8 +245,10 @@ ggml_tensor * build_block_batched(
     ggml_tensor * KQV;
     if (use_fa) {
         constexpr int FA_TC_ALIGN = 16;
-        const int d_pad = (d_head + FA_TC_ALIGN - 1) & ~(FA_TC_ALIGN - 1);
-        const int pad   = d_pad - d_head;
+        const bool no_pad = fa_pad_disabled_env();
+        const int  d_pad = no_pad ? d_head
+                                  : (d_head + FA_TC_ALIGN - 1) & ~(FA_TC_ALIGN - 1);
+        const int  pad   = d_pad - d_head;
 
         Q = ggml_permute(ctx, Q, 0, 2, 1, 3);
         K = ggml_permute(ctx, K, 0, 2, 1, 3);
@@ -370,10 +389,18 @@ struct TextEncoder::State {
     static constexpr size_t kCacheCap = 8;
     std::vector<GraphCacheEntry> graph_cache;
 
+    // QKV-prep scratch — pre-sized at load() to (3 * H * max_pos * max_batch).
+    // See vision State::qkv_scratch_buf for the lifetime contract.
+    ggml_backend_buffer_t qkv_scratch_buf  = nullptr;
+    void *                qkv_scratch_dptr = nullptr;
+    size_t                qkv_scratch_cap  = 0;
+
     ~State() {
         // Cache entries own gallocrs that reference tensors in their own ctxs;
-        // they self-clean. Free in order: cache → weights_buf → weights_ctx → backend.
+        // they self-clean. Free in order: cache → scratch → weights_buf →
+        // weights_ctx → backend.
         graph_cache.clear();
+        if (qkv_scratch_buf) ggml_backend_buffer_free(qkv_scratch_buf);
         if (weights_buf) ggml_backend_buffer_free(weights_buf);
         if (weights_ctx) ggml_free(weights_ctx);
         if (backend) qwen3_tts::release_preferred_backend(backend);
@@ -393,7 +420,7 @@ void TextEncoder::close() {
     }
 }
 
-bool TextEncoder::load(const std::string & gguf_path) {
+bool TextEncoder::load(const std::string & gguf_path, bool private_backend) {
     close();
     state_ = new State{};
 
@@ -420,7 +447,9 @@ bool TextEncoder::load(const std::string & gguf_path) {
         return false;
     }
 
-    state_->backend = qwen3_tts::init_preferred_backend("siglip2-text", &error_msg_);
+    state_->backend = private_backend
+        ? qwen3_tts::init_separate_backend("siglip2-text", &error_msg_)
+        : qwen3_tts::init_preferred_backend("siglip2-text", &error_msg_);
     if (!state_->backend) {
         delete state_;
         state_ = nullptr;
@@ -504,6 +533,29 @@ bool TextEncoder::load(const std::string & gguf_path) {
         delete state_;
         state_ = nullptr;
         return false;
+    }
+
+    // Pre-allocate megakernel QKV scratch sized for (3 * H * max_pos *
+    // max_batch * f32). Text default n_pos = max_position_embeddings (64);
+    // n_batch = number of prompts in a single encode_batch — capped via
+    // SIGLIP2_TEXT_MAX_BATCH (default 32). Larger requests fall back to the
+    // ggml split path, no fusion. See vision State::qkv_scratch_buf for the
+    // captured-graph lifetime rationale.
+    if (siglip2_megakernel::is_installed()) {
+        long max_batch = 32;
+        if (const char * v = std::getenv("SIGLIP2_TEXT_MAX_BATCH")) {
+            const long parsed = std::strtol(v, nullptr, 10);
+            if (parsed > 0) max_batch = parsed;
+        }
+        const size_t cap_b = (size_t) 3 * (size_t) config_.hidden_size
+                           * (size_t) config_.max_position_embeddings
+                           * (size_t) max_batch * sizeof(float);
+        state_->qkv_scratch_buf = ggml_backend_buft_alloc_buffer(
+            ggml_backend_get_default_buffer_type(state_->backend), cap_b);
+        if (state_->qkv_scratch_buf) {
+            state_->qkv_scratch_dptr = ggml_backend_buffer_get_base(state_->qkv_scratch_buf);
+            state_->qkv_scratch_cap  = cap_b;
+        }
     }
 
     return true;
@@ -672,7 +724,9 @@ bool TextEncoder::encode(
         ggml_backend_tensor_set(ce.pool_idx, &idx, 0, sizeof(int32_t));
     }
 
+    siglip2_megakernel::set_active_qkv_scratch(state_->qkv_scratch_dptr, state_->qkv_scratch_cap);
     enum ggml_status st = ggml_backend_graph_compute(state_->backend, ce.gf);
+    siglip2_megakernel::clear_active_qkv_scratch();
     if (st != GGML_STATUS_SUCCESS) {
         error_msg_ = std::string("graph compute failed status=") + std::to_string((int)st);
         return false;
@@ -680,7 +734,7 @@ bool TextEncoder::encode(
 
     out_embedding.assign((size_t)proj, 0.0f);
     ggml_backend_tensor_get(ce.proj_out, out_embedding.data(), 0, sizeof(float) * (size_t)proj);
-
+    siglip2_megakernel::profile_after_encode("text", nullptr);
     return true;
 }
 
@@ -851,7 +905,9 @@ bool TextEncoder::encode_batch(
     }
     auto t_inputs = tnow();
 
+    siglip2_megakernel::set_active_qkv_scratch(state_->qkv_scratch_dptr, state_->qkv_scratch_cap);
     enum ggml_status st = ggml_backend_graph_compute(state_->backend, ce.gf);
+    siglip2_megakernel::clear_active_qkv_scratch();
     if (st != GGML_STATUS_SUCCESS) {
         error_msg_ = std::string("graph compute failed status=") + std::to_string((int)st);
         return false;
@@ -871,6 +927,7 @@ bool TextEncoder::encode_batch(
             tms(t0, t_build), tms(t_build, t_inputs),
             tms(t_inputs, t_compute), tms(t_compute, t_get), tms(t0, t_done));
     }
+    siglip2_megakernel::profile_after_encode("text-batch", nullptr);
     return true;
 }
 

@@ -27,7 +27,10 @@ public:
     TextEncoder();
     ~TextEncoder();
 
-    bool load(const std::string & gguf_path);
+    // private_backend=true gives this encoder its own ggml_backend_t (and thus
+    // its own CUDA stream), so concurrent calls into other encoders execute on
+    // separate streams. Default is the process-wide shared backend.
+    bool load(const std::string & gguf_path, bool private_backend = false);
     void close();
 
     const TextConfig & config() const { return config_; }

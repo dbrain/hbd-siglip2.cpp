@@ -1,6 +1,7 @@
 #include "siglip2_vision.h"
 
 #include "gguf_loader.h"
+#include "cuda/siglip2_megakernel.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -10,6 +11,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -119,6 +121,20 @@ constexpr int FA_TC_ALIGN = 16;
 
 inline int round_up_d(int d) { return (d + FA_TC_ALIGN - 1) & ~(FA_TC_ALIGN - 1); }
 
+// SIGLIP2_DISABLE_FA_PAD=1 routes d_head=72 directly to ggml's tile FA kernel
+// (which has a native `case 72`) instead of padding to d_pad=80 + slicing
+// after MMA. Skips 6 graph ops (3 cont+pad on Q/K/V, post-FA view+cont) and
+// the 10 % wasted MMA arithmetic on the d∈[72,80) zero pad. Default off
+// while we A/B; once tile@72 is confirmed at parity + faster on the cfe
+// shape this becomes the default.
+inline bool fa_pad_disabled_env() {
+    static const bool v = []{
+        const char * s = std::getenv("SIGLIP2_DISABLE_FA_PAD");
+        return s && s[0] != '\0' && std::strcmp(s, "0") != 0;
+    }();
+    return v;
+}
+
 // Pads d-axis (if d_head not multiple of 16) on the F32 side, then casts K/V
 // to F16 for FA. ggml's CUDA pad op only accepts F32 sources, so we do the
 // pad before the cast.
@@ -132,7 +148,8 @@ ggml_tensor * fa_attn_pad_slice(
     int            n_head,
     int            n_pos_q,
     float          kq_scale) {
-    const int d_pad = round_up_d(d_head);
+    const bool no_pad = fa_pad_disabled_env();
+    const int  d_pad  = no_pad ? d_head : round_up_d(d_head);
     if (d_pad != d_head) {
         const int pad = d_pad - d_head;
         // ggml_cuda's pad op requires F32 + contiguous source; ggml_cont covers both.
@@ -140,6 +157,10 @@ ggml_tensor * fa_attn_pad_slice(
         K = ggml_pad(ctx, ggml_cont(ctx, K), pad, 0, 0, 0);
         V = ggml_pad(ctx, ggml_cont(ctx, V), pad, 0, 0, 0);
     }
+    // (no_pad with d_pad == d_head: nothing to do; ggml_flash_attn_ext takes
+    // Q as a strided permute view, K/V get materialized via the F16 cast.
+    // Same shape contract as existing d_head%16==0 callers — only difference
+    // is the dispatcher routes to the tile kernel for d=72.)
     ggml_tensor * K_f16 = ggml_cast(ctx, K, GGML_TYPE_F16);
     ggml_tensor * V_f16 = ggml_cast(ctx, V, GGML_TYPE_F16);
     ggml_tensor * KQV = ggml_flash_attn_ext(ctx, Q, K_f16, V_f16, fa_mask_f16, kq_scale, 0.0f, 0.0f);
@@ -361,8 +382,20 @@ struct VisionEncoder::State {
     static constexpr size_t kCacheCap = 4;
     std::vector<VisionGraphCacheEntry> graph_cache;
 
+    // QKV-prep scratch — pre-sized at load() to the encoder's worst case.
+    // Owned by this encoder; freed on destruction. Captured CUDA graphs
+    // bake this pointer into recorded launches, so the buffer must outlive
+    // any cuda_graph that might still get replayed (i.e. the encoder's
+    // backend, which holds the cuda_graph cache).
+    ggml_backend_buffer_t qkv_scratch_buf  = nullptr;
+    void *                qkv_scratch_dptr = nullptr;
+    size_t                qkv_scratch_cap  = 0;
+
     ~State() {
         graph_cache.clear();
+        if (qkv_scratch_buf) {
+            ggml_backend_buffer_free(qkv_scratch_buf);
+        }
         if (weights_buf) {
             ggml_backend_buffer_free(weights_buf);
         }
@@ -388,7 +421,7 @@ void VisionEncoder::close() {
     }
 }
 
-bool VisionEncoder::load(const std::string & gguf_path) {
+bool VisionEncoder::load(const std::string & gguf_path, bool private_backend) {
     close();
     state_ = new State{};
 
@@ -415,7 +448,19 @@ bool VisionEncoder::load(const std::string & gguf_path) {
         return false;
     }
 
-    state_->backend = qwen3_tts::init_preferred_backend("siglip2-vision", &error_msg_);
+    // Default: vision runs at HIGH stream priority in dual-tower mode so it
+    // wins SM contention against text in /v1/classify (vision is the long
+    // pole at ~44 ms vs text's ~20 ms; under concurrent execution vision
+    // suffers the most without priority). On RTX 3060 the priority range is
+    // [-5,0] (HIGH wins, LOW is a no-op). Override with
+    // SIGLIP2_VISION_STREAM_PRIORITY = -1/0/1 (HIGH/DEFAULT/LOW).
+    int prio = -1;  // HIGH
+    if (const char * v = std::getenv("SIGLIP2_VISION_STREAM_PRIORITY")) {
+        prio = std::atoi(v);
+    }
+    state_->backend = private_backend
+        ? qwen3_tts::init_separate_backend("siglip2-vision", &error_msg_, prio)
+        : qwen3_tts::init_preferred_backend("siglip2-vision", &error_msg_);
     if (!state_->backend) {
         delete state_;
         state_ = nullptr;
@@ -524,6 +569,32 @@ bool VisionEncoder::load(const std::string & gguf_path) {
         return false;
     }
 
+    // Pre-allocate the megakernel's QKV-prep scratch on the encoder's backend.
+    // Sized for the worst case shape (3 * H * max_n_pos * 1 * sizeof(float))
+    // since vision is always n_batch=1. max_n_pos comes from
+    // SIGLIP2_VISION_MAX_PATCHES (env override) or 729 by default — anything
+    // smaller fits in this slab; anything larger falls back to ggml's split
+    // path (graceful, no fusion). Skipped on non-GPU backends or when the
+    // megakernel is disabled.
+    if (siglip2_megakernel::is_installed()) {
+        long max_patches = 729;
+        if (const char * v = std::getenv("SIGLIP2_VISION_MAX_PATCHES")) {
+            const long parsed = std::strtol(v, nullptr, 10);
+            if (parsed > 0) max_patches = parsed;
+        }
+        const size_t cap_b = (size_t) 3 * (size_t) config_.hidden_size
+                           * (size_t) max_patches * sizeof(float);
+        state_->qkv_scratch_buf = ggml_backend_buft_alloc_buffer(
+            ggml_backend_get_default_buffer_type(state_->backend), cap_b);
+        if (state_->qkv_scratch_buf) {
+            state_->qkv_scratch_dptr = ggml_backend_buffer_get_base(state_->qkv_scratch_buf);
+            state_->qkv_scratch_cap  = cap_b;
+        }
+        // Allocation failure is non-fatal — leaving cap=0 disables the
+        // QKV-prep fusion for this encoder; the rest of the megakernel
+        // (LN, tail, post-FA cont) still runs.
+    }
+
     return true;
 }
 
@@ -533,6 +604,12 @@ bool VisionEncoder::encode(
     int                  n_patches_w,
     Pooling              pooling,
     std::vector<float> & out_embedding) {
+    static const bool timing = std::getenv("SIGLIP2_TIME_ENCODE") != nullptr;
+    auto tnow = []{ return std::chrono::steady_clock::now(); };
+    auto tms  = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    auto t0 = tnow();
     if (!state_) {
         error_msg_ = "VisionEncoder not loaded";
         return false;
@@ -649,17 +726,34 @@ bool VisionEncoder::encode(
         }
     }
 
-    ggml_backend_tensor_set(ce.inp, pixel_values, 0, sizeof(float) * (size_t)feat * n_pos);
+    auto t_build = tnow();
 
+    ggml_backend_tensor_set(ce.inp, pixel_values, 0, sizeof(float) * (size_t)feat * n_pos);
+    auto t_set = tnow();
+
+    siglip2_megakernel::set_active_qkv_scratch(state_->qkv_scratch_dptr, state_->qkv_scratch_cap);
     enum ggml_status st = ggml_backend_graph_compute(state_->backend, ce.gf);
+    siglip2_megakernel::clear_active_qkv_scratch();
     if (st != GGML_STATUS_SUCCESS) {
         error_msg_ = std::string("graph compute failed status=") + std::to_string((int)st);
         return false;
     }
+    auto t_compute = tnow();
 
     out_embedding.assign((size_t)H, 0.0f);
     ggml_backend_tensor_get(ce.pooled, out_embedding.data(), 0, sizeof(float) * (size_t)H);
+    auto t_get = tnow();
 
+    if (timing) {
+        std::fprintf(stderr,
+            "[vision encode n_pos=%d cache=%s pooling=%s] build=%.2f set=%.2f compute=%.2f get=%.2f total=%.2f ms\n",
+            n_pos, was_miss ? "miss" : "hit",
+            pooling == Pooling::PROBE ? "probe" : "mean",
+            tms(t0, t_build), tms(t_build, t_set),
+            tms(t_set, t_compute), tms(t_compute, t_get),
+            tms(t0, t_get));
+    }
+    siglip2_megakernel::profile_after_encode("vision", nullptr);
     return true;
 }
 

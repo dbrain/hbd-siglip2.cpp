@@ -1,4 +1,5 @@
 #include "gguf_loader.h"
+#include "ggml-cuda.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -70,6 +71,38 @@ ggml_backend_t init_preferred_backend(const char * component_name, std::string *
         shared.ref_count = 1;
     }
 
+    return backend;
+}
+
+ggml_backend_t init_separate_backend(const char * component_name, std::string * error_msg,
+                                     int stream_priority) {
+    if (error_msg) error_msg->clear();
+
+    const char * force_cpu = std::getenv("QWEN3_TTS_FORCE_CPU");
+    ggml_backend_t backend = nullptr;
+    // Non-zero priority requested → use ggml-cuda's priority API directly
+    // (the by_type init has no priority knob). Falls through to the by_type
+    // path on CPU-only or non-CUDA devices.
+    if (!(force_cpu && force_cpu[0] == '1') && stream_priority != 0) {
+        backend = ggml_backend_cuda_init_with_priority(0, stream_priority);
+    }
+    if (!backend && !(force_cpu && force_cpu[0] == '1')) {
+        backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
+        if (!backend) {
+            backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+        }
+        if (!backend) {
+            backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_ACCEL, nullptr);
+        }
+    }
+    if (!backend) {
+        backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    }
+
+    if (!backend && error_msg) {
+        const char * name = component_name ? component_name : "component";
+        *error_msg = "Failed to initialize separate backend (IGPU/GPU/ACCEL/CPU) for " + std::string(name);
+    }
     return backend;
 }
 

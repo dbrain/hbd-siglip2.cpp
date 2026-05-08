@@ -28,6 +28,10 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <condition_variable>
+#include <functional>
+#include <future>
+#include <thread>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -119,9 +123,86 @@ void l2_normalize(std::vector<float> & v) {
 
 // ---- ServerState ------------------------------------------------------------
 
+// Persistent single-thread worker. Used by /v1/classify to fan out the text
+// encode while vision runs on the request thread; using std::async per
+// request was paying ~12 ms of CUDA driver per-thread init on every call,
+// which ate most of the parallel-streams win. Holding the worker thread
+// open keeps that init cost off the hot path.
+struct PersistentWorker {
+    std::mutex                m;
+    std::condition_variable   cv_req;
+    std::condition_variable   cv_done;
+    std::function<void()>     task;
+    bool                      pending  = false;   // true between submit and f()-return
+    bool                      shutdown = false;
+    bool                      started  = false;
+    std::thread               th;
+
+    void start() {
+        if (started) return;
+        started = true;
+        th = std::thread([this] { run(); });
+    }
+    ~PersistentWorker() {
+        if (!started) return;
+        {
+            std::lock_guard<std::mutex> lk(m);
+            shutdown = true;
+        }
+        cv_req.notify_all();
+        if (th.joinable()) th.join();
+    }
+    void submit(std::function<void()> f) {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            task = std::move(f);
+            pending = true;
+        }
+        cv_req.notify_one();
+    }
+    // Returns only AFTER the submitted lambda has returned. Earlier version
+    // waited on `task == nullptr`, but the worker sets task to null BEFORE
+    // calling the lambda — so wait_done could return mid-encode, the handler
+    // would read uninitialized text_ok/text_err, and 500-with-empty-error
+    // popped up under concurrent /v1/classify.
+    void wait_done() {
+        std::unique_lock<std::mutex> lk(m);
+        cv_done.wait(lk, [this] { return !pending; });
+    }
+private:
+    void run() {
+        std::unique_lock<std::mutex> lk(m);
+        while (true) {
+            cv_req.wait(lk, [this] { return pending || shutdown; });
+            if (shutdown) return;
+            auto f = std::move(task);
+            task = nullptr;
+            lk.unlock();
+            f();
+            lk.lock();
+            pending = false;
+            cv_done.notify_one();
+        }
+    }
+};
+
 struct ServerState {
     ServerConfig                cfg;
-    std::mutex                  encode_mutex;
+    // Each encoder is single-threaded internally (gallocr buffers + tensor
+    // pointers aren't reentrant), but vision and text run on PRIVATE
+    // ggml_backend_t = private CUDA streams, so concurrent calls into the two
+    // separate mutexes overlap on the GPU. /v1/classify uses this to fan out
+    // text encode onto the persistent worker thread while vision runs on the
+    // request thread; load_model holds both locks for the lifecycle transition.
+    std::mutex                  vision_mutex;
+    std::mutex                  text_mutex;
+    // PersistentWorker has a single-task slot; concurrent classify handlers
+    // would clobber each other's submitted lambdas. Each handler holds this
+    // across the submit + wait_done block so worker access is serialized,
+    // while still letting vision (this thread) and text (worker thread) run
+    // concurrently within ONE classify call.
+    std::mutex                  text_worker_mutex;
+    PersistentWorker            text_worker;
     std::unique_ptr<siglip2::VisionEncoder> vision;
     std::unique_ptr<siglip2::TextEncoder>   text;
     std::unique_ptr<siglip2::Tokenizer>     tokenizer;
@@ -130,7 +211,7 @@ struct ServerState {
     std::atomic<long long>      last_request_ms{0};
 
     bool load_model(std::string & err) {
-        std::lock_guard<std::mutex> lock(encode_mutex);
+        std::scoped_lock lock(vision_mutex, text_mutex);
         if (loaded.load()) return true;
         if (cfg.model_path.empty()) {
             err = "model path required";
@@ -141,9 +222,13 @@ struct ServerState {
             err = "tokenizer path required (or pass --vision-only)";
             return false;
         }
+        // Both towers loaded → give each its own backend so /v1/classify
+        // overlaps them on separate CUDA streams. Single-tower deployments
+        // ride the shared singleton (no peer to overlap with).
+        const bool dual_tower = !cfg.vision_only && !cfg.text_only;
         if (!cfg.text_only) {
             vision = std::make_unique<siglip2::VisionEncoder>();
-            if (!vision->load(cfg.model_path)) {
+            if (!vision->load(cfg.model_path, /*private_backend=*/dual_tower)) {
                 err = "vision load: " + vision->last_error();
                 return false;
             }
@@ -151,7 +236,7 @@ struct ServerState {
         if (need_text) {
             text      = std::make_unique<siglip2::TextEncoder>();
             tokenizer = std::make_unique<siglip2::Tokenizer>();
-            if (!text->load(cfg.model_path)) {
+            if (!text->load(cfg.model_path, /*private_backend=*/dual_tower)) {
                 err = "text load: " + text->last_error();
                 return false;
             }
@@ -162,25 +247,54 @@ struct ServerState {
         }
         // Score params (logit_scale/bias) are only needed when both towers are
         // present (classify endpoints); they're always cheap to read either way.
-        if (!cfg.vision_only && !cfg.text_only) {
+        if (dual_tower) {
             if (!siglip2::read_score_params(cfg.model_path, score_params, err)) {
                 return false;
             }
         }
         loaded.store(true);
+        if (dual_tower) text_worker.start();
         const char * mode = cfg.vision_only ? " (vision-only)" :
                             cfg.text_only   ? " (text-only)"   : "";
-        fprintf(stderr, "[siglip2-server] model loaded: %s%s\n", cfg.model_path.c_str(), mode);
+        fprintf(stderr, "[siglip2-server] model loaded: %s%s%s\n",
+                cfg.model_path.c_str(), mode,
+                dual_tower ? " [private-streams]" : "");
+        siglip2_megakernel::log_device_stream_priority_range();
+        if (dual_tower) {
+            int prio_v = -1;
+            if (const char * v = std::getenv("SIGLIP2_VISION_STREAM_PRIORITY")) prio_v = std::atoi(v);
+            fprintf(stderr,
+                "[siglip2-server] requested stream priorities: vision=%d (%s) text=0 (DEFAULT)\n",
+                prio_v,
+                prio_v < 0 ? "HIGH" : prio_v > 0 ? "LOW" : "DEFAULT");
+        }
+        if (siglip2_megakernel::profile_enabled()) {
+            fprintf(stderr, "[siglip2-server] SIGLIP2_PROFILE_OPS=1 — per-anchor breakdown will be logged after each encode\n");
+        }
         return true;
     }
 
     void unload() {
-        std::lock_guard<std::mutex> lock(encode_mutex);
+        const bool timing = std::getenv("SIGLIP2_TIME_HANDLER") != nullptr;
+        auto tnow = []{ return std::chrono::steady_clock::now(); };
+        auto tms  = [](auto a, auto b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        auto t0 = tnow();
+        std::scoped_lock lock(vision_mutex, text_mutex);
+        auto t_lock = tnow();
         if (!loaded.load()) return;
         vision.reset();
+        auto t_v = tnow();
         text.reset();
+        auto t_t = tnow();
         tokenizer.reset();
+        auto t_tk = tnow();
         loaded.store(false);
+        if (timing) {
+            fprintf(stderr, "[siglip2-server] unload timings (ms): lock=%.1f vision=%.1f text=%.1f tokenizer=%.1f total=%.1f\n",
+                    tms(t0,t_lock), tms(t_lock,t_v), tms(t_v,t_t), tms(t_t,t_tk), tms(t0,t_tk));
+        }
         fprintf(stderr, "[siglip2-server] model unloaded\n");
     }
 
@@ -216,9 +330,17 @@ bool encode_image(
     siglip2::Pooling    pooling,
     std::vector<float> & out_emb,
     std::string &       err) {
+    static const bool timing = std::getenv("SIGLIP2_TIME_HANDLER") != nullptr;
+    auto tnow = []{ return std::chrono::steady_clock::now(); };
+    auto tms  = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    auto t0 = tnow();
+
     std::vector<uint8_t> rgb;
     int h = 0, w = 0;
     if (!decode_image(bytes, rgb, h, w, err)) return false;
+    auto t_decode = tnow();
 
     siglip2::PreprocResult pp;
     float mean[3] = {0.5f, 0.5f, 0.5f};
@@ -228,9 +350,20 @@ bool encode_image(
                                        1.0f / 255.0f, mean, std_v, pp, err)) {
         return false;
     }
+    auto t_preproc = tnow();
+
     if (!st.vision->encode(pp.pixel_values.data(), pp.n_patches_h, pp.n_patches_w, pooling, out_emb)) {
         err = "vision encode: " + st.vision->last_error();
         return false;
+    }
+    auto t_encode = tnow();
+
+    if (timing) {
+        std::fprintf(stderr,
+            "[encode_image %dx%d→%dx%d] decode=%.2f preproc=%.2f encode=%.2f total=%.2f ms\n",
+            w, h, pp.n_patches_w, pp.n_patches_h,
+            tms(t0, t_decode), tms(t_decode, t_preproc),
+            tms(t_preproc, t_encode), tms(t0, t_encode));
     }
     return true;
 }
@@ -423,7 +556,7 @@ int main(int argc, char ** argv) {
         std::vector<std::vector<float>> embs;
         embs.reserve(images.size());
         {
-            std::lock_guard<std::mutex> lock(st.encode_mutex);
+            std::lock_guard<std::mutex> lock(st.vision_mutex);
             for (const auto & img : images) {
                 std::vector<float> emb;
                 if (!encode_image(st, img.content, max_num_patches, pooling, emb, err)) {
@@ -448,7 +581,7 @@ int main(int argc, char ** argv) {
         std::vector<std::vector<float>> embs;
         std::string err;
         {
-            std::lock_guard<std::mutex> lock(st.encode_mutex);
+            std::lock_guard<std::mutex> lock(st.text_mutex);
             if (!encode_text_batch(st, prompts, embs, err)) {
                 send_json(res, 500, json{{"error", err}});
                 return;
@@ -460,6 +593,12 @@ int main(int argc, char ** argv) {
 
     // -- /v1/classify
     srv.Post("/v1/classify", [&](const httplib::Request & req, httplib::Response & res) {
+        const bool timing = std::getenv("SIGLIP2_TIME_HANDLER") != nullptr;
+        auto tnow = []{ return std::chrono::steady_clock::now(); };
+        auto tms  = [](auto a, auto b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        auto t0 = tnow();
         if (!ensure(res)) return;
         if (!require_score(res)) return;
         auto images = req.get_file_values("images");
@@ -479,24 +618,53 @@ int main(int argc, char ** argv) {
         const int n_txt = (int)prompts.size();
         std::vector<float> img_buf((size_t)n_img * H);
         std::vector<float> txt_buf((size_t)n_txt * H);
+        auto t_parse = tnow();
+
+        // Run vision and text encodes on parallel CUDA streams. With private
+        // ggml_backend_t per encoder (set up in load_model) the two graph
+        // computes overlap on the GPU; the text encode is dispatched to the
+        // persistent worker thread (avoiding per-call CUDA driver init that
+        // std::async would pay), while vision runs on the request thread.
+        // Each branch owns its own encoder mutex, so concurrent requests
+        // still serialize per-encoder.
+        // Hold text_worker_mutex across submit + wait_done so concurrent
+        // classify handlers don't clobber each other's submitted lambdas
+        // (the worker has a single-task slot). Worker still runs the lambda
+        // on its own thread → text overlaps vision on private CUDA streams.
+        std::lock_guard<std::mutex> worker_lock(st.text_worker_mutex);
+
+        std::string text_err;
+        std::vector<std::vector<float>> txt_embs;
+        bool text_ok = false;
+        std::chrono::steady_clock::time_point t_text_start, t_text_done;
+        st.text_worker.submit([&]() {
+            t_text_start = tnow();
+            std::lock_guard<std::mutex> lock(st.text_mutex);
+            text_ok = encode_text_batch(st, prompts, txt_embs, text_err);
+            t_text_done = tnow();
+        });
+        auto t_submit = tnow();
 
         std::string err;
+        bool vision_ok = true;
         {
-            std::lock_guard<std::mutex> lock(st.encode_mutex);
+            std::lock_guard<std::mutex> lock(st.vision_mutex);
             for (int i = 0; i < n_img; ++i) {
                 std::vector<float> emb;
                 if (!encode_image(st, images[i].content, max_num_patches, siglip2::Pooling::PROBE, emb, err)) {
-                    send_json(res, 500, json{{"error", err}}); return;
+                    vision_ok = false;
+                    break;
                 }
                 std::memcpy(img_buf.data() + (size_t)i * H, emb.data(), sizeof(float) * H);
             }
-            std::vector<std::vector<float>> txt_embs;
-            if (!encode_text_batch(st, prompts, txt_embs, err)) {
-                send_json(res, 500, json{{"error", err}}); return;
-            }
-            for (int j = 0; j < n_txt; ++j) {
-                std::memcpy(txt_buf.data() + (size_t)j * H, txt_embs[j].data(), sizeof(float) * H);
-            }
+        }
+        auto t_vision_done = tnow();
+        st.text_worker.wait_done();
+        auto t_join = tnow();
+        if (!vision_ok) { send_json(res, 500, json{{"error", err}}); return; }
+        if (!text_ok)   { send_json(res, 500, json{{"error", text_err}}); return; }
+        for (int j = 0; j < n_txt; ++j) {
+            std::memcpy(txt_buf.data() + (size_t)j * H, txt_embs[j].data(), sizeof(float) * H);
         }
         std::vector<float> logits((size_t)n_img * n_txt);
         std::vector<float> probs((size_t)n_img * n_txt);
@@ -514,7 +682,19 @@ int main(int argc, char ** argv) {
             }
         json body = {{"scores", scores_out}};
         if (return_logits) body["logits"] = logits_out;
+        auto t_score = tnow();
         send_json(res, 200, body);
+        auto t_send = tnow();
+        if (timing) {
+            fprintf(stderr,
+                "[/v1/classify] parse=%.2f submit=%.2f vision=%.2f join_after_vision=%.2f "
+                "text(%.2f→%.2f=%.2f) score+pack=%.2f json=%.2f total=%.2f\n",
+                tms(t0,t_parse), tms(t_parse,t_submit), tms(t_submit,t_vision_done),
+                tms(t_vision_done,t_join),
+                tms(t_submit,t_text_start), tms(t_text_start,t_text_done),
+                tms(t_text_start,t_text_done),
+                tms(t_join,t_score), tms(t_score,t_send), tms(t0,t_send));
+        }
     });
 
     // -- /v1/classify_from_embeddings (JSON body)
@@ -567,7 +747,7 @@ int main(int argc, char ** argv) {
         std::vector<float> txt_buf((size_t)n_txt * H);
         std::string err;
         {
-            std::lock_guard<std::mutex> lock(st.encode_mutex);
+            std::lock_guard<std::mutex> lock(st.text_mutex);
             std::vector<std::string> prompts(n_txt);
             for (int j = 0; j < n_txt; ++j) prompts[j] = prompts_json[j].get<std::string>();
             std::vector<std::vector<float>> txt_embs;
