@@ -1,28 +1,84 @@
 # siglip2.cpp — Handoff
 
-You're picking up `siglip2.cpp` after the 2026-05-07 VRAM pass + 2026-05-08 perf pass + 2026-05-09 QKV-fusion pass + 2026-05-09 megakernel-v0 Phase A0 (fused LayerNorm) + 2026-05-09 megakernel-v0 Phase A1 (QKV-prep, 2-kernel scratch) + 2026-05-09 Phase A2 (pointwise tail fusion) + 2026-05-09 Phase A3 (post-FA cont specialization). Feature parity has been complete since M5; the prior passes drove VRAM from 1855 MiB to 1438 MiB and added padded MMA-FA for d_head=72; QKV fusion closed 14 % off the text path; Phase A0 introduced the `src/cuda/` scaffolding with fused LN; Phase A1 layered on the QKV-prep chain fusion (9 ops/block → 2 kernels) for another 9-11 %; Phase A2 collapsed the pointwise tails (bias+residual / bias+gelu) for 5-8 %; Phase A3 specialised the post-FA cont for another **1.1-1.5 %** flat. Total **17-21 %** off every endpoint vs pre-megakernel. Read `AGENTS.md` for the architectural overview; this doc is **what to do next + why + the user's disposition**.
+You're picking up `siglip2.cpp` after the megakernel arc (Phase A0-A4 +
+Phase B graph cache, all shipped on `dbrain/siglip2-v0`) and a Phase C
+exploration pass (custom Q8_0 mma kernel + Q4_K_M/Q5_K_M with K-padding,
+both committed on `dbrain/phase-c-cpasync-wip`, neither shipped). Feature
+parity has been complete since M5. **All four endpoints beat python on
+Q8_0 today; cfe at 0.98×, the others at 0.76-0.91×.** VRAM **1558 MiB**
+resident vs python's ~2400 MiB peak.
 
-## Cold-pickup orientation — if you've got a long run ahead
+Read `AGENTS.md` for the architectural overview. The current "what to do
+next" doc is **`HANDOFF-perf-next.md`** (post-megakernel perf targets:
+parallel streams in /v1/classify, cuBLASLt int8 GEMM, FA d_head=72 native
+fast path). Older arc detail lives in `HANDOFF-megakernel-v0.md` and
+`HANDOFF-megakernel-v0-phaseC-{microbench,next}.md`.
 
-The user is asleep. They want to come back to "shocking news," not to a polite request for permission. **Phase A0 + A1 + A2 + A3 of the megakernel plan have landed this pass** — fused LayerNorm, 2-kernel scratch QKV-prep, pointwise tail fusion, and post-FA cont specialization — for **17-21 % per endpoint** off the pre-megakernel baseline. Where to go next, in order of where I'd put my chips:
+## Cold-pickup orientation — read this first
 
-1. **A python re-bench.** The pre-megakernel "cpp 1.43× python" / "cpp 1.79× python" ratios are stale. With A0+A1+A2+A3 we're at 31.75 ms text / 32.05 ms classify_from_embeddings / 45.75 ms embeddings / 75.05 ms classify on a clean GPU. The 2026-05-09 (older) python p50 was 67.6 / 37.2 / 86.5 / 31.2 — current ratios are **0.68× / 0.85× / 0.87× / 1.03×**. Three of four endpoints now well below python; only `/v1/classify_from_embeddings` is still ~3 % above (down from 1.79× pre-megakernel). Re-run `/tmp/bench_cpp.py http://localhost:8890` (kobbler-vision-1) clean-GPU to get fresh python numbers; this baseline's getting stale.
+**State on `dbrain/siglip2-v0` (production):**
 
-2. **Phase B — fuse `mul_mat + bias_add` (and reach further into bias+residual / bias+gelu) for the 4 mul_mat-bias pairs per block (qkv, o, up, down)**. Requires writing custom Q8_0×F32 mul_mat kernels (M=64 for text, M=729 for vision) that fold the bias into the accumulator. Big lift — qwen3-tts only ships M=1 specialized MMVQ; siglip2 needs MMQ-class. With Phase A2 already eating the tail residual/gelu adds, the remaining win from MMQ-with-bias is the bias-add launch itself (~27 per chain × 4 chains/block × 27 = wait that math is wrong; A2 already fuses the bias add into the outer epilogue, so the only remaining win is folding the matmul into the same launch — which means a custom MMQ that writes `outer = mm + bias + residual`/`outer = gelu(mm + bias)` in one launch, eliminating the separate mm launch). ~108 launches/encode saved (4 mm/block × 27), ~1.0-1.5 ms. The natural cap on Phase A — beyond this you need CUDA graphs.
+| endpoint                              | cpp Q8_0 | python | ratio  |
+|---------------------------------------|---------:|-------:|-------:|
+| `/v1/embeddings`                      |  43.3 ms | 54.3 ms| **0.81×** |
+| `/v1/text_embeddings` (n=5)           |  20.1 ms | 26.9 ms| **0.76×** |
+| `/v1/classify`                        |  62.6 ms | 70.4 ms| **0.91×** |
+| `/v1/classify_from_embeddings` (cfe)  |  19.9 ms | 21.6 ms| **0.98×** |
 
-3. **Phase A3+ — extend post-FA cont fusion to absorb the o_proj input.** Currently A3 just specialises the cont. The next step is to write a Q8_0×F32 MMQ for o_proj that takes the strided FA output as input directly (no cont, no contiguous materialisation). Eliminates 27-28 launches/encode (the cont launches A3 just specialised). ~0.3-0.5 ms. Subset of Phase B but only for o_proj.
+VRAM resident: 1558 MiB (-842 MiB vs the original ~2400 MiB python peak).
 
-4. **Graph caching for fixed-shape encoders.** Pre-megakernel "Dead ends" still applies — both shared-sched and per-entry-sched hit gallocr offset reuse on call 2. The CUDA-graphs-on-megakernel idea is much more attractive now that the inner kernel surface is smaller and shape-fixed. ggml's gallocr is the bottleneck; either fork it for a re-bind entry point or skip the scheduler entirely (raw `ggml_backend_graph_compute` with one pinned compute buffer). Estimated 10-20 % more on text once it lands. With A0+A1+A2+A3 the launch budget is already ~half what it was, so this is the biggest remaining swing on text-bound endpoints.
+**The user's punch list** (per 2026-05-09 directive — see
+`HANDOFF-perf-next.md` for full receipts and concrete starting points):
 
-If you want a smaller warm-up before A2, the **banana-stand** ffn_down padding (lever J) is fully implemented — three files, ~30 LOC, measured −126 MiB VRAM at the cost of 74 µcos on one image-parity shape. **Per the user 2026-05-09: keep this parked unless you hit a 400 MiB-class win or actual OOM pressure.** 126 MiB doesn't move the needle on a 12 GB GPU and the cosine cost isn't worth it.
+1. **Async parallel streams in `/v1/classify`.** Vision encode + text
+   encode are independent until the score step but currently sequential.
+   Putting them on parallel CUDA streams brings classify from 62.6 →
+   ~49 ms (0.91× → ~0.65× python). 1-2 days, low risk.
 
-Stay above 0.999 cosine on the real-image path. Everything else is fair game.
+3. **cuBLASLt int8 GEMM swap on the hot mul_mats.** ggml's mma achieves
+   ~50% of RTX 3060 INT8 peak; cuBLASLt routinely hits 70-80%. A
+   Q8_0 → flat-int8 + per-K-tile-scale packing layer + op_hook on
+   MUL_MAT for our four per-block weights. cfe goes 19.9 → ~16.6 ms
+   (0.98× → 0.77× python). 1-2 weeks.
+
+5. **FA d_head=72 native fast path.** Today we pad d to 80 for tensor
+   cores then slice back — 6 launches/block of overhead. Custom MMA-FA
+   kernel for d=72 native saves ~1 ms cfe. 1 week, parity risk.
+
+(Targets 2 and 4 from the bench-time enumeration — bigger batches and
+megakernel-A0/A2/A3 K-padding-bake — are on the cutting-room floor at
+the user's request.)
+
+**What NOT to do (paths already explored, parked on the wip branch):**
+
+- **Custom Q8_0 mma kernel matching ggml-mma** (`v5b` on
+  `dbrain/phase-c-cpasync-wip`). Cosine = 1.0 bit-clean, but 2.7× slower
+  than ggml-mma at the cfe shape. Profile (clock64 instrumentation in
+  the same branch) showed 80% of cycles in global→shmem load latency,
+  19% mma compute. Structural cause: redundant memory traffic — 135
+  small blocks loading their own slabs vs ggml's stream-K running 28
+  blocks loading 1/28th of unique data. Closing the gap needs stream-K
+  + cp.async; multi-week, ends at ggml-parity not past it. Not the right
+  swing for the Phase C target.
+
+- **Q4_K_M / Q5_K_M weights** (Plan A on the wip branch). Conversion
+  tool (`tools/siglip2-quantize`) + runtime ggml_pad insertion at every
+  K-padded mul_mat all landed and Q8_0 baseline parity is preserved.
+  But Q4_K_M is **+12% slower than Q8_0** at our shapes (ggml's K-quant
+  MMQ has per-super-block dequant cost that swamps the bandwidth
+  halving) AND fails the 0.999 parity floor (vision 0.993, image 0.980,
+  text fail; score parity holds at 0.99939). User decision: stay Q8_0
+  in production, keep the plumbing on the branch for emergency opt-in.
+  Reviving needs imatrix calibration (multi-day plumbing).
+
+Stay above 0.999 cosine on all four parity scripts. Everything else is
+fair game.
 
 ## The user's standing instructions
 
 **Priorities, all critical, no longer ranked:**
-- **VRAM**: minimal, **measured against full-tower deploy mode** (both vision and text loaded — the user's actual `gather embeddings → classify` flow needs both). Currently 1504 MiB post-load / 1566 MiB post-warmup vs Python's 2322 MiB. Don't optimize for `--vision-only` at the expense of full-tower wins.
-- **Performance**: as close to maximum viable for the hardware as possible. Current state vs Python at p50: /v1/embeddings **1.07×**, /v1/text_embeddings **1.43×**, /v1/classify **1.34×**, /v1/classify_from_embeddings **1.79×**. The text-heavy endpoints are the gap — they're launch-overhead-bound (~80% of 38 ms is CUDA launches, ~20% is compute), so megakernel-style block fusion is the unlock. See `HANDOFF-megakernel-v0.md` for the detailed plan.
+- **VRAM**: minimal, **measured against full-tower deploy mode** (both vision and text loaded — the user's actual `gather embeddings → classify` flow needs both). Currently **1558 MiB resident** vs Python's ~2400 MiB peak (-842 MiB win already banked). Don't regress; don't optimize for `--vision-only` at the expense of full-tower wins.
+- **Performance**: as close to maximum viable for the hardware as possible. Current state vs Python p50 (Phase B head, all four endpoints clean GPU): /v1/embeddings **0.81×**, /v1/text_embeddings **0.76×**, /v1/classify **0.91×**, /v1/classify_from_embeddings **0.98×**. Three of four well past target; cfe (`classify_from_embeddings`) is the laggard at GPU-compute floor on Q8_0×F32 mul_mats at M=320. See `HANDOFF-perf-next.md` for the next-action targets (parallel streams, cuBLASLt, FA d_head=72).
 - **Correctness**: cosine ≥ 0.999 on real images is the parity floor. (Briefly revised to 0.997 on 2026-05-08 then put back; the user wants the 0.999 sentinel for now and will explicitly relax it if quant noise demands.) Score MAE in the low 10⁻² range is fine.
 
 **Constraints:**

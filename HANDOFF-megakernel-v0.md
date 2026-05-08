@@ -459,7 +459,79 @@ activation buffer is ~30-50 MiB; with two text shapes + 1 vision shape
 typically resident the activation budget is ~150 MiB total — well under
 the previous A4 sched arena.
 
-## Phase C — handoff for the kernel/quant lap
+## Phase C — attempted 2026-05-09, mma-MMQ handoff written for fresh context
+
+**Lever 1 (custom dp4a-MMQ) is dead** per the microbench in
+`HANDOFF-megakernel-v0-phaseC-microbench.md`. ggml's mma path is
+1.22-2.03× FASTER than its dp4a path at every Q8_0 shape we hit
+(opposite of `project_qwen3tts_int8_mma_kill`'s prediction — that
+memory is shape-specific to M=1 decode, doesn't apply at M ≥ 64
+wide-N batched). User's call: re-route to **custom mma-MMQ** as a
+fresh-context multi-week task. See `HANDOFF-megakernel-v0-phaseC-next.md`
+for the kernel-lap handoff (revised headroom estimate, shape table,
+plan-of-attack sketch, pitfalls, what's already been ruled out).
+
+Tooling left in tree from this lap:
+- `bench/microbench_mmq.cpp` + `microbench_mmq` cmake target — Q8_0/F16
+  × F32 mul_mat at all 12 shapes siglip2 hits. Use first on any
+  kernel rewrite.
+- `-DGGML_CUDA_NO_MMA=ON` ggml cmake option — gates TURING/AMPERE/
+  BLACKWELL_MMA_AVAILABLE + host helpers. Keep as future-debug knob.
+
+Quick-wins lap (Levers 3+4) declined as not worth the effort given
+the actual ROI: pre-pad weights is already absorbed by A1 megakernel
+(net 0 ms), probe-head fusion realistic gain 0.1-0.2 ms not the 0.5
+ms originally estimated. The realistic ceiling at the graph layer
+remains Phase B; below that needs the kernel lap.
+
+## Phase C — closed 2026-05-09 (the kernel lap + Plan A Q4_K_M, neither shipped)
+
+The kernel lap and the Plan A Q4_K_M side-quest both ran this session.
+Both committed to `dbrain/phase-c-cpasync-wip` for future opt-in; **neither
+shipped to `dbrain/siglip2-v0`**. Decision (per user 2026-05-09): "lets
+just stick with Q8 - keep the code supporting Q4_K - but this service
+was previously 2400 peak VRAM Q8 has already dropped it a lot."
+
+**Custom Q8_0×F32 mma kernel (cda641f → 9c86d81 → bf42b34):**
+- v5b: bit-clean (cosine = 1.0 across all 9 microbench Q8_0 shapes), but
+  2.7× slower than ggml's mma at the cfe shape on a clean GPU.
+- v6: cp.async + double-buffered shmem. Cosine drops to 0.99997 on
+  edge-tile shapes (M=729 / N=4304); fix sketched in commit message.
+- Profile (clock64 instrumentation, bf42b34): **80% of cycles in
+  global→shmem load latency, 19% mma compute.** Structural cause:
+  redundant memory traffic (135 small blocks each load their own slab vs
+  ggml's stream-K running 28 fixed blocks loading 1/28 of unique data —
+  ~7× more memory traffic in our design).
+- Path forward: stream-K + cp.async fix + custom MMQ for finite (M, N)
+  set. Multi-week, ends at ggml-mma parity not past it. Phase C target
+  ≤ 0.85× python on cfe is structurally hard to hit at the kernel layer
+  alone on this GPU.
+
+**Plan A: Q4_K_M / Q5_K_M conversion + runtime K-padding (4f1ccdd):**
+- Tooling: `tools/siglip2-quantize/main.cpp` (C++ since Python's gguf
+  raises NotImplementedError on K-quants). Converts F16 GGUF → Q4_K_M /
+  Q5_K_M / Q6_K / Q8_0 / Q4_0 with K-padding to the quant's block size.
+- ggml submodule bumped to `4eec5550` for the Q4_K get_rows kernel.
+- Runtime: `pad_x_to_w()` helper inserts ggml_pad on every mul_mat
+  activation when W's K is padded. Q8_0 baseline parity preserved
+  (regression-clean — re-verified mid-session).
+- Receipts: Q4_K_M is **+12% slower** than Q8_0 at our shapes (ggml's
+  K-quant MMQ has per-super-block dequant cost that swamps the
+  bandwidth halving — qwen3-tts memory note "Q5_K_M slower than
+  Q4_K_M on Ampere via MMQ" generalizes to siglip2's batched shapes
+  too, not just M=1 decode).
+- Quality: vision 0.993 / text fail / image 0.980 / score 0.99939.
+  Score parity holds (the actual classification metric); individual
+  embedding cosines drop below the 0.999 floor. Recoverable with
+  imatrix calibration (~1-2 day plumbing) but not attempted.
+- VRAM win is real: -670 MiB on Q4_K_M (888 MiB resident).
+
+The Phase C "≤ 0.85× python" cfe target is parked. The user's directive
+for the next session is post-megakernel perf work — see
+`HANDOFF-perf-next.md` for the punch list (parallel streams in
+/v1/classify, cuBLASLt int8 GEMM, FA d_head=72 native fast path).
+
+## Phase C — original scoping (kept for context)
 
 **Mood from the user 2026-05-08:** "we've hit our target, lets blow it
 away." Phase B beat python on every endpoint, but cfe is at 0.98× — tied,
