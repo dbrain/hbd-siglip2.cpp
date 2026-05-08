@@ -111,6 +111,126 @@ unchanged from A0-only:** vision 0.999944, text 0.999756, image-1920×1080→
 
 Kill switch: `SIGLIP2_DISABLE_QKV_PREP=1`. Default ON in the install hook.
 
+## ✅ Phase A2 landed (2026-05-09) — pointwise tail fusion (bias+residual, bias+gelu)
+
+**Per-block tail fusion: collapse `add(add(mm, 1D-bias), 2D-residual)` and
+`gelu(add(mm, 1D-bias))` into one kernel each.** Anchor on the OUTER op
+(residual_add or GELU); the inner bias-add is a follower. Two new pointwise
+kernels (`fused_bias_residual_kernel`, `fused_bias_gelu_kernel`) replace the
+3-op pattern with 1 launch (mm itself stays put — no MMQ). Per encoder
+block: 2 P1 (o-proj + down-proj) + 1 P2 (up-proj) → **3 launches/block × 27
+= 81 per encode** (text and vision).
+
+GELU formula matches `ggml_cuda_op_gelu_single` bit-for-bit (tanh-approx,
+GELU_COEF_A=0.044715, SQRT_2_OVER_PI=0.79788...). Inner-add uses `__fadd_rn`
+to suppress nvcc FMA fusion across the bias+residual chain — preserves the
+per-store F32 rounding identical to the split (bias_add → residual_add)
+path, so cosine drift is reduction-tree noise only.
+
+**Plan-builder gates (BOTH required):**
+
+1. **`is_blk_bias`** — bias name must contain `"blk"` (per-encoder-block
+   tensors only). Probe head (`v.head.*`) and patch_embedding (`v.patch_embd.*`)
+   matches are filtered. Hard-required: see "gallocr trap take 2" below.
+2. **Consecutive-in-topo** — `inner.idx + 1 == outer.idx`. Defense in depth;
+   per-block patterns always satisfy this, non-block patterns often don't.
+
+**Self-parity (A2 ON vs A2 OFF, same C++ binary):** all four parity scripts
+have **identical cosine + identical MSE bit-for-bit** between the two runs
+(text 0.999756 / 2.41e-4, vision 0.999944 / 1.94e-5, image-1920×1080→729
+0.999523 / 1.36e-4, score 0.999986). Per-block kernels are numerically
+indistinguishable from the split path — bit-clean.
+
+**HF parity unchanged from A1:** vision 0.999944, text 0.999756, image-1920×
+1080→729 0.999523, score 0.999986. No drift on the 0.999 floor.
+
+**Bench A/B (clean GPU, kobbler-vision-1 stopped, no dev containers):**
+
+  - `/v1/embeddings`:               53.2 → 49.9 ms (**−6.2 %**)
+  - `/v1/text_embeddings`:          39.8 → 36.5 ms (**−8.3 %**)
+  - `/v1/classify`:                 86.8 → 82.2 ms (**−5.3 %**)
+  - `/v1/classify_from_embeddings`: 38.0 → 36.7 ms (**−3.4 %**)
+
+Absolute ms drift between this session and the A1 receipts is GPU contention
+noise (this session's clean state had a different mix than A1's; the A/B is
+the receipts you should trust). Computed against post-restart python (sharing
+GPU with the cpp server during the python pass), three of four endpoints now
+beat python:
+
+  - `/v1/embeddings`:               49.9 cpp / 67.6 python = **0.74×**
+  - `/v1/text_embeddings`:          36.5 cpp / 37.2 python = **0.98×**
+  - `/v1/classify`:                 82.2 cpp / 86.5 python = **0.95×**
+  - `/v1/classify_from_embeddings`: 36.7 cpp / 31.2 python = **1.18×**
+
+Down from pre-A0's 1.07× / 1.43× / 1.34× / 1.79× — text-embeddings hit the
+target ≤1.0× ratio called out in the original A scoping.
+
+Kill switch: `SIGLIP2_DISABLE_TAIL_FUSION=1`. Default ON in the install hook.
+
+## Phase A2 — gallocr trap take 2 (read before extending)
+
+The first cut of A2 had no `is_blk_bias` gate — it matched every
+`add(add(mm, 1D-bias), 2D-residual)` and `gelu(add(mm, 1D-bias))` chain. Text
+came back **bit-clean** (cosine 0.999756 ON, identical to OFF). Vision came
+back at cosine **0.694** — broken.
+
+### Bisect
+
+- `SIGLIP2_DISABLE_TAIL_BG=1` (P1 only)  → vision 0.635 (still broken)
+- `SIGLIP2_DISABLE_TAIL_BR=1` (P2 only)  → vision 0.647 (still broken)
+- `SIGLIP2_TAIL_NAME_SKIP=v.head` (skip probe head only) → vision 0.999944
+  (PASS); skipping just `patch_embd` left it broken at 0.694
+- After landing the consecutive-in-topo gate alone (which skips patch_embd
+  + probe head's outer P1 since the chain has many ops between inner and
+  outer), vision STILL failed at 0.647 — because the probe head's `gelu(up_b
+  + up_mm)` IS a consecutive 2-op chain, so the safety gate alone passes it
+  through, and that single match is enough to break vision parity.
+- `SIGLIP2_TAIL_BLK_ONLY=1` (only `*.blk.*` biases) → vision 0.999944 PASS,
+  image 0.999523 PASS, text 0.999756 PASS, score 0.999986 PASS — all clean.
+
+### Why per-block is safe and probe-head/patch_embd are not
+
+Same root family as the A1 single-kernel trap: late-anchor design depends on
+gallocr letting `mm.dst`, `inner_add.dst`, and `outer.dst` share one physical
+slot (their lifetimes are disjoint, shapes match). When the slot aliases,
+follower-skipping inner_add leaves mm's value intact in the slot through to
+outer.idx — our late anchor reads the right value.
+
+Per-block chains satisfy this aggressively: 27 layers × identical (H, n_pos)
+shapes × every block has the same fan-out structure. gallocr packs them
+tightly with shared slots — works in practice for both text n_pos=64 and
+vision n_pos=729, even at 12.5 MiB up_intermediate slots.
+
+Probe-head and patch_embd chains do NOT satisfy this:
+
+- **Probe head** has Q/K/V mm-bias-add nodes whose outers are reshapes (not
+  ADD/GELU) — those don't match anyway. The matches that DO fire are
+  `gelu(up_b + up_mm)` (consecutive 2-op chain, gate allows) and `out =
+  ggml_add(attn, normed)` where `attn` is the inner of the o_b add but
+  separated from `out` by the entire LN+up_mm+gelu+down_mm+down_b sub-chain
+  (gate skips this one). The `gelu(up_b + ...)` match is the surviving
+  failure mode: gallocr packs probe head's mixed-shape slots differently
+  enough that mm.dst's slot doesn't alias with up_bias.dst → late anchor
+  reads garbage. Confirmed by single-pattern bisect.
+- **Patch embedding** has `add(mm, patch_embd_b)` followed by ~10 pos_embd
+  compute ops then `add(x, pos_embd)`. The pos_embd ops materialize tensors
+  that gallocr packs into mm.dst's freed slot. The consecutive-in-topo gate
+  catches this case correctly — non-consecutive, skipped.
+
+### What this rules in/out for future fusions
+
+- **Generic op_hook fusions can't safely follower-skip an upstream op** in a
+  one-off graph location — gallocr's slot packing is shape-and-graph-shape-
+  dependent and drifts between regions. The A1 scratch-buffer pattern is the
+  only path that's robust across all locations.
+- **Long, repetitive sub-graphs** (encoder blocks) DO permit follower-skip
+  because gallocr's packing is uniform across layers and we can verify
+  alias survival empirically with a single self-parity pass.
+- The `is_blk_bias` gate is brittle (couples to `convert_siglip2_to_gguf.py`
+  naming), but empirically necessary. Future agents extending A2 to other
+  patterns must either (a) prove the alias survives across all 4 parity
+  scripts via self-parity, or (b) use the A1 2-kernel scratch pattern.
+
 ## Phase A1 — design history & gallocr aliasing trap (read before extending)
 
 The first attempt at A1 was a single-kernel late-anchor design — anchored
@@ -170,7 +290,7 @@ Plan-builder needs two entries per block — one for each anchor. The followers 
 
 ## Where things stand
 
-- Branch: `dbrain/siglip2-v0` @ `0ff5f03` + ggml submodule fast-
+- Branch: `dbrain/siglip2-v0` @ A2 head + ggml submodule fast-
   forwarded to `a3fc6843` (the qwen3-tts megakernel hook commits:
   graph-compute-begin hook, cgraph passed to it, generic per-op hook).
   All three needed for the dispatcher pattern; no more ggml plumbing

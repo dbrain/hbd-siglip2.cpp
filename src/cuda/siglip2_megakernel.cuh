@@ -100,4 +100,36 @@ void launch_fused_qkv_prep(
     int            d_pad,
     cudaStream_t   stream);
 
+// Phase A2: pointwise tail fusion. Fires per encoder block:
+//   * P1 (bias + residual): y = (mm + bias_1d) + residual_2d. Anchored on the
+//     OUTER add (the residual add); the inner bias-add is a follower. Saves
+//     1 launch per anchor; per block this fires twice (o-proj and down-proj),
+//     so 2 launches/block × 27 = 54/encode.
+//   * P2 (bias + gelu): y = gelu(mm + bias_1d). Anchored on the GELU UNARY;
+//     the upstream bias-add is a follower. Fires once per block (up-proj),
+//     27/encode. GELU formula matches ggml's tanh approximation
+//     (ggml_cuda_op_gelu_single) bit-for-bit.
+//
+// Both kernels assume 2D F32 contiguous mm/residual/output of shape (H, n_pos)
+// with H innermost, plus a 1D F32 bias of length H broadcast over n_pos.
+// __fadd_rn is used for the inner add to suppress nvcc's FMA fusion across
+// the (mm+bias)→(+residual) chain, keeping per-store rounding identical to
+// the split-kernel path. Drift is therefore reduction-tree noise only.
+void launch_fused_bias_residual(
+    const float *  mm,          // (H, n_pos)  F32 contiguous
+    const float *  bias,        // (H,)        F32
+    const float *  residual,    // (H, n_pos)  F32 contiguous (same shape as mm)
+    float *        y,           // (H, n_pos)  F32 contiguous
+    int            H,
+    int            n_pos,
+    cudaStream_t   stream);
+
+void launch_fused_bias_gelu(
+    const float *  mm,          // (H, n_pos)  F32 contiguous
+    const float *  bias,        // (H,)        F32
+    float *        y,           // (H, n_pos)  F32 contiguous
+    int            H,
+    int            n_pos,
+    cudaStream_t   stream);
+
 }  // namespace siglip2_megakernel

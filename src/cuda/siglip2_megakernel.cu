@@ -250,6 +250,85 @@ void launch_fused_qkv_prep(
 }
 
 // ----------------------------------------------------------------------------
+// Phase A2: pointwise tail fusion (bias+residual, bias+gelu)
+// ----------------------------------------------------------------------------
+
+namespace {
+
+// Match ggml's gelu tanh-approximation (ggml_cuda_op_gelu_single) bit-for-bit.
+__device__ __forceinline__ float fused_gelu_single(float x) {
+    constexpr float GELU_COEF_A    = 0.044715f;
+    constexpr float SQRT_2_OVER_PI = 0.79788456080286535587989211986876f;
+    return 0.5f * x * (1.0f + tanhf(SQRT_2_OVER_PI * x * (1.0f + GELU_COEF_A * x * x)));
+}
+
+// y[idx] = (mm[idx] + bias[idx % H]) + residual[idx]
+// The two adds are written with __fadd_rn so nvcc cannot FMA-fuse them; this
+// preserves per-store F32 rounding parity with ggml's split (bias_add → add)
+// path. Bias-broadcast uses a divrem since H may not be a power of two
+// (H = d_head * n_head, e.g. 1152 for siglip2).
+__global__ void fused_bias_residual_kernel(
+        const float * __restrict__ mm,
+        const float * __restrict__ bias,
+        const float * __restrict__ residual,
+        float       * __restrict__ y,
+        const int                  H,
+        const int                  n_pos) {
+    const int idx   = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = H * n_pos;
+    if (idx >= total) return;
+    const int h = idx % H;
+    const float mb = __fadd_rn(mm[idx], bias[h]);
+    y[idx] = __fadd_rn(mb, residual[idx]);
+}
+
+// y[idx] = gelu(mm[idx] + bias[idx % H])
+__global__ void fused_bias_gelu_kernel(
+        const float * __restrict__ mm,
+        const float * __restrict__ bias,
+        float       * __restrict__ y,
+        const int                  H,
+        const int                  n_pos) {
+    const int idx   = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = H * n_pos;
+    if (idx >= total) return;
+    const int h = idx % H;
+    const float mb = __fadd_rn(mm[idx], bias[h]);
+    y[idx] = fused_gelu_single(mb);
+}
+
+}  // namespace
+
+void launch_fused_bias_residual(
+        const float * mm,
+        const float * bias,
+        const float * residual,
+        float       * y,
+        int           H,
+        int           n_pos,
+        cudaStream_t  stream) {
+    constexpr int TPB = 256;
+    const int total = H * n_pos;
+    const dim3 grid((unsigned) ((total + TPB - 1) / TPB), 1, 1);
+    const dim3 block((unsigned) TPB, 1, 1);
+    fused_bias_residual_kernel<<<grid, block, 0, stream>>>(mm, bias, residual, y, H, n_pos);
+}
+
+void launch_fused_bias_gelu(
+        const float * mm,
+        const float * bias,
+        float       * y,
+        int           H,
+        int           n_pos,
+        cudaStream_t  stream) {
+    constexpr int TPB = 256;
+    const int total = H * n_pos;
+    const dim3 grid((unsigned) ((total + TPB - 1) / TPB), 1, 1);
+    const dim3 block((unsigned) TPB, 1, 1);
+    fused_bias_gelu_kernel<<<grid, block, 0, stream>>>(mm, bias, y, H, n_pos);
+}
+
+// ----------------------------------------------------------------------------
 // Plan: (norm → mul-with-weight → add-with-bias) chain detection
 // ----------------------------------------------------------------------------
 //
@@ -293,6 +372,38 @@ struct LayerNormEntry {
 // of {q_pad, k_cast, v_cast} has the highest topo index in the cgraph (so
 // when the op-hook anchors and the fused kernel writes all three dsts, the
 // upstream followers' op_hook calls have already returned true).
+
+// Phase A2 entries — pointwise tail fusion. Anchor on the OUTER op (residual
+// add or GELU); inner bias-add is the follower. Read the full design notes
+// above launch_fused_bias_residual / launch_fused_bias_gelu in the .cuh.
+//
+// Gallocr-trap caveat: skipping the bias-add follower only works if gallocr
+// packs mm.dst, bias_add.dst, and outer.dst into the same physical slot, so
+// the slot still holds mm's value when our late anchor reads it. This holds
+// in the per-encoder-block sub-graph (long, repetitive, shape-uniform), but
+// breaks for one-off chains like the vision probe head (gelu reads garbage)
+// and the patch embedding (non-consecutive). The plan-builder gates on both
+// `is_blk_bias` (bias name contains "blk") and consecutive-in-topo to scope
+// the fusion to the safe region. See HANDOFF-megakernel-v0.md "gallocr trap
+// take 2" for the bisect receipts (text bit-clean unrestricted, vision drops
+// to cosine 0.65 unrestricted, both 0.999+ once gated).
+
+struct BiasResidualEntry {
+    const ggml_tensor * mm_node       = nullptr;  // mul_mat output  (H, n_pos)
+    const ggml_tensor * bias_node     = nullptr;  // 1D F32 bias     (H,)
+    const ggml_tensor * residual_node = nullptr;  // 2D F32 residual (H, n_pos)
+    const ggml_tensor * inner_add     = nullptr;  // follower
+    int H     = 0;
+    int n_pos = 0;
+};
+
+struct BiasGeluEntry {
+    const ggml_tensor * mm_node   = nullptr;
+    const ggml_tensor * bias_node = nullptr;
+    const ggml_tensor * inner_add = nullptr;  // follower
+    int H     = 0;
+    int n_pos = 0;
+};
 
 struct QkvPrepEntry {
     // Copy-to-scratch fields (used at qkv_add anchor)
@@ -346,6 +457,10 @@ std::unordered_map<const ggml_tensor *, QkvPrepEntry>   g_qkv_split_anchors;
 std::unordered_set<const ggml_tensor *>                 g_qkv_followers;
 QkvScratch                                              g_qkv_scratch;
 
+std::unordered_map<const ggml_tensor *, BiasResidualEntry> g_br_anchors;
+std::unordered_map<const ggml_tensor *, BiasGeluEntry>     g_bg_anchors;
+std::unordered_set<const ggml_tensor *>                    g_tail_followers;
+
 bool     g_enabled              = true;
 // QKV-prep — 2-kernel form: anchor 1 on qkv_add copies mm+bias into a
 // persistent device-side scratch buffer (replacing the bias-add); anchor 2
@@ -356,12 +471,25 @@ bool     g_enabled              = true;
 // gallocr aliasing trap (qkv_add slot reclaimed before the late anchor
 // fired); see HANDOFF-megakernel-v0.md for receipts.
 bool     g_qkv_enabled          = true;
+// Phase A2 — pointwise tail fusion: (mm + 1D bias) + 2D residual collapsed
+// into one launch (P1, fires at o-proj and down-proj per block), and gelu(mm
+// + 1D bias) collapsed into one launch (P2, fires at up-proj per block). 3
+// launches/block × 27 blocks = 81/encode. Anchor on OUTER op (residual_add
+// or GELU); inner bias_add is the follower. Bit-clean against the split path
+// (both kernels use __fadd_rn for the inner add to suppress nvcc FMA fusion;
+// GELU formula matches ggml_cuda_op_gelu_single). Kill switch:
+// SIGLIP2_DISABLE_TAIL_FUSION=1.
+bool     g_tail_enabled         = true;
 uint64_t g_ln_groups_built      = 0;
 uint64_t g_ln_anchor_fires      = 0;
 uint64_t g_ln_follower_fires    = 0;
 uint64_t g_qkv_groups_built     = 0;
 uint64_t g_qkv_anchor_fires     = 0;
 uint64_t g_qkv_follower_fires   = 0;
+uint64_t g_br_groups_built      = 0;
+uint64_t g_bg_groups_built      = 0;
+uint64_t g_tail_anchor_fires    = 0;
+uint64_t g_tail_follower_fires  = 0;
 int      g_log_budget           = 0;
 
 bool is_2d_f32_contiguous(const ggml_tensor * t) {
@@ -577,6 +705,151 @@ void build_qkv_prep_plan(const ggml_cgraph * cgraph) {
     }
 }
 
+// Phase A2 plan-builder. Walks every ADD/UNARY node looking for two patterns
+// rooted at a (mul_mat + 1D-bias) "inner" node:
+//
+//   P1: outer = ADD(inner_add, residual_2d), where inner_add = ADD(mm, bias_1d)
+//   P2: outer = UNARY/GELU(inner_add),       where inner_add = ADD(mm, bias_1d)
+//
+// Anchor = outer; follower = inner_add. Outer's dst gets written directly by
+// the fused kernel (reads mm.data + bias.data + residual.data, writes to
+// outer.dst). The inner_add's compute is skipped — its slot may alias with
+// mm.dst's slot (same shape, disjoint lifetimes), and at outer.idx the slot
+// still holds mm's value because nothing else writes to it.
+//
+// Disjoint from A0/A1: A0 anchors on (NORM-prefixed) ADDs, A1 anchors on the
+// QKV bias-add specifically (filtered by weight name "attn_qkv.weight"). Tail
+// patterns require src[0].op == GGML_OP_ADD or live above a UNARY, neither of
+// which the A0/A1 anchors match. Defensive `count(...)` checks below skip any
+// node already claimed by a prior plan.
+void build_tail_fusion_plan(const ggml_cgraph * cgraph) {
+    g_br_anchors.clear();
+    g_bg_anchors.clear();
+    g_tail_followers.clear();
+    if (!cgraph || !g_tail_enabled) return;
+
+    auto is_2d_f32_contig = is_2d_f32_contiguous;
+
+    auto is_1d_f32_bias = [](const ggml_tensor * t, int64_t H) -> bool {
+        if (!t) return false;
+        if (t->type != GGML_TYPE_F32) return false;
+        if (t->ne[0] != H) return false;
+        if (t->ne[1] != 1 || t->ne[2] != 1 || t->ne[3] != 1) return false;
+        return true;
+    };
+
+    auto is_already_claimed = [](const ggml_tensor * node) -> bool {
+        if (!node) return false;
+        return g_ln_anchors.count(node)        || g_ln_followers.count(node) ||
+               g_qkv_copy_anchors.count(node)  || g_qkv_split_anchors.count(node) ||
+               g_qkv_followers.count(node)     ||
+               g_br_anchors.count(node)        || g_bg_anchors.count(node) ||
+               g_tail_followers.count(node);
+    };
+
+    auto match_inner = [&](const ggml_tensor * inner_add,
+                           const ggml_tensor *& mm,
+                           const ggml_tensor *& bias,
+                           int & H, int & n_pos) -> bool {
+        if (!inner_add || inner_add->op != GGML_OP_ADD) return false;
+        const ggml_tensor * a = inner_add->src[0];
+        const ggml_tensor * b = inner_add->src[1];
+        if (!a || !b) return false;
+        if (a->op != GGML_OP_MUL_MAT) return false;
+        if (!is_2d_f32_contig(a))      return false;
+        if (!is_2d_f32_contig(inner_add)) return false;
+        if (a->ne[0] != inner_add->ne[0] || a->ne[1] != inner_add->ne[1]) return false;
+        H     = (int) a->ne[0];
+        n_pos = (int) a->ne[1];
+        if (!is_1d_f32_bias(b, H)) return false;
+        mm   = a;
+        bias = b;
+        return true;
+    };
+
+    // PRODUCTION GATE — fuse only patterns whose bias is a per-encoder-block
+    // tensor (name contains "blk", i.e. "v.blk.{i}.*" or "t.blk.{i}.*"). The
+    // probe head (`v.head.*`) and patch embedding (`v.patch_embd.*`) chains
+    // empirically corrupt because gallocr's slot packing for those one-off,
+    // mixed-shape sub-graphs doesn't keep mm.dst alive in the same physical
+    // slot through to our late-anchor read. Per-block chains, by contrast,
+    // are long and shape-uniform across 27 layers — gallocr packs them with
+    // aggressive slot reuse that *does* preserve the value through our window.
+    // Verified via per-pattern bisect: BLK_ONLY off → vision 0.65 cosine;
+    // BLK_ONLY on → vision 0.9999. Same root family as the A1 gallocr trap.
+    auto is_blk_bias = [](const ggml_tensor * bias) -> bool {
+        if (!bias || !bias->name[0]) return false;
+        return std::strstr(bias->name, "blk") != nullptr;
+    };
+
+    const int n = ggml_graph_n_nodes((ggml_cgraph *) cgraph);
+    for (int i = 0; i < n; ++i) {
+        ggml_tensor * outer = ggml_graph_node((ggml_cgraph *) cgraph, i);
+        if (!outer) continue;
+
+        // Defense-in-depth: also require inner_add to be the IMMEDIATELY
+        // PRECEDING node in topo (outer at i, inner at i-1). Per-block
+        // patterns always satisfy this; non-block ones often don't, so this
+        // doubles-up on the BLK gate above.
+        if (i < 1) continue;
+        ggml_tensor * prev = ggml_graph_node((ggml_cgraph *) cgraph, i - 1);
+
+        // Pattern P1: outer = ADD(inner_add, residual_2d)
+        if (outer->op == GGML_OP_ADD) {
+            const ggml_tensor * inner    = outer->src[0];
+            const ggml_tensor * residual = outer->src[1];
+            const ggml_tensor * mm = nullptr, * bias = nullptr;
+            int H = 0, n_pos = 0;
+            if (!match_inner(inner, mm, bias, H, n_pos))   continue;
+            if (inner != prev)                             continue;  // safety gate
+            if (!is_blk_bias(bias))                        continue;
+            if (!is_2d_f32_contig(residual))               continue;
+            if (!is_2d_f32_contig(outer))                  continue;
+            if (residual->ne[0] != H || residual->ne[1] != n_pos) continue;
+            if (outer->ne[0]    != H || outer->ne[1]    != n_pos) continue;
+            if (is_already_claimed(outer)) continue;
+            if (is_already_claimed(inner)) continue;
+
+            BiasResidualEntry e;
+            e.mm_node       = mm;
+            e.bias_node     = bias;
+            e.residual_node = residual;
+            e.inner_add     = inner;
+            e.H             = H;
+            e.n_pos         = n_pos;
+            g_br_anchors[outer] = e;
+            g_tail_followers.insert(inner);
+            ++g_br_groups_built;
+            continue;
+        }
+
+        // Pattern P2: outer = UNARY/GELU(inner_add)
+        if (outer->op == GGML_OP_UNARY && ggml_get_unary_op(outer) == GGML_UNARY_OP_GELU) {
+            const ggml_tensor * inner = outer->src[0];
+            const ggml_tensor * mm = nullptr, * bias = nullptr;
+            int H = 0, n_pos = 0;
+            if (!match_inner(inner, mm, bias, H, n_pos)) continue;
+            if (inner != prev)                            continue;  // safety gate
+            if (!is_blk_bias(bias))                       continue;
+            if (!is_2d_f32_contig(outer))                continue;
+            if (outer->ne[0] != H || outer->ne[1] != n_pos) continue;
+            if (is_already_claimed(outer)) continue;
+            if (is_already_claimed(inner)) continue;
+
+            BiasGeluEntry e;
+            e.mm_node   = mm;
+            e.bias_node = bias;
+            e.inner_add = inner;
+            e.H         = H;
+            e.n_pos     = n_pos;
+            g_bg_anchors[outer] = e;
+            g_tail_followers.insert(inner);
+            ++g_bg_groups_built;
+            continue;
+        }
+    }
+}
+
 }  // namespace
 
 // ----------------------------------------------------------------------------
@@ -589,17 +862,22 @@ extern "C" void siglip2_graph_begin_hook(
     if (!g_enabled) return;
     build_ln_plan(cgraph);
     build_qkv_prep_plan(cgraph);
+    build_tail_fusion_plan(cgraph);
 
     if (g_log_budget > 0) {
         const int n = cgraph ? ggml_graph_n_nodes((ggml_cgraph *) cgraph) : 0;
         std::fprintf(stderr,
             "[siglip2-megakernel] graph_begin: LN groups=%zu (followers=%zu) "
             "QKV groups=%zu (copy_anchors=%zu split_anchors=%zu followers=%zu) "
+            "tail bias-residual=%zu bias-gelu=%zu (followers=%zu) "
             "total_nodes=%d\n",
             g_ln_anchors.size(),  g_ln_followers.size(),
             g_qkv_groups_built,
             g_qkv_copy_anchors.size(), g_qkv_split_anchors.size(),
-            g_qkv_followers.size(), n);
+            g_qkv_followers.size(),
+            g_br_anchors.size(),  g_bg_anchors.size(),
+            g_tail_followers.size(),
+            n);
         --g_log_budget;
     }
 }
@@ -610,13 +888,18 @@ extern "C" bool siglip2_op_hook(
         cudaStream_t                stream) {
     if (!g_enabled || !dst) return false;
 
-    // Fast path: follower no-op (LN's norm+mul, or QKV-prep's cont/pad/cast).
+    // Fast path: follower no-op (LN's norm+mul, QKV-prep's cont/pad/cast, or
+    // the inner bias-add of a tail fusion).
     if (g_ln_followers.count(dst)) {
         ++g_ln_follower_fires;
         return true;
     }
     if (g_qkv_followers.count(dst)) {
         ++g_qkv_follower_fires;
+        return true;
+    }
+    if (g_tail_followers.count(dst)) {
+        ++g_tail_follower_fires;
         return true;
     }
 
@@ -653,6 +936,37 @@ extern "C" bool siglip2_op_hook(
                                   e.H, e.n_pos, e.n_head, e.d_head, e.d_pad,
                                   stream);
             ++g_qkv_anchor_fires;
+            return true;
+        }
+    }
+
+    // Tail-fusion anchors. Outer op (residual_add or gelu) reads mm.data
+    // directly — by gallocr's static analysis this slot may also host
+    // bias_add.dst and outer.dst (same shape, disjoint lifetimes), so the
+    // value persists from mm.idx through outer.idx because the inner bias_add
+    // is a follower (no compute, no overwrite).
+    if (g_tail_enabled) {
+        auto it_br = g_br_anchors.find(dst);
+        if (it_br != g_br_anchors.end()) {
+            const BiasResidualEntry & e = it_br->second;
+            const float * mm   = e.mm_node       ? (const float *) e.mm_node->data       : nullptr;
+            const float * bias = e.bias_node     ? (const float *) e.bias_node->data     : nullptr;
+            const float * res  = e.residual_node ? (const float *) e.residual_node->data : nullptr;
+            float       * y    = (float *) dst->data;
+            if (!mm || !bias || !res || !y) return false;
+            launch_fused_bias_residual(mm, bias, res, y, e.H, e.n_pos, stream);
+            ++g_tail_anchor_fires;
+            return true;
+        }
+        auto it_bg = g_bg_anchors.find(dst);
+        if (it_bg != g_bg_anchors.end()) {
+            const BiasGeluEntry & e = it_bg->second;
+            const float * mm   = e.mm_node   ? (const float *) e.mm_node->data   : nullptr;
+            const float * bias = e.bias_node ? (const float *) e.bias_node->data : nullptr;
+            float       * y    = (float *) dst->data;
+            if (!mm || !bias || !y) return false;
+            launch_fused_bias_gelu(mm, bias, y, e.H, e.n_pos, stream);
+            ++g_tail_anchor_fires;
             return true;
         }
     }
@@ -700,13 +1014,18 @@ bool install() {
         if (d[0] != '\0' && std::strcmp(d, "0") != 0) g_qkv_enabled = false;
     }
 
+    if (const char * d = std::getenv("SIGLIP2_DISABLE_TAIL_FUSION")) {
+        if (d[0] != '\0' && std::strcmp(d, "0") != 0) g_tail_enabled = false;
+    }
+
     ggml_cuda_set_graph_begin_hook(siglip2_graph_begin_hook);
     ggml_cuda_set_op_hook(siglip2_op_hook);
     s_installed = true;
 
     std::fprintf(stderr,
-        "[siglip2-megakernel] installed: fused-LN%s\n",
-        g_qkv_enabled ? " + QKV-prep (copy→scratch + split-permute-pad-cast, 9 ops → 2)" : "");
+        "[siglip2-megakernel] installed: fused-LN%s%s\n",
+        g_qkv_enabled  ? " + QKV-prep (copy→scratch + split-permute-pad-cast, 9 ops → 2)" : "",
+        g_tail_enabled ? " + tail (bias+residual, bias+gelu, 3 ops/block → 0 anchor launches)" : "");
     return true;
 }
 
