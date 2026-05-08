@@ -1,6 +1,7 @@
 # Build
 build/
 build-cuda/
+build-cuda-*/
 
 # Bench artifacts (one-shot result blobs)
 bench_results*.json
