@@ -286,8 +286,113 @@ bool run_custom_path(const Shape & s,
 
 }  // namespace
 
-int main(int /*argc*/, char ** /*argv*/) {
+// One-shot profile of the custom kernel at the cfe shape (M=320). Dumps
+// per-region cycle breakdown averaged across CUDA blocks. Returns nothing
+// useful — this is purely for understanding where the time goes.
+static void run_profile_cfe(const Shape & s,
+                            const std::vector<float> & host_x_f32,
+                            const std::vector<uint8_t> & host_w_quant)
+{
+    using namespace siglip2_custom_mmq;
+
+    if (s.w_type != GGML_TYPE_Q8_0 || s.K != K_FIXED) {
+        printf("[profile] shape unsupported, skipping\n");
+        return;
+    }
+
+    void * d_w = nullptr; void * d_x = nullptr; void * d_act = nullptr;
+    float * d_dst = nullptr; void * d_cyc = nullptr;
+    cudaMalloc(&d_w,   host_w_quant.size());
+    cudaMalloc(&d_x,   host_x_f32.size() * sizeof(float));
+    cudaMalloc(&d_act, activation_scratch_bytes((int) s.M));
+    cudaMalloc(&d_dst, (size_t) s.N * (size_t) s.M * sizeof(float));
+    // Worst-case 2048 blocks (cfe = 27 × 5 = 135).
+    const int max_blocks = 2048;
+    cudaMalloc(&d_cyc, (size_t) max_blocks * sizeof(ProfileCycles));
+    cudaMemset(d_cyc, 0, (size_t) max_blocks * sizeof(ProfileCycles));
+    cudaMemcpy(d_w, host_w_quant.data(), host_w_quant.size(),  cudaMemcpyHostToDevice);
+    cudaMemcpy(d_x, host_x_f32.data(),   host_x_f32.size() * sizeof(float), cudaMemcpyHostToDevice);
+
+    cudaStream_t stream = 0;
+    auto s_stream = (siglip2_cuda_stream_t) stream;
+
+    // Warmup (without profile counters, so the first JIT/L1 hit doesn't
+    // contaminate the profiled run).
+    for (int i = 0; i < 5; ++i) {
+        launch_quantize_activation((const float *) d_x, d_act, (int) s.M, s_stream);
+        launch_custom_mmq(d_w, 0, d_act, d_dst, (int) s.M, (int) s.N, s_stream);
+    }
+    cudaStreamSynchronize(stream);
+
+    // Profile run.
+    int grid_n = 0, grid_m = 0;
+    launch_quantize_activation((const float *) d_x, d_act, (int) s.M, s_stream);
+    launch_custom_mmq_profile(d_w, 0, d_act, d_dst, (int) s.M, (int) s.N,
+                              d_cyc, &grid_n, &grid_m, s_stream);
+    cudaStreamSynchronize(stream);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[profile] kernel error: %s\n", cudaGetErrorString(err));
+        cudaFree(d_w); cudaFree(d_x); cudaFree(d_act); cudaFree(d_dst); cudaFree(d_cyc);
+        return;
+    }
+
+    const int n_blocks = grid_n * grid_m;
+    std::vector<ProfileCycles> host_cyc(n_blocks);
+    cudaMemcpy(host_cyc.data(), d_cyc,
+               (size_t) n_blocks * sizeof(ProfileCycles),
+               cudaMemcpyDeviceToHost);
+
+    // Aggregate.
+    unsigned long long sum_load = 0, sum_sync1 = 0, sum_compute = 0, sum_sync2 = 0;
+    unsigned long long min_load = ~0ull, max_load = 0;
+    unsigned long long min_compute = ~0ull, max_compute = 0;
+    for (const auto & c : host_cyc) {
+        sum_load    += c.load;
+        sum_sync1   += c.sync1;
+        sum_compute += c.compute;
+        sum_sync2   += c.sync2;
+        if (c.load    < min_load)    min_load    = c.load;
+        if (c.load    > max_load)    max_load    = c.load;
+        if (c.compute < min_compute) min_compute = c.compute;
+        if (c.compute > max_compute) max_compute = c.compute;
+    }
+    const double inv_blocks = 1.0 / (double) n_blocks;
+    const double avg_load    = sum_load    * inv_blocks;
+    const double avg_sync1   = sum_sync1   * inv_blocks;
+    const double avg_compute = sum_compute * inv_blocks;
+    const double avg_sync2   = sum_sync2   * inv_blocks;
+    const double avg_total   = avg_load + avg_sync1 + avg_compute + avg_sync2;
+
+    printf("\n--- profile @ %s (grid=%dx%d=%d blocks, K_BLOCKS=%d) ---\n",
+           s.label, grid_n, grid_m, n_blocks, (int) K_BLOCKS);
+    printf("  region        avg cycles/block   share    avg cycles/K-block\n");
+    printf("  load          %15.0f   %5.1f%%  %18.0f\n",
+           avg_load,    100.0 * avg_load    / avg_total, avg_load    / (double) K_BLOCKS);
+    printf("  sync (post-L) %15.0f   %5.1f%%  %18.0f\n",
+           avg_sync1,   100.0 * avg_sync1   / avg_total, avg_sync1   / (double) K_BLOCKS);
+    printf("  compute       %15.0f   %5.1f%%  %18.0f\n",
+           avg_compute, 100.0 * avg_compute / avg_total, avg_compute / (double) K_BLOCKS);
+    printf("  sync (end)    %15.0f   %5.1f%%  %18.0f\n",
+           avg_sync2,   100.0 * avg_sync2   / avg_total, avg_sync2   / (double) K_BLOCKS);
+    printf("  total         %15.0f   100.0%%  %18.0f\n",
+           avg_total, avg_total / (double) K_BLOCKS);
+    printf("  load   range  min=%llu max=%llu  (block-to-block variance)\n",
+           min_load, max_load);
+    printf("  compute range min=%llu max=%llu\n",
+           min_compute, max_compute);
+
+    cudaFree(d_w); cudaFree(d_x); cudaFree(d_act); cudaFree(d_dst); cudaFree(d_cyc);
+}
+
+int main(int argc, char ** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
+
+    bool profile_mode = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--profile") profile_mode = true;
+    }
 
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) {
@@ -329,6 +434,12 @@ int main(int /*argc*/, char ** /*argv*/) {
         } else {
             printf("%-32s | %10.3f %10.1f | %10s %10s | %8s | %s\n",
                    s.label, rg.p50, ggflops, "—", "—", "—", "—");
+        }
+
+        // Profile mode: run the cycle breakdown for the cfe shape after
+        // benching it.
+        if (profile_mode && std::string(s.label).find("M=320 (text n=5)") != std::string::npos) {
+            run_profile_cfe(s, host_x_f32, host_w_quant);
         }
     }
 

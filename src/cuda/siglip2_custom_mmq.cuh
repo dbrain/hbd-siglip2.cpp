@@ -66,6 +66,20 @@ void launch_quantize_activation(
     int           M,
     siglip2_cuda_stream_t stream);
 
+// Per-block cycle counters emitted by the profiling kernel variant.
+// 4 unsigned long long per CUDA block:
+//   [0] = sum of cycles spent in load loops across the K-loop
+//   [1] = sum of cycles spent in the post-load __syncthreads
+//   [2] = sum of cycles spent in compute (scale-cache + ldmatrix A + per-M-sub
+//         B-load + N_SUBTILES × mma + scale-and-add)
+//   [3] = sum of cycles spent in the end-of-iter __syncthreads
+struct ProfileCycles {
+    unsigned long long load;
+    unsigned long long sync1;
+    unsigned long long compute;
+    unsigned long long sync2;
+};
+
 // Custom Q8_0 × Q8_1 → F32 GEMM for siglip2 shapes.
 //
 // The weight tensor `w` is the raw GGUF Q8_0 buffer of shape (K, N) — i.e.
@@ -86,6 +100,24 @@ void launch_custom_mmq(
     float *       dst,           // (N, M) F32, N innermost
     int           M,
     int           N,
+    siglip2_cuda_stream_t stream);
+
+// Profiling variant: same kernel as launch_custom_mmq, but with clock64()-
+// based per-region cycle counters written to `out_cycles`. The buffer must
+// be sized for at least (n_block_n × n_block_m) ProfileCycles entries (one
+// per CUDA block). Adds a few cycles of overhead per region; not for
+// production. Returns the (n_block_n, n_block_m) grid dims via *out_grid_n
+// and *out_grid_m so the caller can iterate the buffer.
+void launch_custom_mmq_profile(
+    const void *  w,
+    size_t        w_row_bytes,
+    const void *  act_scratch,
+    float *       dst,
+    int           M,
+    int           N,
+    void *        out_cycles,    // ProfileCycles * sized for (grid_n × grid_m)
+    int *         out_grid_n,
+    int *         out_grid_m,
     siglip2_cuda_stream_t stream);
 
 }  // namespace siglip2_custom_mmq
