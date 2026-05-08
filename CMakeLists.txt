@@ -76,6 +76,7 @@ if(GGML_CUDA)
     endif()
     add_library(siglip2_megakernel STATIC
         src/cuda/siglip2_megakernel.cu
+        src/cuda/siglip2_custom_mmq.cu
     )
     set_target_properties(siglip2_megakernel PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
@@ -84,6 +85,7 @@ if(GGML_CUDA)
     target_include_directories(siglip2_megakernel PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda
         ${GGML_DIR}/include
+        ${GGML_DIR}/src
     )
     target_link_libraries(siglip2_megakernel PUBLIC ggml)
 else()
@@ -199,6 +201,20 @@ if(SIGLIP2_SERVER)
         siglip2_megakernel
         httplib::httplib
         nlohmann_json::nlohmann_json
+    )
+endif()
+
+# Phase C microbench — Q8_0/F16 × F32 mul_mat at the exact (M,K,N) shapes
+# siglip2 hits per encoder block. Standalone harness for "is the lever there"
+# decisions before kernel work. Built only when GGML_CUDA=ON since that's the
+# whole point.
+if(GGML_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    add_executable(microbench_mmq bench/microbench_mmq.cpp)
+    target_link_libraries(microbench_mmq PRIVATE ggml siglip2_megakernel CUDA::cudart)
+    target_include_directories(microbench_mmq PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda
+        ${GGML_DIR}/src
     )
 endif()
 
