@@ -1,12 +1,13 @@
 # siglip2.cpp — Handoff
 
-You're picking up `siglip2.cpp` after the megakernel arc (Phase A0-A4 +
-Phase B graph cache, all shipped on `dbrain/siglip2-v0`) and a Phase C
-exploration pass (custom Q8_0 mma kernel + Q4_K_M/Q5_K_M with K-padding,
-both committed on `dbrain/phase-c-cpasync-wip`, neither shipped). Feature
-parity has been complete since M5. **All four endpoints beat python on
-Q8_0 today; cfe at 0.98×, the others at 0.76-0.91×.** VRAM **1558 MiB**
-resident vs python's ~2400 MiB peak.
+**You are on `dbrain/siglip2-v0` — that's the production branch, and the
+only branch you need.** Don't switch elsewhere. Phase C exploration code
+(custom Q8_0 mma kernel, Q4_K_M/Q5_K_M conversion + runtime K-padding) is
+on this branch but parked — none of it dispatches at runtime under default
+config; Q8_0 GGUFs run the same path Phase B shipped. Feature parity has
+been complete since M5. **All four endpoints beat python on Q8_0 today;
+cfe at 0.98×, the others at 0.76-0.91×.** VRAM **1558 MiB** resident vs
+python's ~2400 MiB peak.
 
 Read `AGENTS.md` for the architectural overview. The current "what to do
 next" doc is **`HANDOFF-perf-next.md`** (post-megakernel perf targets:
@@ -49,27 +50,33 @@ VRAM resident: 1558 MiB (-842 MiB vs the original ~2400 MiB python peak).
 megakernel-A0/A2/A3 K-padding-bake — are on the cutting-room floor at
 the user's request.)
 
-**What NOT to do (paths already explored, parked on the wip branch):**
+**What NOT to do (paths already explored, parked on this branch — code
+present, runtime dispatch off-by-default):**
 
-- **Custom Q8_0 mma kernel matching ggml-mma** (`v5b` on
-  `dbrain/phase-c-cpasync-wip`). Cosine = 1.0 bit-clean, but 2.7× slower
-  than ggml-mma at the cfe shape. Profile (clock64 instrumentation in
-  the same branch) showed 80% of cycles in global→shmem load latency,
-  19% mma compute. Structural cause: redundant memory traffic — 135
-  small blocks loading their own slabs vs ggml's stream-K running 28
-  blocks loading 1/28th of unique data. Closing the gap needs stream-K
-  + cp.async; multi-week, ends at ggml-parity not past it. Not the right
-  swing for the Phase C target.
+- **Custom Q8_0 mma kernel matching ggml-mma** (`src/cuda/siglip2_custom_mmq.{cu,cuh}`,
+  used only by `bench/microbench_mmq`). v5b is cosine = 1.0 bit-clean
+  but 2.7× slower than ggml-mma at the cfe shape. Profile (clock64
+  instrumentation, same files) showed 80% of cycles in global→shmem
+  load latency, 19% mma compute. Structural cause: redundant memory
+  traffic — 135 small blocks loading their own slabs vs ggml's stream-K
+  running 28 blocks loading 1/28th of unique data. Closing the gap
+  needs stream-K + cp.async; multi-week, ends at ggml-parity not past
+  it. Not the right swing for the Phase C target. v6 cp.async variant
+  is also in this file with a known cosine bug on edge tiles, fix
+  sketched in the v6 commit (cda641f → 9c86d81).
 
-- **Q4_K_M / Q5_K_M weights** (Plan A on the wip branch). Conversion
-  tool (`tools/siglip2-quantize`) + runtime ggml_pad insertion at every
-  K-padded mul_mat all landed and Q8_0 baseline parity is preserved.
-  But Q4_K_M is **+12% slower than Q8_0** at our shapes (ggml's K-quant
-  MMQ has per-super-block dequant cost that swamps the bandwidth
-  halving) AND fails the 0.999 parity floor (vision 0.993, image 0.980,
-  text fail; score parity holds at 0.99939). User decision: stay Q8_0
-  in production, keep the plumbing on the branch for emergency opt-in.
-  Reviving needs imatrix calibration (multi-day plumbing).
+- **Q4_K_M / Q5_K_M weights** (Plan A: `tools/siglip2-quantize/`,
+  `--type q4_k_m` in the converter, `pad_x_to_w()` in
+  `src/siglip2_{text,vision}.cpp`, plus the bumped ggml submodule for
+  Q4_K get_rows). Q8_0 baseline parity is preserved (the runtime
+  helpers are no-op when W's K matches activation's K, which is the
+  case for Q8_0 GGUFs). But Q4_K_M is **+12% slower than Q8_0** at our
+  shapes (ggml's K-quant MMQ has per-super-block dequant cost that
+  swamps the bandwidth halving) AND fails the 0.999 parity floor
+  (vision 0.993, image 0.980, text fail; score parity holds at 0.99939).
+  User decision: stay Q8_0 in production, keep the plumbing in tree
+  for emergency opt-in. Reviving needs imatrix calibration (multi-day
+  plumbing).
 
 Stay above 0.999 cosine on all four parity scripts. Everything else is
 fair game.

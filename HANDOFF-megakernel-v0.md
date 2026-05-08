@@ -484,13 +484,17 @@ the actual ROI: pre-pad weights is already absorbed by A1 megakernel
 ms originally estimated. The realistic ceiling at the graph layer
 remains Phase B; below that needs the kernel lap.
 
-## Phase C — closed 2026-05-09 (the kernel lap + Plan A Q4_K_M, neither shipped)
+## Phase C — closed 2026-05-09 (the kernel lap + Plan A Q4_K_M, parked on prod branch)
 
 The kernel lap and the Plan A Q4_K_M side-quest both ran this session.
-Both committed to `dbrain/phase-c-cpasync-wip` for future opt-in; **neither
-shipped to `dbrain/siglip2-v0`**. Decision (per user 2026-05-09): "lets
-just stick with Q8 - keep the code supporting Q4_K - but this service
-was previously 2400 peak VRAM Q8 has already dropped it a lot."
+Both committed to `dbrain/siglip2-v0` (fast-forwarded from a transient
+`dbrain/phase-c-cpasync-wip` branch that was used during the work). **Q8_0
+runtime paths are unchanged from Phase B head** — the new helpers
+(`pad_x_to_w`, custom-mmq dispatch) gate themselves off when W's
+innermost K matches the activation's, which is the case for Q8_0 GGUFs.
+Decision (per user 2026-05-09): "lets just stick with Q8 - keep the code
+supporting Q4_K - but this service was previously 2400 peak VRAM Q8 has
+already dropped it a lot."
 
 **Custom Q8_0×F32 mma kernel (cda641f → 9c86d81 → bf42b34):**
 - v5b: bit-clean (cosine = 1.0 across all 9 microbench Q8_0 shapes), but

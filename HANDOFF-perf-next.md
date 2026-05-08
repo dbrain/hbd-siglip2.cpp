@@ -12,11 +12,12 @@
 >
 > Translation: the megakernel chapter (Phase A0-A4 + Phase B graph cache)
 > is closed and shipped on `dbrain/siglip2-v0`. The custom-kernel and
-> Q4_K_M side experiments are committed on `dbrain/phase-c-cpasync-wip`
-> for future reference but the user wants the production line to stay on
-> Q8_0. The next agent's punch list is **(1) async parallel streams in
-> /v1/classify, (3) cuBLASLt int8 GEMM swap on the hot mul_mats, and
-> (5) FA d_head=72 native fast path.**
+> Q4_K_M side experiments rode the same branch in via fast-forward
+> (commits below) but their runtime paths are off-by-default for Q8_0
+> GGUFs. **You're on `dbrain/siglip2-v0`. Stay there.** The next agent's
+> punch list is **(1) async parallel streams in /v1/classify, (3) cuBLASLt
+> int8 GEMM swap on the hot mul_mats, and (5) FA d_head=72 native fast
+> path.**
 >
 > **Standing rules from `HANDOFF.md` still apply:**
 > - **VRAM**: full-tower resident is the metric. Q8_0 today is **1558 MiB**
@@ -50,10 +51,14 @@ VRAM: **1558 MiB** resident.
 Re-confirmed mid-session (server endpoint /v1/text_embeddings n=5 form-encoded,
 30 reqs): 20.2 ms p50 / min 20.1 / mean 20.3. Holds.
 
-## What landed in this session (commits on `dbrain/phase-c-cpasync-wip`)
+## What landed in this session (commits now on `dbrain/siglip2-v0`)
 
-**The wip branch is divergent from `dbrain/siglip2-v0`** — none of this
-work shipped to prod. It's all preserved for future opt-in or reuse.
+These rode in via fast-forward from the now-archived `dbrain/phase-c-cpasync-wip`
+branch. **All Q8_0 paths run identically to Phase B head** — the new
+runtime helpers (`pad_x_to_w()`, custom-mmq kernel installation) gate
+themselves off when W's K matches activation's K (Q8_0) or are only
+invoked by the microbench. None of this dispatches at runtime under
+default config when running the production Q8_0 GGUF.
 
 ```
 2f8a1c8 chore: track phaseC handoff trail + ignore build-cuda-* variants
@@ -293,11 +298,15 @@ After targets 1, 3, 5:
 
 ## Files / facts unchanged
 
-- Production branch: `dbrain/siglip2-v0` at Phase B head. Phase C work
-  is on `dbrain/phase-c-cpasync-wip` — not merged.
-- ggml submodule on `siglip2-v0` is still at `a3fc6843`. The wip branch
-  bumped to `4eec5550` for the Q4_K get_rows kernel — only relevant if
-  you ever opt into the Plan A code.
+- Production branch: `dbrain/siglip2-v0`. The Phase C exploration commits
+  (v5b/v6/profile/Plan A/handoff updates) fast-forwarded onto this branch
+  after the user's "lets just stick with Q8" call — code is here, but
+  runtime paths are off-by-default for Q8_0 GGUFs. No separate wip branch
+  to track.
+- ggml submodule at `4eec5550` (dbrain/ggml@master). Adds the Q4_K
+  get_rows kernel — only relevant if you ever opt into Plan A. The
+  GGML_CUDA_NO_MMA debug knob is preserved as uncommitted local content
+  inside the submodule (intentional; debug-only).
 - VRAM 1558 MiB resident.
 - Models: `siglip2-so400m-naflex-q8_0.gguf` (1.46 GB) is the production
   artifact. Q4_K_M / Q5_K_M / new F16 GGUFs from this session are in
