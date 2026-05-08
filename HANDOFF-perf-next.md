@@ -1,6 +1,23 @@
 # siglip2.cpp — performance next-targets handoff (post-Phase-C)
 
-> ## Mood of the room (read this first)
+> ## ⛔ CHAPTER CLOSED — 2026-05-10
+>
+> All actionable perf levers exhausted on RTX 3060 / Ampere. See **"Final
+> outcomes"** at the end of this doc for receipts. The next focus is
+> productionization — see `HANDOFF-prod.md`.
+>
+> **Current state (RTX 3060, clean GPU, per-process VRAM):**
+> - `/v1/classify` p50 **57.6 ms** (0.81× python), p95 **57.8 ms**
+> - `/v1/embeddings` p50 **44.3 ms** (0.82× python)
+> - `/v1/text_embeddings` p50 **20.1 ms** (0.76× python)
+> - `/v1/classify_from_embeddings` p50 **19.9 ms** (0.92× python)
+> - VRAM resident **1542 MiB** post-load / **1668 MiB** post-warmup (CUDA
+>   graph captures), unchanged under burst
+> - Cold start **1.33 s**, reload after `/unload` **0.79 s**
+> - 400/400 concurrent classify pass clean
+> - All 4 parity scripts pass at the 0.999 floor
+>
+> ## Original mood-of-the-room (kept for context)
 >
 > User on 2026-05-09 after the Plan-A Q4_K_M attempt and the v5b/v6 custom
 > kernel exploration:
@@ -319,3 +336,69 @@ After targets 1, 3, 5:
   has Python deps but lacks CUDA libs. The bind-mount stitches them.
 
 Now go.
+
+---
+
+# Final outcomes — 2026-05-10
+
+## Receipts table
+
+| Lever | Status | Δ on `/v1/classify` | Notes |
+|---|---|---:|---|
+| **Target 1: parallel CUDA streams in `/v1/classify`** | ✅ shipped | 62.6 → **57.6 ms** (-5.0 ms, -8 %; 0.91× → 0.81× python) | Private `ggml_backend_t` per encoder + persistent worker thread + `text_worker_mutex` for concurrent-handler serialization. Per-encoder QKV-prep scratch (vision 9.6 MiB, text 27 MiB) allocated once at `load()`, captured CUDA graphs reference encoder-owned slabs. Less than the handoff's projected 49 ms ceiling because RTX 3060's 28 SMs saturate on vision matmuls — under concurrent execution vision goes 43→56 ms (+30 %) and text goes 20→48 ms (+140 %). Wall = max(under_contention) ≈ 56 ms is the floor on this GPU. |
+| **Target 4: `/unload` + `/v1/classify` SIGSEGV** | ✅ fixed | n/a (correctness) | Two root causes: (1) concurrent `graph_begin_hook` on parallel host threads racing on global `g_*_anchors` `unordered_map`s (clear+rebuild was UB) → moved to `thread_local`. (2) QKV-prep `g_qkv_scratch` was a process-global slab with grow-on-resize semantics, where realloc invalidated the pointer baked into already-captured CUDA graphs of OTHER shapes → moved to per-encoder pre-sized slab, registered via `siglip2_megakernel::set_active_qkv_scratch` thread-local. 3× (30 classifies + unload) cycle survives clean. |
+| **PersistentWorker race fix** | ✅ fixed | n/a (correctness) | `wait_done()` was waiting on `task == nullptr`, but the worker sets task to null at the START of the lambda execution → `wait_done()` could return mid-encode, handler reads uninitialized `text_ok`/`text_err`, returns 500 with empty error string under concurrent load (~3 % under 4-thread burst). Two fixes: separate `pending` flag set false only after `f()` returns, and handler holds `text_worker_mutex` across submit + wait_done so concurrent classify handlers don't clobber each other's submitted lambdas. **400/400 concurrent classify clean post-fix.** |
+| **Target 5b: vision stream priority HIGH** | ✅ shipped (default-on) | 57.9 → 57.6 ms (-0.3 ms p50, -0.8 ms p95) | `ggml_backend_cuda_init_with_priority(0, -1)` for the vision backend in dual-tower mode (text stays DEFAULT). Vision is the long pole; HIGH lets it hold SMs under text contention. Sub-noise on p50 but real on p95. Free win, no parity drift. Override via `SIGLIP2_VISION_STREAM_PRIORITY` env (-1/0/1 = HIGH/DEFAULT/LOW). |
+| **Target 3: cuBLASLt int8 GEMM swap** | ❌ aborted at gating | — | `bench/microbench_mmq` now has a `cuBLLt` column (per-row int8 + fp32 row-scale + cuBLASLt int32 IMMA + custom rescale). Receipts on RTX 3060: cuBLLt only wins at M=64 (text n=1: 0.75-0.93× across attn_qkv/attn_o/ffn_up); at M=320 (cfe shape, the primary target) it's tied or slower (1.00-1.25×); at M=729 (vision) it's tied or much slower (up to 1.43× at attn_o). And this is the SPEED upper bound — per-K-tile scales (the only form preserving Q8_0 per-32-element fidelity) require K=32 sub-GEMMs which would be slower. ggml-mma's stream-K already saturates Ampere SMs at our shapes. Code stays in tree as a future-reference receipt + re-check harness for sm89+ where per-tile scales are supported. |
+| **Target 5: native d=72 FA fast path** | ❌ aborted | — | Discovered ggml's tile FA kernel has a NATIVE `case 72` (`fattn-tile.cu:17-20`). Wired via `SIGLIP2_DISABLE_FA_PAD=1` env to drop the d=72→80 pad and route to the tile path. All 4 parity scripts pass on the env-on path. But A/B clean-GPU bench shows tile@72 SLOWER than mma@80+pad: vision 43.4 → **55.1 ms (+27 %)**, classify 56.8 → 70.5 ms (+24 %). Text barely moves (20.2 → 20.4 ms) — the regression concentrates on n_pos=729 vision where tile@72's `// TODO optimize kernel parameters for head sizes 40, 72, 80, 96, 112` (`fattn-tile.cuh:9`) bites hard. The custom MMA@72 kernel the original handoff sketched as the alternative would need to BEAT mma@80+pad cleanly to be worth shipping (best-case ~1 ms savings on cfe), plus 1 week of MMA surgery + parity risk. Not a viable swing on Ampere. Env-gated, default-off; useful as a re-test knob on sm89+. |
+| **Q4_K_M / K-quant production path** | ❌ failed (Plan A receipts above) | — | Code on branch for emergency opt-in; -670 MiB VRAM but fails 0.999 floor + 12 % slower. |
+| **Lever J: ffn_down padding** | ❌ parked (user decision) | — | -126 MiB available but cosine drops below 0.999. Floor is the working bar. |
+
+## What's NOT a target anymore (don't relitigate)
+
+- **Custom MMQ for M=320** — the cuBLASLt microbench above just disproved the
+  premise that the matmul layer has slack to find on RTX 3060 / Ampere. ggml-
+  mma's stream-K is at the SM-saturation ceiling at our shapes. Anything else
+  custom would need to BEAT ggml-mma without benefit of cuBLASLt's internal
+  algos — multi-week with parity risk and no headroom.
+- **Anything else FA-related** — d=72 is the only siglip2 head dim that doesn't
+  divide by 16, and the tile/MMA dispatch is already as good as it gets.
+- **VRAM at 0.999 floor** — Q4_K_M failed, Lever J parked, ffn_down already
+  Q8_0 in prod GGUF. If you ever lower the floor, Q4_K_M with imatrix
+  calibration is the next move (~1-2 day plumbing).
+
+## API gaps vs python kobbler-vision
+
+1:1 endpoint surface match (`/health`, `/unload`, `/v1/embeddings`,
+`/v1/text_embeddings`, `/v1/classify`, `/v1/classify_from_embeddings`).
+**One feature gap**: `return_last_hidden=true` returns 501 (python returns
+the full hidden state). **No kobbler caller exercises this flag** — checked
+across `~/dev/kobbler/api/src/skip_detect/vision.rs` (the only kobbler
+client). Functionally siglip2.cpp can replace kobbler-vision-1 today.
+
+## New env knobs introduced this session
+
+| Env | Default | Purpose |
+|---|---|---|
+| `SIGLIP2_VISION_STREAM_PRIORITY` | `-1` (HIGH) | Vision backend stream priority. `-1`/`0`/`1` = HIGH/DEFAULT/LOW. On RTX 3060 only HIGH actually changes anything (priority range [-5,0]). |
+| `SIGLIP2_DISABLE_FA_PAD` | unset (=off) | Skip d=72→80 zero-pad → route to tile FA. Slower on Ampere; useful as a re-test knob on sm89+. |
+| `SIGLIP2_VISION_MAX_PATCHES` | `729` | Worst-case vision QKV-prep scratch sizing. Larger requests fall back to ggml's split path (no fusion). |
+| `SIGLIP2_TEXT_MAX_BATCH` | `32` | Worst-case text n_batch for QKV-prep scratch. Larger fall back. |
+| `SIGLIP2_TIME_HANDLER` | unset | Per-stage timing for `/v1/classify` and `/unload`. |
+
+## Files touched this session
+
+- `src/siglip2_server.cpp` — split `encode_mutex` → `vision_mutex` + `text_mutex`; private backends in `load_model` (dual-tower); persistent text worker; `text_worker_mutex` serializing handler access; per-stage timing on `/v1/classify` + `/unload`.
+- `src/siglip2_vision.cpp` — `private_backend` flag wired through `load()`; per-encoder `qkv_scratch_buf`; HIGH stream priority default; env-gated FA pad disable.
+- `src/siglip2_text.cpp` — same private-backend + scratch-buf shape as vision.
+- `src/siglip2_vision.h` / `siglip2_text.h` — `load(path, private_backend)` signature.
+- `src/cuda/siglip2_megakernel.cu` — anchor maps + counters → `thread_local`; QKV scratch is now a thread-local `(dptr, cap)` pair set by `set_active_qkv_scratch`.
+- `src/cuda/siglip2_megakernel.h` / `_stub.cpp` — `set_active_qkv_scratch` / `clear_active_qkv_scratch` API.
+- `src/gguf_loader.{h,cpp}` — `init_separate_backend(name, err, stream_priority=0)` bypasses the singleton; passes priority to `ggml_backend_cuda_init_with_priority` when non-zero.
+- `bench/microbench_mmq.cpp` + `bench/microbench_cublaslt_helpers.{cu,cuh}` — cuBLASLt int8 column for the gating bench.
+- `CMakeLists.txt` — link `CUDA::cublasLt` to microbench.
+
+ggml submodule unchanged this session (still `4eec5550` on `dbrain/ggml@master`).
+
+Now go: `HANDOFF-prod.md`.
+
