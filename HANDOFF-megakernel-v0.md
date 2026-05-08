@@ -215,6 +215,304 @@ the post-FA cont kernel, eliminating the post-FA cont launch entirely. That
 needs a custom Q8_0 × F32 MMQ for o_proj (M=64 text, M=729 vision) — Phase B
 territory.
 
+## ✅ Phase A4 landed (2026-05-09) — batched text encode + hooks-in-batched-mode
+
+**The win:** `/v1/text_embeddings` and `/v1/classify_from_embeddings` were the
+last endpoints behind python (1.18× and 1.49× per the pre-A4 baseline). Root
+cause: cpp ran 5 sequential `encode_text` graph computes for 5 prompts, while
+python batched all 5 into a single forward pass. Even after A3 the 5× sequential
+graph build + launch chain dwarfed python's batched cuDNN path.
+
+**What landed:**
+
+1. **`TextEncoder::encode_batch`** (`src/siglip2_text.cpp`). Single graph
+   compute over (n_pos, n_batch). Activations 3D `(H, n_pos, n_batch)`; Q/K/V
+   views become 4D with the prompt-batch on `ne[3]`. ggml's
+   `ggml_flash_attn_ext` natively supports 4D batches (per `ggml.h:2452`:
+   `q: [n_embd_k, n_batch, n_head, ne3]`). For `n_batch=1` the call dispatches
+   to the existing `encode()` so single-prompt CLI / parity scripts are
+   untouched.
+
+2. **Server wires through `encode_text_batch`** for all three text endpoints
+   (`/v1/text_embeddings`, `/v1/classify`, `/v1/classify_from_embeddings`).
+   Tokenizes all prompts in one batch, runs one graph compute, fans the
+   batch-major output back into per-prompt response rows.
+
+3. **A0 + A2 hooks extended for 3D-contig** via a new
+   `is_2d_or_3d_f32_contiguous` predicate. Both fusions are pointwise across
+   positions, so flattening `flat_n_pos = ne[1]*ne[2]` is sufficient — no
+   kernel changes, just dispatcher param. The A0 anchor's shape gates were
+   tightened to also compare `ne[2]` across `x/norm/mul/add` to keep the
+   chain self-consistent. A2's `match_inner` got the same `ne[2]` consistency
+   gate, and the residual/outer checks compare flat positions.
+
+4. **A1 QKV-prep kernels learned the batch dim.** Both
+   `qkv_copy_to_scratch_kernel` and `fused_qkv_prep_kernel` now take
+   `blockIdx.z = batch index`, with per-batch source/dest pointer offsets.
+   Plan-builder: `qkv_add` accepts `ne[2] > 1` (now strictly contiguous-3D);
+   `q_pad / k_cast / v_cast` must have `ne[3] == n_batch`. Scratch buffer
+   sized to `3*H*n_pos*n_batch*4` — for the 5-prompt text path that's 4.4 MiB,
+   well below vision's 10 MiB ceiling, so no allocator regression.
+
+5. **A3 post-FA cont kernel** got the same batch-dim treatment. Plan-builder
+   gates ne[3] consistency between view/fa_out/cont and records `n_batch`.
+
+**Self-parity (A4 batched ON, n=5 prompts vs n=1 sequential, same C++ binary):**
+five test prompts cosine 0.99994–0.99996 across all of them. Drift is reduction-tree
+shuffle from the 5× wider matmul; well above the 0.999 floor.
+
+**HF parity (CLI scripts, single-prompt path) unchanged from A3:**
+- text 0.999779
+- vision 0.999907
+- image 0.999545
+- score 0.999987 / probs MAE 4.97e-7
+
+CLI runs through the unmodified `encode()`, so this confirms A4 didn't disturb
+the single-prompt path. **Server batched parity vs python**: 0.99927–0.99994
+across the 5 bench prompts, well above the 0.999 floor.
+
+**Bench A/B (clean GPU, only `kobbler-tts-qwen3-1` + `tts-qwen3-iter` co-resident,
+30 runs each, 2 reps; ratios are cpp/python p50):**
+
+|                                  | A3 head (sequential) | Phase A4 batched | python  |
+|----------------------------------|---------------------:|-----------------:|--------:|
+| `/v1/embeddings`                 | 45.5  (0.84×)        | 45.6   (**0.84×**) | 54.3  |
+| `/v1/text_embeddings`            | 31.5  (1.18×)        | 21.7   (**0.81×**) | 26.9  |
+| `/v1/classify`                   | 74.7  (1.07×)        | 65.2   (**0.93×**) | 70.4  |
+| `/v1/classify_from_embeddings`   | 31.7  (1.49×)        | 21.9   (**1.02×**) | 21.6  |
+
+Three of four endpoints now beat python clean. Cfe is measurement-noise tied
+(within 0.3-0.5 ms; python wins one rep, cpp the other).
+
+**Verbose plan-build counts confirm full hook coverage in batched mode:**
+```
+LN groups=55 (followers=110)
+QKV groups=27 (copy_anchors=27 split_anchors=27 followers=189)
+tail bias-residual=54 bias-gelu=27 (followers=81)
+post-FA cont=27
+total_nodes=958
+```
+Same as single-prompt, just one graph for all 5 prompts instead of five.
+
+**Kill switches:** existing per-fusion kill switches still work
+(`SIGLIP2_DISABLE_QKV_PREP`, `SIGLIP2_DISABLE_TAIL_FUSION`,
+`SIGLIP2_DISABLE_POST_FA_CONT`, `SIGLIP2_DISABLE_MEGAKERNEL`). Plus per-call
+timing under `SIGLIP2_TIME_ENCODE=1` and `SIGLIP2_TIME_HANDLER=1`.
+
+## Phase A4 — investigation: where is the remaining 22 ms?
+
+Per-call breakdown for steady-state cfe (`SIGLIP2_TIME_ENCODE=1`,
+`SIGLIP2_TIME_HANDLER=1`):
+
+```
+[cfe] parse=0.10 imgs=0.00 encode=22.0 score=0.01 respond=0.01 total=22.1 ms
+  └─ encode_batch: init=0.65 build=0.15 alloc=0.15 inputs=0.00 compute=21.6 get=0.04 reset=0.00
+```
+
+**99 % of cfe is `sched_graph_compute`.** All "overhead" — JSON parse, image-emb
+parse, tokenize, ggml setup, tensor sets, response — totals <1 ms.
+
+Cross-check: vision encode at n_pos=729 takes 49 ms; text batched at effective
+n_pos=320 takes 22 ms. Ratio 2.23× ≈ 729/320 = 2.28×. **Compute scales linearly
+with n_pos — we're at the GPU compute floor for ggml's matmul implementation
+on Q8_0 × F32 at these shapes.**
+
+The megakernel work eliminated CUDA driver/launch overhead. Python uses
+cuDNN/cuBLAS GEMMs that are hand-tuned for these shapes; ggml dispatches
+Q8_0×F32 via dequant+cuBLAS for M=320. **Both backends are now hitting
+roughly the same TensorCores and bandwidth ceiling.** That's why we tied,
+not embarrassed, on cfe.
+
+## ❌ Phase A4 dead end — n_pos trimming
+
+**Tested and proven dead.** SigLIP2 is hard-coded to expect padding to
+`max_position_embeddings=64`. Tokenized 5 typical prompts (≤6 tokens each)
+into `padding="longest"` (n_pos=7) and various smaller `max_length`s, then ran
+HF reference and compared to `max_length=64` on a real image:
+
+```
+config            top-1 prediction              correct-prompt prob
+max_length=64     "an abstract gradient"        0.401  ← REFERENCE
+max_length=32     "a photo of a cat"            0.000000
+max_length=16     "a colorful landscape"        0.000000
+max_length=12     "white noise on a TV"         0.000004
+max_length=8      "a TV showing static"         0.000011
+longest(=7)       "a TV showing static"         0.000006
+```
+
+**Confidence in the correct answer collapses by ≥5 orders of magnitude.** Not
+just rank scramble — the model's signal vanishes. SigLIP2 is trained with the
+pooler at position 63 (a pad-token's hidden state after 64-position self-attention),
+and that mechanism is load-bearing. Trimming pools at the EOS token after a
+shorter attention context, which is fundamentally a different computation.
+
+**Don't try this lever.** The optimization-vs-correctness boundary is at the
+graph layer (megakernel + CUDA graphs) and the kernel layer (custom MMQ),
+not at the input length.
+
+## Where the next big win lives
+
+The remaining theoretical ceiling on cpp text encode at n_pos=64×n_batch=5:
+
+| Lever                                  | Est. win on cfe | Status |
+|----------------------------------------|----------------:|--------|
+| Phase A4 batched + hooks (this lap)    | 31.7 → 21.9 ms (-9.8) | landed |
+| **CUDA graph capture** (Phase B)       | ~3-5 ms more    | gallocr path 3 (handoff parent doc) |
+| Custom MMQ for M=320 shapes            | ~5-7 ms more    | multi-week, parity risk per rewrite |
+| Q4_K_M weights + rank-parity bench     | bandwidth half + VRAM 1504→~750 MiB | needs rank-parity test infra first |
+
+**The honest bottom line:** A4 is the realistic ceiling at the graph-fusion
+layer. Going below ~17 ms cfe needs a different layer of attack (either kernel-
+level MMQ work or CUDA graph capture, both multi-day projects).
+
+## Phase B — handoff for the CUDA-graph-capture lap
+
+**Mood from the user 2026-05-09:** they want 2× embarrassment of python on
+classify_from_embeddings. A4 got us to "tied," not "embarrassed." CUDA graphs
+is the named next move. Trim n_pos is dead (don't relitigate; see the dead-end
+section above and `feedback_no_hf_publish` adjacent in memory if you find
+yourself measuring rank parity again — the rank-parity test recipe lives in
+`/home/dbrain/.claude/projects/-home-dbrain-dev-kobbler/memory/project_siglip2_n_pos_trim_dead.md`).
+
+### What's already known (read these first, save your context window)
+
+1. **Parent doc `HANDOFF.md` "Dead ends and partial attempts" section.** Path 1
+   (shared sched) and Path 2 (per-entry sched) both crash on call 2 with
+   illegal memory access. **Path 3 (cache build, refresh gf each call) was
+   never tried — that's the recommended starting experiment.**
+2. **`-DGGML_CUDA_GRAPHS=ON` was tried with the flag flipped at the cmake
+   level — no-op with a slight regression** because `ggml_cuda_graph_get_key`
+   keys on `cgraph->nodes[0]`, which is a freshly-allocated tensor pointer
+   every call. Won't kick in until tensor pointers are stable across calls.
+   Path 3 fixes that.
+3. **The diagnosis from the parent doc:** `ggml_backend_sched_split_graph`
+   frees `sched->ctx` and creates fresh split-copy tensors at same context
+   offsets each call. Per-entry isolation doesn't help; the gallocr's
+   `node_allocs[]` is keyed by position in `sched->graph`, and on call 2
+   position N may point to a fresh split-copy tensor whose `data == NULL`,
+   triggering an allocation that overlaps a cached tensor.
+
+### What changed in A4 that affects this
+
+**Cache keys now need `n_batch`.** The text path runs three different graphs
+in production: `encode()` for n_batch=1 (CLI parity, single-prompt server
+calls), `encode_batch(n_batch=N)` for the prompt-list endpoints. Vision is
+still single-encode. Suggested cache keying:
+
+- text encode: `(n_pos, n_batch)` — typically `(64, 1)` and `(64, 5)`, but
+  callers may hit other batch sizes. LRU with 3-4 entries is plenty.
+- vision encode: `(n_patches_h, n_patches_w)` (unchanged from parent doc
+  guidance).
+
+**4D Q/K/V views are new.** A4 made the QKV views 4D in `encode_batch` (for
+the prompt-batch on `ne[3]`). `ggml_cuda_graph_update_required`'s
+`memcmp(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor))` check is bytewise
+on the full `ggml_tensor` struct — fresh tensors will still differ even
+on identical shapes. Path 3 has to keep the cached tensor objects alive,
+not just their data pointers, for ggml-cuda's own warmup-graph logic to
+match across calls.
+
+### Where to start — Path 3 in concrete steps
+
+Pull the build and `gf` cache into `TextEncoder::State` (and a similar
+`VisionEncoder::State`):
+
+```cpp
+struct CacheEntry {
+    int n_pos;
+    int n_batch;
+    std::vector<uint8_t> arena;
+    ggml_context *       ctx = nullptr;
+    ggml_cgraph *        gf  = nullptr;
+    ggml_tensor *        tok_inp;
+    ggml_tensor *        pos_inp;
+    ggml_tensor *        pool_idx;
+    ggml_tensor *        proj_out;
+    // ...other named inputs/outputs you set or get
+};
+std::vector<CacheEntry> cache_;  // small LRU
+```
+
+On encode call:
+1. Look up by `(n_pos, n_batch)`. On miss, build the entry: `ggml_init` with
+   the same arena pattern, build the full graph (call `build_block_batched`
+   per layer), keep `ctx + gf + named tensors` alive in the entry.
+2. On hit, do **not** rebuild. Keep `ctx`/`gf` alive. Call
+   `ggml_graph_clear(gf)` then `ggml_build_forward_expand(gf, proj_out)`
+   from the cached output tensor — this re-runs the topo expansion fresh
+   while reusing the construction work (the `build_block_batched` traversal
+   is the expensive bit; expansion is cheap).
+3. Then `ggml_backend_sched_alloc_graph` / set inputs / compute / get
+   output / **don't ggml_free**. `ggml_backend_sched_reset` is still fine.
+
+The hypothesis: re-running `build_forward_expand` puts fresh node references
+into `gf`, but reusing the *same* `ctx` keeps the underlying tensor objects
+alive at stable pointers across calls — gallocr's offset table stays valid,
+and `ggml_cuda_graph_update_required`'s memcmp matches.
+
+Once Path 3 stops crashing on call 2:
+1. Verify parity scripts still pass (single-prompt + batched server smoke).
+2. Flip `-DGGML_CUDA_GRAPHS=ON` in `CMakeLists.txt`. Don't change anything
+   else — ggml-cuda's warmup path takes over after two calls per cached
+   shape.
+3. Bench. Expected: text encode drops ~3-5 ms (from ~22 ms to ~17-19 ms).
+   That puts cfe at **~0.85× python** = real embarrassment.
+
+### Risks to watch for
+
+- **Per-shape activation VRAM.** Each cached entry holds its own activation
+  buffer (after `sched_alloc_graph`). Estimate ~50-100 MiB per cached shape.
+  For 4 cached entries that's <500 MiB — fine on the 12 GB GPU but worth
+  measuring. The user's standing rule: full-tower VRAM is the metric; A4
+  current is 1504 MiB post-load.
+- **Megakernel hooks have to keep firing.** The plan-builder runs at
+  `siglip2_graph_begin_hook`. If the cached `gf` keeps the same node objects
+  call-to-call, the plan builds once and then... actually does it rebuild?
+  Check this: `siglip2_graph_begin_hook` clears and re-populates
+  `g_*_anchors` on every call. With cached graph, the node pointers are
+  stable, so the plan rebuild is idempotent — should be fine, but worth
+  verifying with `SIGLIP2_MEGAKERNEL_VERBOSE=1` after wiring.
+- **Self-parity matters more than HF parity here.** Path 3 doesn't change
+  math; if it crashes-or-corrupts, the bug is in graph reuse, not parity.
+  Use the n=5-batched-vs-n=1-sequential cosine check (≥0.99994 today)
+  as your fast smoke; if that drops, you've corrupted state.
+- **The ggml-cuda warmup is bytewise-strict.** It memcmp's the entire
+  `ggml_tensor` struct. Even if Path 3 stabilizes pointers, the `data`
+  field may differ between alloc and reset. If the warmup never converges,
+  read `ggml/src/ggml-cuda/ggml-cuda.cu` around `ggml_cuda_graph_update_required`
+  and consider patching the comparison to skip `data` (or whichever field
+  cycles).
+
+### What "done" looks like
+
+- Path 3 holds for 1000+ encode calls without crash.
+- All four parity scripts PASS (no regression on single-prompt).
+- Server-batched parity (5-prompt vs 1-prompt sequential cosine) ≥ 0.99994.
+- `-DGGML_CUDA_GRAPHS=ON` shows the warmup-graph path firing
+  (instrument `ggml-cuda.cu`'s warmup path with a printf if you want
+  verification).
+- Bench: text 22 → ≤19 ms. Cfe 22 → ≤19 ms. Real ≤0.9× ratios across the
+  board, not just text/classify. Add a Phase B section here mirroring A4's
+  receipts table.
+
+If Path 3 also crashes (despite the diagnosis suggesting it shouldn't),
+fall back to Path 1 from the parent doc: fork ggml's gallocr to add an
+explicit re-bind entry point that doesn't skip on `data != NULL`. ~50 LOC
+in `src/ggml-alloc.c`. Cleaner unlock but bigger blast radius.
+
+### Files you'll touch
+
+- `src/siglip2_text.cpp` — extract the build-the-graph logic from `encode`
+  and `encode_batch` into a function that takes a `CacheEntry &`. Both
+  encoders dispatch to this.
+- `src/siglip2_text.h` — `TextEncoder::State` gets a small LRU member.
+- `src/siglip2_vision.cpp` / `.h` — same pattern. (Vision is bigger ROI per
+  cache hit since 49 ms encode → ~3-5 ms launch overhead saved.)
+- Possibly `ggml/src/ggml-cuda/ggml-cuda.cu` if the warmup-graph memcmp
+  needs relaxing.
+- `CMakeLists.txt` — flip `-DGGML_CUDA_GRAPHS=ON` once Path 3 is stable.
+- `HANDOFF-megakernel-v0.md` — add Phase B receipts when shipping.
+
 ## Phase A2 — gallocr trap take 2 (read before extending)
 
 The first cut of A2 had no `is_blk_bias` gate — it matched every

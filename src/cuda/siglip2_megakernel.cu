@@ -158,8 +158,9 @@ void launch_fused_layernorm_affine(
 namespace {
 
 // (1) Scratch-fill: scratch[i] = mm[i] + bias[i % triH].
-//     Grid: (n_pos, ceil(triH / 256), 1). Block: (256, 1, 1). One thread per
-//     element of the (triH, n_pos) F32 output.
+//     Grid: (n_pos, ceil(triH / 256), n_batch). Block: (256, 1, 1).
+//     The batch dim is independent; per-batch the layout is exactly the
+//     unbatched (3*H, n_pos) F32 contiguous block.
 __global__ void qkv_copy_to_scratch_kernel(
         const float * __restrict__ mm,
         const float * __restrict__ bias,
@@ -169,7 +170,9 @@ __global__ void qkv_copy_to_scratch_kernel(
     const int p   = blockIdx.x;
     const int tid = blockIdx.y * blockDim.x + threadIdx.x;
     if (tid >= triH) return;
-    const int idx = p * triH + tid;
+    const int b   = blockIdx.z;
+    const int per_batch = triH * n_pos;
+    const int idx = b * per_batch + p * triH + tid;
     scratch[idx] = mm[idx] + bias[tid];
 }
 
@@ -189,27 +192,35 @@ __global__ void fused_qkv_prep_kernel(
     const int hc = blockIdx.y;          // 0..3*n_head - 1
     const int c  = hc / n_head;         // 0=Q, 1=K, 2=V
     const int h  = hc - c * n_head;
+    const int b  = blockIdx.z;
+
+    const int qkv_per_batch = 3 * H * n_pos;
+    const int dst_per_batch = d_pad * n_pos * n_head;
+    const float * __restrict__ qkv_b   = qkv    + b * qkv_per_batch;
+    float       * __restrict__ q_pad_b = q_pad  + b * dst_per_batch;
+    __half      * __restrict__ k_cast_b = k_cast + b * dst_per_batch;
+    __half      * __restrict__ v_cast_b = v_cast + b * dst_per_batch;
 
     const int dst_idx = h * d_pad * n_pos + p * d_pad + d;
 
     if (d < d_head) {
         const int src_idx = p * 3 * H + c * H + h * d_head + d;
-        const float v = qkv[src_idx];
+        const float v = qkv_b[src_idx];
         if (c == 0) {
-            q_pad[dst_idx] = v;
+            q_pad_b[dst_idx] = v;
         } else if (c == 1) {
-            k_cast[dst_idx] = __float2half(v);
+            k_cast_b[dst_idx] = __float2half(v);
         } else {
-            v_cast[dst_idx] = __float2half(v);
+            v_cast_b[dst_idx] = __float2half(v);
         }
     } else {
         // Pad slot — exact zero (no denormals).
         if (c == 0) {
-            q_pad[dst_idx] = 0.0f;
+            q_pad_b[dst_idx] = 0.0f;
         } else if (c == 1) {
-            k_cast[dst_idx] = __ushort_as_half((unsigned short) 0);
+            k_cast_b[dst_idx] = __ushort_as_half((unsigned short) 0);
         } else {
-            v_cast[dst_idx] = __ushort_as_half((unsigned short) 0);
+            v_cast_b[dst_idx] = __ushort_as_half((unsigned short) 0);
         }
     }
 }
@@ -222,9 +233,12 @@ void launch_qkv_copy_to_scratch(
         float       * scratch,
         int           triH,
         int           n_pos,
+        int           n_batch,
         cudaStream_t  stream) {
     constexpr int TPB = 256;
-    const dim3 grid((unsigned) n_pos, (unsigned) ((triH + TPB - 1) / TPB), 1);
+    const dim3 grid((unsigned) n_pos,
+                    (unsigned) ((triH + TPB - 1) / TPB),
+                    (unsigned) n_batch);
     const dim3 block((unsigned) TPB, 1, 1);
     qkv_copy_to_scratch_kernel<<<grid, block, 0, stream>>>(mm, bias, scratch, triH, n_pos);
 }
@@ -239,8 +253,9 @@ void launch_fused_qkv_prep(
         int           n_head,
         int           d_head,
         int           d_pad,
+        int           n_batch,
         cudaStream_t  stream) {
-    const dim3 grid((unsigned) n_pos, (unsigned) (3 * n_head), 1);
+    const dim3 grid((unsigned) n_pos, (unsigned) (3 * n_head), (unsigned) n_batch);
     const dim3 block((unsigned) d_pad, 1, 1);
     fused_qkv_prep_kernel<<<grid, block, 0, stream>>>(
         qkv, q_pad,
@@ -334,9 +349,10 @@ void launch_fused_bias_gelu(
 
 namespace {
 
-// Read FA output[(d, h, p)] = fa_out[d + h*d_pad + p*d_pad*n_head]
-// Write y[(d, h, p)]         = y[d + h*d_head + p*d_head*n_head]
-// One thread per output element. Block over d_head, grid over (n_pos, n_head).
+// Per batch b in [0, n_batch):
+//   src[(d, h, p, b)] = fa_out[b * (d_pad*n_head*n_pos) + d + h*d_pad + p*d_pad*n_head]
+//   dst[(d, h, p, b)] = y     [b * (d_head*n_head*n_pos) + d + h*d_head + p*d_head*n_head]
+// One thread per output element. Block over d_head, grid over (n_pos, n_head, n_batch).
 __global__ void fused_post_fa_cont_kernel(
         const float * __restrict__ fa_out,
         float       * __restrict__ y,
@@ -348,10 +364,13 @@ __global__ void fused_post_fa_cont_kernel(
     if (d >= d_head) return;
     const int h = blockIdx.y;
     const int p = blockIdx.x;
+    const int b = blockIdx.z;
     const int H = d_head * n_head;
 
-    const int src_idx = d + h * d_pad + p * d_pad * n_head;
-    const int dst_idx = d + h * d_head + p * H;
+    const int src_per_batch = d_pad  * n_head * n_pos;
+    const int dst_per_batch = d_head * n_head * n_pos;
+    const int src_idx = b * src_per_batch + d + h * d_pad + p * d_pad * n_head;
+    const int dst_idx = b * dst_per_batch + d + h * d_head + p * H;
     y[dst_idx] = fa_out[src_idx];
 }
 
@@ -364,8 +383,9 @@ void launch_fused_post_fa_cont(
         int           d_pad,
         int           n_head,
         int           n_pos,
+        int           n_batch,
         cudaStream_t  stream) {
-    const dim3 grid((unsigned) n_pos, (unsigned) n_head, 1);
+    const dim3 grid((unsigned) n_pos, (unsigned) n_head, (unsigned) n_batch);
     const dim3 block((unsigned) d_head, 1, 1);
     fused_post_fa_cont_kernel<<<grid, block, 0, stream>>>(
         fa_out, y, d_head, d_pad, n_head, n_pos);
@@ -455,10 +475,11 @@ struct BiasGeluEntry {
 // pattern with shape-specialized indexing.
 struct PostFaContEntry {
     const ggml_tensor * fa_out_node = nullptr;  // FA output (the 3D view's parent)
-    int d_head = 0;
-    int d_pad  = 0;
-    int n_head = 0;
-    int n_pos  = 0;
+    int d_head  = 0;
+    int d_pad   = 0;
+    int n_head  = 0;
+    int n_pos   = 0;
+    int n_batch = 1;
 };
 
 struct QkvPrepEntry {
@@ -471,11 +492,12 @@ struct QkvPrepEntry {
     const ggml_tensor * k_cast_dst  = nullptr;
     const ggml_tensor * v_cast_dst  = nullptr;
     const ggml_tensor * split_anchor = nullptr; // anchor 2 — last of {q_pad,k_cast,v_cast}
-    int H      = 0;
-    int n_pos  = 0;
-    int n_head = 0;
-    int d_head = 0;
-    int d_pad  = 0;
+    int H       = 0;
+    int n_pos   = 0;
+    int n_head  = 0;
+    int d_head  = 0;
+    int d_pad   = 0;
+    int n_batch = 1;
 };
 
 // Persistent device scratch — sized for the hottest (3*H, n_pos) F32 shape.
@@ -566,6 +588,25 @@ bool is_2d_f32_contiguous(const ggml_tensor * t) {
     return true;
 }
 
+// Permissive variant for pointwise-across-positions kernels (LN, bias+residual,
+// bias+gelu) that don't care about per-batch boundaries — they iterate flat
+// across all positions × batches as long as memory is contiguous along H.
+// Allows ne[2]>1 (the prompt-batch dim from encode_batch). Treats the effective
+// row count as ne[1]*ne[2].
+bool is_2d_or_3d_f32_contiguous(const ggml_tensor * t) {
+    if (!t) return false;
+    if (t->type != GGML_TYPE_F32) return false;
+    if (t->ne[3] != 1) return false;
+    if (t->nb[0] != ggml_type_size(t->type)) return false;
+    if (t->nb[1] != t->nb[0] * t->ne[0])     return false;
+    if (t->ne[2] > 1 && t->nb[2] != t->nb[1] * t->ne[1]) return false;
+    return true;
+}
+
+int64_t flat_n_pos(const ggml_tensor * t) {
+    return t->ne[1] * t->ne[2];
+}
+
 bool is_1d_f32_affine(const ggml_tensor * t, int64_t H) {
     if (!t) return false;
     if (t->type != GGML_TYPE_F32) return false;
@@ -595,10 +636,13 @@ void build_ln_plan(const ggml_cgraph * cgraph) {
         ggml_tensor * x    = norm->src[0];
         if (!x)                       continue;
 
-        if (!is_2d_f32_contiguous(x))                  continue;
-        if (!is_2d_f32_contiguous(norm))               continue;
-        if (!is_2d_f32_contiguous(mul))                continue;
-        if (!is_2d_f32_contiguous(add))                continue;
+        if (!is_2d_or_3d_f32_contiguous(x))                  continue;
+        if (!is_2d_or_3d_f32_contiguous(norm))               continue;
+        if (!is_2d_or_3d_f32_contiguous(mul))                continue;
+        if (!is_2d_or_3d_f32_contiguous(add))                continue;
+        if (x->ne[1]    != norm->ne[1] || x->ne[2] != norm->ne[2]) continue;
+        if (norm->ne[1] != mul->ne[1]  || norm->ne[2] != mul->ne[2]) continue;
+        if (mul->ne[1]  != add->ne[1]  || mul->ne[2] != add->ne[2])  continue;
         if (!is_1d_f32_affine(w, x->ne[0]))            continue;
         if (!is_1d_f32_affine(b, x->ne[0]))            continue;
 
@@ -620,7 +664,7 @@ void build_ln_plan(const ggml_cgraph * cgraph) {
         e.norm_node = norm;
         e.mul_node  = mul;
         e.H         = (int) x->ne[0];
-        e.n_pos     = (int) x->ne[1];
+        e.n_pos     = (int) flat_n_pos(x);
         e.eps       = eps;
 
         g_ln_anchors[add] = e;
@@ -648,15 +692,19 @@ void build_qkv_prep_plan(const ggml_cgraph * cgraph) {
         if (!w || !w->name[0]) continue;
         if (!std::strstr(w->name, "attn_qkv.weight")) continue;
 
-        // qkv bias-add. ne=(3*H, n_pos), F32 contiguous.
+        // qkv bias-add. ne=(3*H, n_pos[, n_batch]), F32 contiguous.
+        // n_batch>1 is the encode_batch path (text). For 2D we keep n_batch=1.
         if (add->type != GGML_TYPE_F32) continue;
-        if (add->ne[2] != 1 || add->ne[3] != 1) continue;
+        if (add->ne[3] != 1) continue;
         if (add->nb[0] != ggml_type_size(add->type)) continue;
+        if (add->nb[1] != add->nb[0] * add->ne[0]) continue;
+        if (add->ne[2] > 1 && add->nb[2] != add->nb[1] * add->ne[1]) continue;
 
         const int64_t triH = add->ne[0];
         if (triH % 3 != 0) continue;
         const int H_block = (int) (triH / 3);
         const int n_pos   = (int) add->ne[1];
+        const int n_batch = (int) add->ne[2];
         const size_t f32_size = sizeof(float);
 
         // Find the 3 view children of this add by walking forward.
@@ -718,6 +766,10 @@ void build_qkv_prep_plan(const ggml_cgraph * cgraph) {
         if (q_pad->ne[1] != n_pos || q_pad->ne[2] != n_head) continue;
         if (k_cast->ne[0] != d_pad || k_cast->ne[1] != n_pos || k_cast->ne[2] != n_head) continue;
         if (v_cast->ne[0] != d_pad || v_cast->ne[1] != n_pos || v_cast->ne[2] != n_head) continue;
+        // The split-pad-cast destinations carry the prompt batch on ne[3].
+        if (q_pad->ne[3]  != n_batch) continue;
+        if (k_cast->ne[3] != n_batch) continue;
+        if (v_cast->ne[3] != n_batch) continue;
 
         // Split anchor = whichever of {q_pad, k_cast, v_cast} appears
         // LAST in topo order. By that point all the upstream cont/pad/cast
@@ -757,6 +809,7 @@ void build_qkv_prep_plan(const ggml_cgraph * cgraph) {
         e.n_head       = n_head;
         e.d_head       = d_head;
         e.d_pad        = d_pad;
+        e.n_batch      = n_batch;
         g_qkv_copy_anchors[add]            = e;
         g_qkv_split_anchors[split_anchor]  = e;
 
@@ -793,7 +846,8 @@ void build_tail_fusion_plan(const ggml_cgraph * cgraph) {
     g_tail_followers.clear();
     if (!cgraph || !g_tail_enabled) return;
 
-    auto is_2d_f32_contig = is_2d_f32_contiguous;
+    // Permissive predicate (allows 3D-contig from encode_batch).
+    auto is_2d_f32_contig = is_2d_or_3d_f32_contiguous;
 
     auto is_1d_f32_bias = [](const ggml_tensor * t, int64_t H) -> bool {
         if (!t) return false;
@@ -823,9 +877,11 @@ void build_tail_fusion_plan(const ggml_cgraph * cgraph) {
         if (a->op != GGML_OP_MUL_MAT) return false;
         if (!is_2d_f32_contig(a))      return false;
         if (!is_2d_f32_contig(inner_add)) return false;
-        if (a->ne[0] != inner_add->ne[0] || a->ne[1] != inner_add->ne[1]) return false;
+        if (a->ne[0] != inner_add->ne[0] ||
+            a->ne[1] != inner_add->ne[1] ||
+            a->ne[2] != inner_add->ne[2]) return false;
         H     = (int) a->ne[0];
-        n_pos = (int) a->ne[1];
+        n_pos = (int) flat_n_pos(a);
         if (!is_1d_f32_bias(b, H)) return false;
         mm   = a;
         bias = b;
@@ -859,7 +915,7 @@ void build_tail_fusion_plan(const ggml_cgraph * cgraph) {
         if (i < 1) continue;
         ggml_tensor * prev = ggml_graph_node((ggml_cgraph *) cgraph, i - 1);
 
-        // Pattern P1: outer = ADD(inner_add, residual_2d)
+        // Pattern P1: outer = ADD(inner_add, residual)
         if (outer->op == GGML_OP_ADD) {
             const ggml_tensor * inner    = outer->src[0];
             const ggml_tensor * residual = outer->src[1];
@@ -870,8 +926,8 @@ void build_tail_fusion_plan(const ggml_cgraph * cgraph) {
             if (!is_blk_bias(bias))                        continue;
             if (!is_2d_f32_contig(residual))               continue;
             if (!is_2d_f32_contig(outer))                  continue;
-            if (residual->ne[0] != H || residual->ne[1] != n_pos) continue;
-            if (outer->ne[0]    != H || outer->ne[1]    != n_pos) continue;
+            if (residual->ne[0] != H || (int) flat_n_pos(residual) != n_pos) continue;
+            if (outer->ne[0]    != H || (int) flat_n_pos(outer)    != n_pos) continue;
             if (is_already_claimed(outer)) continue;
             if (is_already_claimed(inner)) continue;
 
@@ -897,7 +953,7 @@ void build_tail_fusion_plan(const ggml_cgraph * cgraph) {
             if (inner != prev)                            continue;  // safety gate
             if (!is_blk_bias(bias))                       continue;
             if (!is_2d_f32_contig(outer))                continue;
-            if (outer->ne[0] != H || outer->ne[1] != n_pos) continue;
+            if (outer->ne[0] != H || (int) flat_n_pos(outer) != n_pos) continue;
             if (is_already_claimed(outer)) continue;
             if (is_already_claimed(inner)) continue;
 
@@ -947,26 +1003,32 @@ void build_post_fa_cont_plan(const ggml_cgraph * cgraph) {
         const ggml_tensor * fa_out = view->src[0];
         if (!fa_out || fa_out->op != GGML_OP_FLASH_ATTN_EXT) continue;
 
-        // Must slice only d-axis (axis 0); other axes preserved.
+        // Must slice only d-axis (axis 0); other axes preserved. The optional
+        // batch dim sits on ne[3] (encode_batch path); n_batch=1 in the unbatched
+        // text/vision case.
         const int d_head = (int) view->ne[0];
         const int n_head = (int) view->ne[1];
         const int n_pos  = (int) view->ne[2];
         const int d_pad  = (int) fa_out->ne[0];
+        const int n_batch = (int) view->ne[3];
         if (d_head <= 0 || d_head >= d_pad)         continue;
         if (n_head != (int) fa_out->ne[1])          continue;
         if (n_pos  != (int) fa_out->ne[2])          continue;
-        if (view->ne[3] != 1 || fa_out->ne[3] != 1) continue;
+        if (n_batch != (int) fa_out->ne[3])         continue;
 
         // View must inherit fa_out's strides (we rely on the (d_pad, n_head,
-        // n_pos) physical layout).
+        // n_pos[, n_batch]) physical layout).
         if (view->nb[1] != fa_out->nb[1])           continue;
         if (view->nb[2] != fa_out->nb[2])           continue;
+        if (n_batch > 1 && view->nb[3] != fa_out->nb[3]) continue;
 
-        // cont dst must be contiguous (d_head, n_head, n_pos) F32.
-        if (cont->ne[0] != d_head || cont->ne[1] != n_head || cont->ne[2] != n_pos) continue;
+        // cont dst must be contiguous (d_head, n_head, n_pos[, n_batch]) F32.
+        if (cont->ne[0] != d_head  || cont->ne[1] != n_head ||
+            cont->ne[2] != n_pos   || cont->ne[3] != n_batch) continue;
         if (cont->nb[0] != ggml_type_size(GGML_TYPE_F32))                           continue;
         if (cont->nb[1] != cont->nb[0] * cont->ne[0])                               continue;
         if (cont->nb[2] != cont->nb[1] * cont->ne[1])                               continue;
+        if (n_batch > 1 && cont->nb[3] != cont->nb[2] * cont->ne[2])                continue;
 
         // Skip if already claimed by another fusion (defensive — these patterns
         // shouldn't overlap with LN/QKV/tail anchors but cheap to guard).
@@ -985,6 +1047,7 @@ void build_post_fa_cont_plan(const ggml_cgraph * cgraph) {
         e.d_pad       = d_pad;
         e.n_head      = n_head;
         e.n_pos       = n_pos;
+        e.n_batch     = n_batch;
         g_post_fa_anchors[cont] = e;
         ++g_post_fa_groups_built;
     }
@@ -1058,10 +1121,12 @@ extern "C" bool siglip2_op_hook(
             if (!mm || !bias) return false;
 
             const int triH = 3 * e.H;
-            const size_t need_b = (size_t) triH * (size_t) e.n_pos * sizeof(float);
+            const size_t need_b = (size_t) triH * (size_t) e.n_pos
+                                * (size_t) e.n_batch * sizeof(float);
             if (!g_qkv_scratch.ensure(need_b)) return false;
 
-            launch_qkv_copy_to_scratch(mm, bias, g_qkv_scratch.d_ptr, triH, e.n_pos, stream);
+            launch_qkv_copy_to_scratch(mm, bias, g_qkv_scratch.d_ptr,
+                                       triH, e.n_pos, e.n_batch, stream);
             ++g_qkv_anchor_fires;
             return true;
         }
@@ -1076,7 +1141,7 @@ extern "C" bool siglip2_op_hook(
 
             launch_fused_qkv_prep(g_qkv_scratch.d_ptr, q_pad, k_cast, v_cast,
                                   e.H, e.n_pos, e.n_head, e.d_head, e.d_pad,
-                                  stream);
+                                  e.n_batch, stream);
             ++g_qkv_anchor_fires;
             return true;
         }
@@ -1092,7 +1157,7 @@ extern "C" bool siglip2_op_hook(
             const float * fa_out = e.fa_out_node ? (const float *) e.fa_out_node->data : nullptr;
             float       * y      = (float *) dst->data;
             if (!fa_out || !y) return false;
-            launch_fused_post_fa_cont(fa_out, y, e.d_head, e.d_pad, e.n_head, e.n_pos, stream);
+            launch_fused_post_fa_cont(fa_out, y, e.d_head, e.d_pad, e.n_head, e.n_pos, e.n_batch, stream);
             ++g_post_fa_anchor_fires;
             return true;
         }

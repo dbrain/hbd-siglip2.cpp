@@ -235,27 +235,52 @@ bool encode_image(
     return true;
 }
 
-bool encode_text(
-    ServerState &       st,
-    const std::string & prompt,
-    std::vector<float> & out_emb,
-    std::string &       err) {
-    // Match HuggingFace Siglip2Processor's text branch exactly:
-    //   - pad input_ids to max_position_embeddings (64) with pad_token_id
-    //   - DO NOT pass attention_mask to the model. Siglip2Processor returns
-    //     only input_ids for text-only calls; the live kobbler-vision service
-    //     does `model.text_model(**inputs)` without a mask, so pad-token-0
-    //     embeddings flow through attention as real tokens. Passing a mask
-    //     would diverge by ~0.24 cosine on short prompts.
-    std::vector<int32_t> ids, mask;
+// Batched text encode.
+//
+// Tokenization matches HuggingFace Siglip2Processor: pad each prompt to
+// max_position_embeddings (64) with pad_token_id, no attention_mask passed
+// to the model. The live kobbler-vision service does `model.text_model(**inputs)`
+// with input_ids only; pad-token-0 embeddings flow through attention as
+// real tokens. Passing a mask would diverge by ~0.24 cosine on short prompts.
+//
+// All prompts run in ONE text-encoder graph compute (n_pos, n_batch) instead
+// of N sequential graphs. The win is launch-overhead amortization plus better
+// matmul utilization at higher M.
+bool encode_text_batch(
+    ServerState &                       st,
+    const std::vector<std::string> &    prompts,
+    std::vector<std::vector<float>> &   out_embs,
+    std::string &                       err) {
+    out_embs.clear();
+    if (prompts.empty()) return true;
+
+    const int n_batch = (int)prompts.size();
     const int max_pos = st.text->config().max_position_embeddings;
-    if (!st.tokenizer->encode(prompt, max_pos, ids, mask)) {
-        err = "tokenize: " + st.tokenizer->last_error();
+    const int proj    = st.text->config().projection_size;
+
+    std::vector<int32_t> ids_flat((size_t)max_pos * (size_t)n_batch);
+    for (int b = 0; b < n_batch; ++b) {
+        std::vector<int32_t> ids, mask;
+        if (!st.tokenizer->encode(prompts[b], max_pos, ids, mask)) {
+            err = "tokenize: " + st.tokenizer->last_error();
+            return false;
+        }
+        std::memcpy(ids_flat.data() + (size_t)b * (size_t)max_pos,
+                    ids.data(), sizeof(int32_t) * (size_t)max_pos);
+    }
+
+    std::vector<float> flat;
+    if (!st.text->encode_batch(ids_flat.data(), max_pos, n_batch,
+                               /*attention_mask=*/nullptr, flat)) {
+        err = "text encode_batch: " + st.text->last_error();
         return false;
     }
-    if (!st.text->encode(ids.data(), max_pos, /*attention_mask=*/nullptr, out_emb)) {
-        err = "text encode: " + st.text->last_error();
-        return false;
+
+    out_embs.assign(n_batch, std::vector<float>((size_t)proj));
+    for (int b = 0; b < n_batch; ++b) {
+        std::memcpy(out_embs[b].data(),
+                    flat.data() + (size_t)b * (size_t)proj,
+                    sizeof(float) * (size_t)proj);
     }
     return true;
 }
@@ -421,20 +446,15 @@ int main(int argc, char ** argv) {
         if (prompts.empty()) { send_json(res, 400, json{{"error", "No prompts provided"}}); return; }
 
         std::vector<std::vector<float>> embs;
-        embs.reserve(prompts.size());
         std::string err;
         {
             std::lock_guard<std::mutex> lock(st.encode_mutex);
-            for (const auto & p : prompts) {
-                std::vector<float> emb;
-                if (!encode_text(st, p, emb, err)) {
-                    send_json(res, 500, json{{"error", err}});
-                    return;
-                }
-                l2_normalize(emb);
-                embs.emplace_back(std::move(emb));
+            if (!encode_text_batch(st, prompts, embs, err)) {
+                send_json(res, 500, json{{"error", err}});
+                return;
             }
         }
+        for (auto & e : embs) l2_normalize(e);
         send_json(res, 200, json{{"embeddings", embs}});
     });
 
@@ -470,12 +490,12 @@ int main(int argc, char ** argv) {
                 }
                 std::memcpy(img_buf.data() + (size_t)i * H, emb.data(), sizeof(float) * H);
             }
+            std::vector<std::vector<float>> txt_embs;
+            if (!encode_text_batch(st, prompts, txt_embs, err)) {
+                send_json(res, 500, json{{"error", err}}); return;
+            }
             for (int j = 0; j < n_txt; ++j) {
-                std::vector<float> emb;
-                if (!encode_text(st, prompts[j], emb, err)) {
-                    send_json(res, 500, json{{"error", err}}); return;
-                }
-                std::memcpy(txt_buf.data() + (size_t)j * H, emb.data(), sizeof(float) * H);
+                std::memcpy(txt_buf.data() + (size_t)j * H, txt_embs[j].data(), sizeof(float) * H);
             }
         }
         std::vector<float> logits((size_t)n_img * n_txt);
@@ -499,12 +519,17 @@ int main(int argc, char ** argv) {
 
     // -- /v1/classify_from_embeddings (JSON body)
     srv.Post("/v1/classify_from_embeddings", [&](const httplib::Request & req, httplib::Response & res) {
+        const bool timing = std::getenv("SIGLIP2_TIME_HANDLER") != nullptr;
+        auto tnow = []{ return std::chrono::steady_clock::now(); };
+        auto tms  = [](auto a, auto b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        auto t0 = tnow();
+
         if (!ensure(res)) return;
         // image embeddings are supplied by the client, but we still need text + score.
         if (!require_text(res)) return;
         if (!st.vision) {
-            // /classify_from_embeddings doesn't need vision graph, but score_params
-            // are gated on full load — refuse cleanly so the error is unambiguous.
             send_json(res, 503, json{{"error", "classify requires the model loaded with both towers"}});
             return;
         }
@@ -519,6 +544,7 @@ int main(int argc, char ** argv) {
             send_json(res, 400, json{{"error", "JSON must contain image_embeddings and prompts"}});
             return;
         }
+        auto t_parse = tnow();
         const bool return_logits = body.value("return_logits", false);
 
         const int H = (int)st.vision->config().hidden_size;
@@ -536,25 +562,30 @@ int main(int argc, char ** argv) {
             }
             for (int c = 0; c < H; ++c) img_buf[(size_t)i * H + c] = row[c].get<float>();
         }
+        auto t_imgs = tnow();
 
         std::vector<float> txt_buf((size_t)n_txt * H);
         std::string err;
         {
             std::lock_guard<std::mutex> lock(st.encode_mutex);
+            std::vector<std::string> prompts(n_txt);
+            for (int j = 0; j < n_txt; ++j) prompts[j] = prompts_json[j].get<std::string>();
+            std::vector<std::vector<float>> txt_embs;
+            if (!encode_text_batch(st, prompts, txt_embs, err)) {
+                send_json(res, 500, json{{"error", err}}); return;
+            }
             for (int j = 0; j < n_txt; ++j) {
-                std::vector<float> emb;
-                if (!encode_text(st, prompts_json[j].get<std::string>(), emb, err)) {
-                    send_json(res, 500, json{{"error", err}}); return;
-                }
-                std::memcpy(txt_buf.data() + (size_t)j * H, emb.data(), sizeof(float) * H);
+                std::memcpy(txt_buf.data() + (size_t)j * H, txt_embs[j].data(), sizeof(float) * H);
             }
         }
+        auto t_encode = tnow();
 
         std::vector<float> logits((size_t)n_img * n_txt);
         std::vector<float> probs((size_t)n_img * n_txt);
         siglip2::score_image_text(
             img_buf.data(), n_img, txt_buf.data(), n_txt, H,
             st.score_params, logits.data(), probs.data());
+        auto t_score = tnow();
 
         std::vector<std::vector<float>> scores_out(n_img, std::vector<float>(n_txt));
         std::vector<std::vector<float>> logits_out(n_img, std::vector<float>(n_txt));
@@ -566,6 +597,14 @@ int main(int argc, char ** argv) {
         json out = {{"scores", scores_out}};
         if (return_logits) out["logits"] = logits_out;
         send_json(res, 200, out);
+        auto t_done = tnow();
+
+        if (timing) {
+            std::fprintf(stderr,
+                "[cfe] parse=%.2f imgs=%.2f encode=%.2f score=%.2f respond=%.2f total=%.2f ms\n",
+                tms(t0, t_parse), tms(t_parse, t_imgs), tms(t_imgs, t_encode),
+                tms(t_encode, t_score), tms(t_score, t_done), tms(t0, t_done));
+        }
     });
 
     fprintf(stderr, "[siglip2-server] listening on %s:%d (model=%s)\n",

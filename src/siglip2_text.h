@@ -46,6 +46,24 @@ public:
         const int32_t *      attention_mask, // may be nullptr
         std::vector<float> & out_embedding);
 
+    // Batched encode: all n_batch prompts share the same n_tokens (caller pads
+    // each to the same length, typically max_position_embeddings). token_ids
+    // is a flat array of n_tokens*n_batch I32 values, batch-major. attention_mask
+    // currently must be nullptr (matches HF — no mask used).
+    //
+    // out_embeddings is resized to projection_size*n_batch on success, batch-major
+    // (batch i embedding starts at offset i*projection_size).
+    //
+    // Hits a single graph compute for all n_batch prompts — amortizes launch
+    // overhead. For n_batch==1, dispatches to encode() to keep the megakernel
+    // hooks firing on that path.
+    bool encode_batch(
+        const int32_t *      token_ids,
+        int                  n_tokens,
+        int                  n_batch,
+        const int32_t *      attention_mask,
+        std::vector<float> & out_embeddings);
+
 private:
     TextConfig  config_;
     std::string error_msg_;

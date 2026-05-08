@@ -9,6 +9,7 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -139,6 +140,93 @@ ggml_tensor * build_block(
         KQV = ggml_mul_mat(ctx, V, KQ);
         KQV = ggml_permute(ctx, KQV, 0, 2, 1, 3);
         KQV = ggml_cont_2d(ctx, KQV, d_head * n_head, n_pos);
+    }
+
+    cur = ggml_add(ctx, ggml_mul_mat(ctx, layer.o_w, KQV), layer.o_b);
+    cur = ggml_add(ctx, cur, residual);
+    residual = cur;
+
+    cur = build_layernorm(ctx, cur, layer.ln2_w, layer.ln2_b, ln_eps);
+    cur = ggml_add(ctx, ggml_mul_mat(ctx, layer.up_w, cur), layer.up_b);
+    cur = ggml_gelu(ctx, cur);
+    cur = ggml_add(ctx, ggml_mul_mat(ctx, layer.down_w, cur), layer.down_b);
+
+    cur = ggml_add(ctx, cur, residual);
+    return cur;
+}
+
+// Batched variant of build_block. All activations are 3D (H, n_pos, n_batch);
+// QKV views and FA inputs are 4D with ne[3]=n_batch. For n_batch=1 the memory
+// layout is byte-identical to the unbatched path (the trailing 1-dim doesn't
+// add bytes), but the explicit 4D-ness lets ggml's CUDA backend dispatch the
+// batched ops correctly when n_batch>1.
+//
+// Megakernel hooks (A0/A1/A2/A3) gate on ne[2]==1 && ne[3]==1 — so they
+// cleanly fall back to ggml's stock dispatch when n_batch>1, but still fire
+// when n_batch==1. The parity guarantee is the same as the unbatched path.
+ggml_tensor * build_block_batched(
+    ggml_context * ctx,
+    const Block &  layer,
+    ggml_tensor *  inp,            // (H, n_pos, n_batch)
+    ggml_tensor *  fa_mask_f16,    // (n_pos, n_pos, 1, n_batch) F16, may be nullptr
+    int            n_pos,
+    int            n_batch,
+    int            d_head,
+    int            n_head,
+    float          ln_eps,
+    float          kq_scale,
+    bool           use_fa) {
+    const int    H  = d_head * n_head;
+    const size_t es = sizeof(float);
+
+    ggml_tensor * residual = inp;
+    ggml_tensor * cur = build_layernorm(ctx, inp, layer.ln1_w, layer.ln1_b, ln_eps);
+
+    ggml_tensor * qkv = ggml_add(ctx, ggml_mul_mat(ctx, layer.qkv_w, cur), layer.qkv_b);
+    // qkv: (3*H, n_pos, n_batch). Q/K/V are 4D strided views into it.
+    ggml_tensor * Q = ggml_view_4d(ctx, qkv, d_head, n_head, n_pos, n_batch,
+        d_head * es, 3 * H * es, 3 * H * (size_t)n_pos * es, 0 * H * es);
+    ggml_tensor * K = ggml_view_4d(ctx, qkv, d_head, n_head, n_pos, n_batch,
+        d_head * es, 3 * H * es, 3 * H * (size_t)n_pos * es, 1 * H * es);
+    ggml_tensor * V = ggml_view_4d(ctx, qkv, d_head, n_head, n_pos, n_batch,
+        d_head * es, 3 * H * es, 3 * H * (size_t)n_pos * es, 2 * H * es);
+
+    ggml_tensor * KQV;
+    if (use_fa) {
+        constexpr int FA_TC_ALIGN = 16;
+        const int d_pad = (d_head + FA_TC_ALIGN - 1) & ~(FA_TC_ALIGN - 1);
+        const int pad   = d_pad - d_head;
+
+        Q = ggml_permute(ctx, Q, 0, 2, 1, 3);
+        K = ggml_permute(ctx, K, 0, 2, 1, 3);
+        V = ggml_permute(ctx, V, 0, 2, 1, 3);
+        if (pad > 0) {
+            Q = ggml_pad(ctx, ggml_cont(ctx, Q), pad, 0, 0, 0);
+            K = ggml_pad(ctx, ggml_cont(ctx, K), pad, 0, 0, 0);
+            V = ggml_pad(ctx, ggml_cont(ctx, V), pad, 0, 0, 0);
+        }
+        ggml_tensor * K_f16 = ggml_cast(ctx, K, GGML_TYPE_F16);
+        ggml_tensor * V_f16 = ggml_cast(ctx, V, GGML_TYPE_F16);
+        KQV = ggml_flash_attn_ext(ctx, Q, K_f16, V_f16, fa_mask_f16, kq_scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(KQV, GGML_PREC_F32);
+        // FA result shape (per ggml.h): [n_embd_v, n_head, n_batch_q, ne3]
+        // = (d_pad, n_head, n_pos, n_batch). Slice ne[0] back to d_head.
+        if (pad > 0) {
+            KQV = ggml_view_4d(ctx, KQV, d_head, n_head, n_pos, n_batch,
+                KQV->nb[1], KQV->nb[2], KQV->nb[3], 0);
+            KQV = ggml_cont(ctx, KQV);
+        }
+        KQV = ggml_reshape_3d(ctx, KQV, d_head * n_head, n_pos, n_batch);
+    } else {
+        Q = ggml_permute(ctx, Q, 0, 2, 1, 3);                  // (d_head, n_pos, n_head, n_batch)
+        K = ggml_permute(ctx, K, 0, 2, 1, 3);                  // same
+        V = ggml_cont(ctx, ggml_permute(ctx, V, 1, 2, 0, 3));  // (n_pos, d_head, n_head, n_batch)
+        ggml_tensor * KQ = ggml_mul_mat(ctx, K, Q);            // (n_pos, n_pos, n_head, n_batch)
+        KQ = ggml_soft_max_ext(ctx, KQ, /*mask=*/nullptr, kq_scale, 0.0f);
+        KQV = ggml_mul_mat(ctx, V, KQ);                        // (d_head, n_pos, n_head, n_batch)
+        KQV = ggml_permute(ctx, KQV, 0, 2, 1, 3);              // (d_head, n_head, n_pos, n_batch)
+        KQV = ggml_cont(ctx, KQV);
+        KQV = ggml_reshape_3d(ctx, KQV, d_head * n_head, n_pos, n_batch);
     }
 
     cur = ggml_add(ctx, ggml_mul_mat(ctx, layer.o_w, KQV), layer.o_b);
@@ -470,6 +558,169 @@ bool TextEncoder::encode(
 
     ggml_backend_sched_reset(state_->sched);
     ggml_free(ctx);
+    return true;
+}
+
+bool TextEncoder::encode_batch(
+    const int32_t *      token_ids,
+    int                  n_tokens,
+    int                  n_batch,
+    const int32_t *      attention_mask,
+    std::vector<float> & out_embeddings) {
+    if (!state_) {
+        error_msg_ = "TextEncoder not loaded";
+        return false;
+    }
+    if (n_batch <= 0) {
+        error_msg_ = "n_batch must be > 0";
+        return false;
+    }
+    // Single-prompt: dispatch to encode() so megakernel hooks fire.
+    if (n_batch == 1) {
+        return encode(token_ids, n_tokens, attention_mask, out_embeddings);
+    }
+    if (n_tokens <= 0 || n_tokens > config_.max_position_embeddings) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "n_tokens must be in (0, %d], got %d",
+            config_.max_position_embeddings, n_tokens);
+        error_msg_ = buf;
+        return false;
+    }
+    // attention_mask in batched mode would require constructing a (n_pos, n_pos, 1, n_batch)
+    // F32 mask and casting to F16 for FA. The live deployment matches HF — no
+    // mask passed — so for now we reject the masked path and document.
+    if (attention_mask != nullptr) {
+        error_msg_ = "encode_batch with attention_mask is not implemented (HF path doesn't use one)";
+        return false;
+    }
+
+    static const bool timing = std::getenv("SIGLIP2_TIME_ENCODE") != nullptr;
+    auto tnow = []{ return std::chrono::steady_clock::now(); };
+    auto tms  = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    auto t0 = tnow();
+
+    const int   H        = config_.hidden_size;
+    const int   n_head   = config_.num_attention_heads;
+    const int   d_head   = H / n_head;
+    const int   n_pos    = n_tokens;
+    const float kq_scale = 1.0f / std::sqrt((float)d_head);
+    const int   proj     = config_.projection_size;
+
+    const int    max_nodes = 2048;
+    const size_t arena_sz  =
+        ggml_tensor_overhead() * 4096 +
+        ggml_graph_overhead_custom(max_nodes, false);
+    std::vector<uint8_t> arena(arena_sz);
+    struct ggml_init_params gp = {
+        /*.mem_size   =*/ arena.size(),
+        /*.mem_buffer =*/ arena.data(),
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(gp);
+    if (!ctx) {
+        error_msg_ = "ggml_init for graph_ctx failed";
+        return false;
+    }
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, max_nodes, false);
+    auto t_init = tnow();
+
+    // ggml_get_rows asserts source->ne[2] == idx->ne[1] (batched-table semantic),
+    // which doesn't fit our shared-vocab/shared-pos-table lookups. Flatten the
+    // indices to 1D, then reshape the result to 3D.
+    ggml_tensor * tok_inp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t)n_pos * n_batch);
+    ggml_set_name(tok_inp, "token_ids");
+    ggml_set_input(tok_inp);
+
+    ggml_tensor * pos_inp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t)n_pos * n_batch);
+    ggml_set_name(pos_inp, "position_ids");
+    ggml_set_input(pos_inp);
+
+    static const bool use_fa = std::getenv("SIGLIP2_DISABLE_FA") == nullptr;
+
+    // tok_emb / pos_emb: (H, n_pos*n_batch) → reshape_3d → (H, n_pos, n_batch)
+    ggml_tensor * x = ggml_get_rows(ctx, state_->token_embd, tok_inp);
+    ggml_tensor * p = ggml_get_rows(ctx, state_->position_embd, pos_inp);
+    x = ggml_reshape_3d(ctx, x, H, n_pos, n_batch);
+    p = ggml_reshape_3d(ctx, p, H, n_pos, n_batch);
+    x = ggml_add(ctx, x, p);
+
+    for (int il = 0; il < config_.num_hidden_layers; ++il) {
+        x = build_block_batched(ctx, state_->blocks[il], x, /*fa_mask_f16=*/nullptr,
+                                n_pos, n_batch, d_head, n_head,
+                                config_.layer_norm_eps, kq_scale, use_fa);
+    }
+
+    x = build_layernorm(ctx, x, state_->final_ln_w, state_->final_ln_b, config_.layer_norm_eps);
+
+    // Pool last position per batch. pool_idx is (1, n_batch); ggml_get_rows on
+    // a 3D tensor with a 2D index yields (H, 1, n_batch) — each batch picks
+    // its own row from its own slice along ne[2].
+    ggml_tensor * pool_idx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_batch);
+    ggml_set_name(pool_idx, "pool_idx");
+    ggml_set_input(pool_idx);
+    ggml_tensor * pooled = ggml_get_rows(ctx, ggml_cont(ctx, x), pool_idx);
+    pooled = ggml_reshape_2d(ctx, pooled, H, n_batch);
+
+    ggml_tensor * proj_out = ggml_add(ctx, ggml_mul_mat(ctx, state_->head_w, pooled), state_->head_b);
+    ggml_set_name(proj_out, "text_embed_batch");
+    ggml_set_output(proj_out);
+    ggml_build_forward_expand(gf, proj_out);
+    auto t_build = tnow();
+
+    if (!ggml_backend_sched_alloc_graph(state_->sched, gf)) {
+        ggml_free(ctx);
+        error_msg_ = "ggml_backend_sched_alloc_graph failed";
+        return false;
+    }
+    auto t_alloc = tnow();
+
+    ggml_backend_tensor_set(tok_inp, token_ids, 0,
+                            sizeof(int32_t) * (size_t)n_pos * (size_t)n_batch);
+    {
+        // pos_inp is 1D (n_pos*n_batch); each batch's slice is 0..n_pos-1.
+        std::vector<int32_t> pos((size_t)n_pos * (size_t)n_batch);
+        for (int b = 0; b < n_batch; ++b) {
+            for (int i = 0; i < n_pos; ++i) {
+                pos[(size_t)b * (size_t)n_pos + (size_t)i] = i;
+            }
+        }
+        ggml_backend_tensor_set(pos_inp, pos.data(), 0,
+                                sizeof(int32_t) * (size_t)n_pos * (size_t)n_batch);
+    }
+    {
+        std::vector<int32_t> idx(n_batch, (int32_t)(n_pos - 1));
+        ggml_backend_tensor_set(pool_idx, idx.data(), 0, sizeof(int32_t) * (size_t)n_batch);
+    }
+    auto t_inputs = tnow();
+
+    enum ggml_status st = ggml_backend_sched_graph_compute(state_->sched, gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        ggml_backend_sched_reset(state_->sched);
+        ggml_free(ctx);
+        error_msg_ = std::string("graph compute failed status=") + std::to_string((int)st);
+        return false;
+    }
+    auto t_compute = tnow();
+
+    out_embeddings.assign((size_t)proj * (size_t)n_batch, 0.0f);
+    ggml_backend_tensor_get(proj_out, out_embeddings.data(), 0,
+                            sizeof(float) * (size_t)proj * (size_t)n_batch);
+    auto t_get = tnow();
+
+    ggml_backend_sched_reset(state_->sched);
+    ggml_free(ctx);
+    auto t_done = tnow();
+
+    if (timing) {
+        std::fprintf(stderr,
+            "[encode_batch n_batch=%d n_pos=%d] init=%.2f build=%.2f alloc=%.2f inputs=%.2f compute=%.2f get=%.2f reset=%.2f total=%.2f ms\n",
+            n_batch, n_pos,
+            tms(t0, t_init), tms(t_init, t_build), tms(t_build, t_alloc),
+            tms(t_alloc, t_inputs), tms(t_inputs, t_compute),
+            tms(t_compute, t_get), tms(t_get, t_done), tms(t0, t_done));
+    }
     return true;
 }
 
