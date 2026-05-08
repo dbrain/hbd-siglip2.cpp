@@ -167,6 +167,54 @@ target ≤1.0× ratio called out in the original A scoping.
 
 Kill switch: `SIGLIP2_DISABLE_TAIL_FUSION=1`. Default ON in the install hook.
 
+## ✅ Phase A3 landed (2026-05-09) — post-FA cont specialization
+
+**One specialized kernel replaces ggml's generic `cpy_f32_f32` for the post-FA
+cont in `fa_attn_pad_slice` when `d_pad != d_head`.** Same launch count (1 per
+block, 27 text / 28 vision incl. probe head), but the kernel is shape-specialised
+(input strided over `d_pad`, output contiguous `(d_head, n_head, n_pos)`) so the
+launch path skips ggml-cuda's generic-cpy dispatch overhead. Anchor on the cont
+node; the upstream view is metadata-only (no follower needed).
+
+Plan-builder gates: source must be `FLASH_ATTN_EXT`, view must be a 3D F32
+zero-offset slice off the d-axis only (other axes preserved), and cont must be
+contiguous F32 with matching `(d_head, n_head, n_pos)` shape. Defensive
+`is_already_claimed` check guards against overlap with LN/QKV/tail anchors —
+in practice they don't overlap, but cheap to keep honest.
+
+**Self-parity (A3 ON vs OFF, same C++ binary):** all four parity scripts have
+**bit-identical** first-8 outputs and HF cosine unchanged: vision **0.999944**,
+text **0.999756**, image-1920×1080→729 **0.999523**, score **0.999986** /
+probs MAE **5.6e-7**. The kernel is functionally identical to ggml's cpy
+(same memory pattern, same per-store rounding); the only difference is dispatch
+path, so any drift is reduction-tree noise — and we measure none.
+
+**Bench A/B (clean GPU, only `tts-qwen3-iter` co-resident, 30 runs each, 2 reps):**
+
+  - `/v1/embeddings`:               46.45 → 45.75 ms (**−1.5 %**)
+  - `/v1/text_embeddings`:          32.20 → 31.75 ms (**−1.4 %**)
+  - `/v1/classify`:                 76.15 → 75.05 ms (**−1.4 %**)
+  - `/v1/classify_from_embeddings`: 32.40 → 32.05 ms (**−1.1 %**)
+
+Modest, but free given the scaffolding. The win is purely launch-path overhead
+(generic ggml-cuda cpy dispatch is heavier than a single-shape specialised
+kernel), not launch count — counts are unchanged. ROI math: 27-28 launches per
+encode × ~150-200 ns saved per launch ≈ 4-6 µs / encode total. The actual ms
+delta is larger than that math predicts; either the generic-cpy dispatch is
+heavier than estimated, or downstream ops benefit from slightly tighter CUDA
+stream packing. Either way the receipts are real and reproducible.
+
+Kill switch: `SIGLIP2_DISABLE_POST_FA_CONT=1`. Default ON in the install hook.
+
+**Cumulative since pre-megakernel (A0+A1+A2+A3):** text 38.3 → 31.75 ms (**−17 %**),
+embeddings 58.2 → 45.75 ms (**−21 %**), classify 94.1 → 75.05 ms (**−20 %**),
+classify_from_embeddings 38.5 → 32.05 ms (**−17 %**).
+
+**The natural extension** (not landed): swallow the o_proj's mul_mat read into
+the post-FA cont kernel, eliminating the post-FA cont launch entirely. That
+needs a custom Q8_0 × F32 MMQ for o_proj (M=64 text, M=729 vision) — Phase B
+territory.
+
 ## Phase A2 — gallocr trap take 2 (read before extending)
 
 The first cut of A2 had no `is_blk_bias` gate — it matched every

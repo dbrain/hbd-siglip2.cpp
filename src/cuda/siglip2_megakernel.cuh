@@ -132,4 +132,27 @@ void launch_fused_bias_gelu(
     int            n_pos,
     cudaStream_t   stream);
 
+// Phase A3: post-FA cont fusion. After flash_attn_ext, fa_attn_pad_slice
+// shrinks d-axis from d_pad → d_head and rebuilds a contiguous (H, n_pos)
+// tensor (logically (d_head, n_head, n_pos) packed contiguous) for the o_proj
+// mul_mat input. The current path is `view_3d(strided slice off d_pad tail) →
+// ggml_cont` — one launch dispatched through ggml's generic cpy_f32_f32_kernel
+// which carries arbitrary-stride parameter dispatch overhead. This kernel is
+// the same operation specialized for these shapes (uniform contiguous output,
+// uniform strided input over d_pad) so the per-launch path is shorter.
+//
+// One-launch operation; doesn't reduce kernel count vs ggml's cont, but the
+// specialized path avoids ggml-cuda's generic-cpy dispatch tax and sets up
+// the scaffolding for fusing the o_proj reads into this kernel later.
+//
+// Grid: (n_pos, n_head). Block: (d_head). One thread per output element.
+void launch_fused_post_fa_cont(
+    const float *  fa_out,      // (d_pad, n_head, n_pos)  F32 strided FA output
+    float *        y,           // (d_head*n_head, n_pos)  F32 contiguous
+    int            d_head,
+    int            d_pad,
+    int            n_head,
+    int            n_pos,
+    cudaStream_t   stream);
+
 }  // namespace siglip2_megakernel

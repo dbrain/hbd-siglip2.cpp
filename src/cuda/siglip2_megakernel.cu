@@ -329,6 +329,49 @@ void launch_fused_bias_gelu(
 }
 
 // ----------------------------------------------------------------------------
+// Phase A3: post-FA cont fusion (strided slice + contiguous copy)
+// ----------------------------------------------------------------------------
+
+namespace {
+
+// Read FA output[(d, h, p)] = fa_out[d + h*d_pad + p*d_pad*n_head]
+// Write y[(d, h, p)]         = y[d + h*d_head + p*d_head*n_head]
+// One thread per output element. Block over d_head, grid over (n_pos, n_head).
+__global__ void fused_post_fa_cont_kernel(
+        const float * __restrict__ fa_out,
+        float       * __restrict__ y,
+        const int                  d_head,
+        const int                  d_pad,
+        const int                  n_head,
+        const int                  n_pos) {
+    const int d = threadIdx.x;
+    if (d >= d_head) return;
+    const int h = blockIdx.y;
+    const int p = blockIdx.x;
+    const int H = d_head * n_head;
+
+    const int src_idx = d + h * d_pad + p * d_pad * n_head;
+    const int dst_idx = d + h * d_head + p * H;
+    y[dst_idx] = fa_out[src_idx];
+}
+
+}  // namespace
+
+void launch_fused_post_fa_cont(
+        const float * fa_out,
+        float       * y,
+        int           d_head,
+        int           d_pad,
+        int           n_head,
+        int           n_pos,
+        cudaStream_t  stream) {
+    const dim3 grid((unsigned) n_pos, (unsigned) n_head, 1);
+    const dim3 block((unsigned) d_head, 1, 1);
+    fused_post_fa_cont_kernel<<<grid, block, 0, stream>>>(
+        fa_out, y, d_head, d_pad, n_head, n_pos);
+}
+
+// ----------------------------------------------------------------------------
 // Plan: (norm → mul-with-weight → add-with-bias) chain detection
 // ----------------------------------------------------------------------------
 //
@@ -405,6 +448,19 @@ struct BiasGeluEntry {
     int n_pos = 0;
 };
 
+// Phase A3: post-FA cont. Anchor on the cont node; follower = nothing (the
+// upstream view is metadata-only, no compute). The cont currently reads a
+// strided 3D F32 view (slicing d_head off the d_pad tail of FA's output) and
+// writes contiguous (d_head, n_head, n_pos). Our kernel does the same memory
+// pattern with shape-specialized indexing.
+struct PostFaContEntry {
+    const ggml_tensor * fa_out_node = nullptr;  // FA output (the 3D view's parent)
+    int d_head = 0;
+    int d_pad  = 0;
+    int n_head = 0;
+    int n_pos  = 0;
+};
+
 struct QkvPrepEntry {
     // Copy-to-scratch fields (used at qkv_add anchor)
     const ggml_tensor * mm_node     = nullptr;  // mul_mat output (F32, 3*H × n_pos)
@@ -461,6 +517,8 @@ std::unordered_map<const ggml_tensor *, BiasResidualEntry> g_br_anchors;
 std::unordered_map<const ggml_tensor *, BiasGeluEntry>     g_bg_anchors;
 std::unordered_set<const ggml_tensor *>                    g_tail_followers;
 
+std::unordered_map<const ggml_tensor *, PostFaContEntry>   g_post_fa_anchors;
+
 bool     g_enabled              = true;
 // QKV-prep — 2-kernel form: anchor 1 on qkv_add copies mm+bias into a
 // persistent device-side scratch buffer (replacing the bias-add); anchor 2
@@ -480,6 +538,11 @@ bool     g_qkv_enabled          = true;
 // GELU formula matches ggml_cuda_op_gelu_single). Kill switch:
 // SIGLIP2_DISABLE_TAIL_FUSION=1.
 bool     g_tail_enabled         = true;
+// Phase A3 — post-FA cont. Strided 3D view (slicing d_pad → d_head off FA's
+// output) + ggml_cont collapsed into one specialized kernel. Same launch
+// count (1) as the existing cont, but skips ggml-cuda's generic-cpy dispatch
+// path. Default ON; SIGLIP2_DISABLE_POST_FA_CONT=1 to fall back to ggml's cpy.
+bool     g_post_fa_enabled      = true;
 uint64_t g_ln_groups_built      = 0;
 uint64_t g_ln_anchor_fires      = 0;
 uint64_t g_ln_follower_fires    = 0;
@@ -490,6 +553,8 @@ uint64_t g_br_groups_built      = 0;
 uint64_t g_bg_groups_built      = 0;
 uint64_t g_tail_anchor_fires    = 0;
 uint64_t g_tail_follower_fires  = 0;
+uint64_t g_post_fa_groups_built = 0;
+uint64_t g_post_fa_anchor_fires = 0;
 int      g_log_budget           = 0;
 
 bool is_2d_f32_contiguous(const ggml_tensor * t) {
@@ -850,6 +915,81 @@ void build_tail_fusion_plan(const ggml_cgraph * cgraph) {
     }
 }
 
+// Phase A3 plan-builder. Walks every CONT node looking for the post-FA pattern:
+//
+//   fa_out  = FLASH_ATTN_EXT(...)                       ne=(d_pad, n_head, n_pos)
+//   view    = VIEW_3D(fa_out, ne=(d_head, n_head, n_pos), nb=fa_out->nb, off=0)
+//   cont    = CONT(view)                                ne=(d_head, n_head, n_pos)
+//
+// The view must:
+//   * Be a 3D non-contiguous view of fa_out (offset 0, ne[0]<d_pad, n_head and
+//     n_pos preserved, strides inherited from fa_out).
+// The cont's dst is the input to a downstream reshape_2d → o_proj mul_mat;
+// nothing else reads from view, so anchoring on cont is safe.
+//
+// Defensive: skip if cont's dst already claimed by another fusion. The view
+// is metadata (no compute) so it's neither anchor nor follower.
+void build_post_fa_cont_plan(const ggml_cgraph * cgraph) {
+    g_post_fa_anchors.clear();
+    if (!cgraph || !g_post_fa_enabled) return;
+
+    const int n = ggml_graph_n_nodes((ggml_cgraph *) cgraph);
+    for (int i = 0; i < n; ++i) {
+        ggml_tensor * cont = ggml_graph_node((ggml_cgraph *) cgraph, i);
+        if (!cont || cont->op != GGML_OP_CONT) continue;
+        if (cont->type != GGML_TYPE_F32)       continue;
+
+        const ggml_tensor * view = cont->src[0];
+        if (!view || view->op != GGML_OP_VIEW) continue;
+        if (view->type != GGML_TYPE_F32)       continue;
+        if (view->view_offs != 0)              continue;
+
+        const ggml_tensor * fa_out = view->src[0];
+        if (!fa_out || fa_out->op != GGML_OP_FLASH_ATTN_EXT) continue;
+
+        // Must slice only d-axis (axis 0); other axes preserved.
+        const int d_head = (int) view->ne[0];
+        const int n_head = (int) view->ne[1];
+        const int n_pos  = (int) view->ne[2];
+        const int d_pad  = (int) fa_out->ne[0];
+        if (d_head <= 0 || d_head >= d_pad)         continue;
+        if (n_head != (int) fa_out->ne[1])          continue;
+        if (n_pos  != (int) fa_out->ne[2])          continue;
+        if (view->ne[3] != 1 || fa_out->ne[3] != 1) continue;
+
+        // View must inherit fa_out's strides (we rely on the (d_pad, n_head,
+        // n_pos) physical layout).
+        if (view->nb[1] != fa_out->nb[1])           continue;
+        if (view->nb[2] != fa_out->nb[2])           continue;
+
+        // cont dst must be contiguous (d_head, n_head, n_pos) F32.
+        if (cont->ne[0] != d_head || cont->ne[1] != n_head || cont->ne[2] != n_pos) continue;
+        if (cont->nb[0] != ggml_type_size(GGML_TYPE_F32))                           continue;
+        if (cont->nb[1] != cont->nb[0] * cont->ne[0])                               continue;
+        if (cont->nb[2] != cont->nb[1] * cont->ne[1])                               continue;
+
+        // Skip if already claimed by another fusion (defensive — these patterns
+        // shouldn't overlap with LN/QKV/tail anchors but cheap to guard).
+        if (g_ln_anchors.count(cont)        || g_ln_followers.count(cont) ||
+            g_qkv_copy_anchors.count(cont)  || g_qkv_split_anchors.count(cont) ||
+            g_qkv_followers.count(cont)     ||
+            g_br_anchors.count(cont)        || g_bg_anchors.count(cont) ||
+            g_tail_followers.count(cont)    ||
+            g_post_fa_anchors.count(cont)) {
+            continue;
+        }
+
+        PostFaContEntry e;
+        e.fa_out_node = fa_out;
+        e.d_head      = d_head;
+        e.d_pad       = d_pad;
+        e.n_head      = n_head;
+        e.n_pos       = n_pos;
+        g_post_fa_anchors[cont] = e;
+        ++g_post_fa_groups_built;
+    }
+}
+
 }  // namespace
 
 // ----------------------------------------------------------------------------
@@ -863,6 +1003,7 @@ extern "C" void siglip2_graph_begin_hook(
     build_ln_plan(cgraph);
     build_qkv_prep_plan(cgraph);
     build_tail_fusion_plan(cgraph);
+    build_post_fa_cont_plan(cgraph);
 
     if (g_log_budget > 0) {
         const int n = cgraph ? ggml_graph_n_nodes((ggml_cgraph *) cgraph) : 0;
@@ -870,13 +1011,14 @@ extern "C" void siglip2_graph_begin_hook(
             "[siglip2-megakernel] graph_begin: LN groups=%zu (followers=%zu) "
             "QKV groups=%zu (copy_anchors=%zu split_anchors=%zu followers=%zu) "
             "tail bias-residual=%zu bias-gelu=%zu (followers=%zu) "
-            "total_nodes=%d\n",
+            "post-FA cont=%zu  total_nodes=%d\n",
             g_ln_anchors.size(),  g_ln_followers.size(),
             g_qkv_groups_built,
             g_qkv_copy_anchors.size(), g_qkv_split_anchors.size(),
             g_qkv_followers.size(),
             g_br_anchors.size(),  g_bg_anchors.size(),
             g_tail_followers.size(),
+            g_post_fa_anchors.size(),
             n);
         --g_log_budget;
     }
@@ -936,6 +1078,22 @@ extern "C" bool siglip2_op_hook(
                                   e.H, e.n_pos, e.n_head, e.d_head, e.d_pad,
                                   stream);
             ++g_qkv_anchor_fires;
+            return true;
+        }
+    }
+
+    // Phase A3 — post-FA cont anchor. Anchored on the cont; reads the strided
+    // FA output and writes contiguous (d_head, n_head, n_pos) to dst->data.
+    // Same launch count as ggml's cont; specialized indexing only.
+    if (g_post_fa_enabled) {
+        auto it_pf = g_post_fa_anchors.find(dst);
+        if (it_pf != g_post_fa_anchors.end()) {
+            const PostFaContEntry & e = it_pf->second;
+            const float * fa_out = e.fa_out_node ? (const float *) e.fa_out_node->data : nullptr;
+            float       * y      = (float *) dst->data;
+            if (!fa_out || !y) return false;
+            launch_fused_post_fa_cont(fa_out, y, e.d_head, e.d_pad, e.n_head, e.n_pos, stream);
+            ++g_post_fa_anchor_fires;
             return true;
         }
     }
@@ -1018,14 +1176,19 @@ bool install() {
         if (d[0] != '\0' && std::strcmp(d, "0") != 0) g_tail_enabled = false;
     }
 
+    if (const char * d = std::getenv("SIGLIP2_DISABLE_POST_FA_CONT")) {
+        if (d[0] != '\0' && std::strcmp(d, "0") != 0) g_post_fa_enabled = false;
+    }
+
     ggml_cuda_set_graph_begin_hook(siglip2_graph_begin_hook);
     ggml_cuda_set_op_hook(siglip2_op_hook);
     s_installed = true;
 
     std::fprintf(stderr,
-        "[siglip2-megakernel] installed: fused-LN%s%s\n",
-        g_qkv_enabled  ? " + QKV-prep (copy→scratch + split-permute-pad-cast, 9 ops → 2)" : "",
-        g_tail_enabled ? " + tail (bias+residual, bias+gelu, 3 ops/block → 0 anchor launches)" : "");
+        "[siglip2-megakernel] installed: fused-LN%s%s%s\n",
+        g_qkv_enabled     ? " + QKV-prep (copy→scratch + split-permute-pad-cast, 9 ops → 2)" : "",
+        g_tail_enabled    ? " + tail (bias+residual, bias+gelu, 3 ops/block → 0 anchor launches)" : "",
+        g_post_fa_enabled ? " + post-FA cont (specialized strided slice→contig)" : "");
     return true;
 }
 
