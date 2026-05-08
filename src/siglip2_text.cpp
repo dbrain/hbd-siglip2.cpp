@@ -244,14 +244,77 @@ ggml_tensor * build_block_batched(
 
 } // anonymous namespace
 
+// Phase B Path 2: cache (ctx, gf, gallocr, named tensors) per (n_pos, n_batch, has_mask).
+//
+// We bypass ggml_backend_sched entirely (it owns split-copy tensors that get
+// recreated each call, which made path-3-style sched-reuse crash on call 2 with
+// stale gallocr offsets). Single CUDA backend → no graph splits needed; the
+// scheduler's only job for us was input data upload, which we do directly via
+// ggml_backend_tensor_set. With per-entry gallocr the activation buffer + offset
+// table are stable across calls, which (a) avoids the gallocr aliasing trap and
+// (b) keeps tensor.data pointers stable, which is what ggml-cuda's CUDA-graph
+// warmup memcmp needs to match.
+//
+// One entry per shape; LRU eviction beyond a small cap so server churn through
+// many shapes can't grow VRAM unbounded. Text typically only sees (64, 1, X)
+// and (64, 5, false), so the cap is generous.
+struct GraphCacheEntry {
+    // Shape key.
+    int  n_pos    = 0;
+    int  n_batch  = 0;
+    bool has_mask = false;
+
+    std::vector<uint8_t>  arena;
+    ggml_context *        ctx       = nullptr;
+    ggml_cgraph *         gf        = nullptr;
+    ggml_gallocr_t        gallocr   = nullptr;
+
+    // Named inputs/outputs (set / get tensor each call).
+    ggml_tensor * tok_inp  = nullptr;
+    ggml_tensor * pos_inp  = nullptr;
+    ggml_tensor * mask_inp = nullptr; // null when has_mask=false
+    ggml_tensor * pool_idx = nullptr;
+    ggml_tensor * proj_out = nullptr;
+
+    GraphCacheEntry() = default;
+    GraphCacheEntry(const GraphCacheEntry &) = delete;
+    GraphCacheEntry & operator=(const GraphCacheEntry &) = delete;
+    GraphCacheEntry(GraphCacheEntry && o) noexcept { *this = std::move(o); }
+    GraphCacheEntry & operator=(GraphCacheEntry && o) noexcept {
+        if (this != &o) {
+            // Free anything we might already own (rare on cache vector growth,
+            // but correct in general).
+            if (gallocr) ggml_gallocr_free(gallocr);
+            if (ctx) ggml_free(ctx);
+            n_pos    = o.n_pos;
+            n_batch  = o.n_batch;
+            has_mask = o.has_mask;
+            arena    = std::move(o.arena);
+            ctx      = o.ctx;       o.ctx = nullptr;
+            gf       = o.gf;        o.gf = nullptr;
+            gallocr  = o.gallocr;   o.gallocr = nullptr;
+            tok_inp  = o.tok_inp;   o.tok_inp = nullptr;
+            pos_inp  = o.pos_inp;   o.pos_inp = nullptr;
+            mask_inp = o.mask_inp;  o.mask_inp = nullptr;
+            pool_idx = o.pool_idx;  o.pool_idx = nullptr;
+            proj_out = o.proj_out;  o.proj_out = nullptr;
+        }
+        return *this;
+    }
+    ~GraphCacheEntry() {
+        // gallocr owns its activation buffer (which references tensors in our
+        // ctx). Free gallocr first, then ctx.
+        if (gallocr) ggml_gallocr_free(gallocr);
+        if (ctx) ggml_free(ctx);
+    }
+};
+
 struct TextEncoder::State {
     qwen3_tts::GGUFLoader loader;
 
     ggml_backend_t        backend     = nullptr;
-    ggml_backend_t        backend_cpu = nullptr;
     ggml_backend_buffer_t weights_buf = nullptr;
     ggml_context *        weights_ctx = nullptr;
-    ggml_backend_sched_t  sched       = nullptr;
 
     ggml_tensor * token_embd    = nullptr; // (H, vocab)
     ggml_tensor * position_embd = nullptr; // (H, max_pos)
@@ -262,11 +325,17 @@ struct TextEncoder::State {
 
     std::vector<Block> blocks;
 
+    // LRU cap: text path produces at most a handful of shapes
+    // ((64, 1, false), (64, 1, true), (64, 5, false), occasionally other batch sizes).
+    static constexpr size_t kCacheCap = 8;
+    std::vector<GraphCacheEntry> graph_cache;
+
     ~State() {
-        if (sched) ggml_backend_sched_free(sched);
+        // Cache entries own gallocrs that reference tensors in their own ctxs;
+        // they self-clean. Free in order: cache → weights_buf → weights_ctx → backend.
+        graph_cache.clear();
         if (weights_buf) ggml_backend_buffer_free(weights_buf);
         if (weights_ctx) ggml_free(weights_ctx);
-        if (backend_cpu && backend_cpu != backend) ggml_backend_free(backend_cpu);
         if (backend) qwen3_tts::release_preferred_backend(backend);
     }
 };
@@ -316,11 +385,6 @@ bool TextEncoder::load(const std::string & gguf_path) {
         delete state_;
         state_ = nullptr;
         return false;
-    }
-    if (ggml_backend_dev_type(ggml_backend_get_device(state_->backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-        state_->backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    } else {
-        state_->backend_cpu = state_->backend;
     }
 
     const int64_t n_total = state_->loader.get_n_tensors();
@@ -402,26 +466,6 @@ bool TextEncoder::load(const std::string & gguf_path) {
         return false;
     }
 
-    {
-        std::vector<ggml_backend_t> backends;
-        backends.push_back(state_->backend);
-        if (state_->backend_cpu && state_->backend_cpu != state_->backend) {
-            backends.push_back(state_->backend_cpu);
-        }
-        std::vector<ggml_backend_buffer_type_t> bufts;
-        for (auto b : backends) bufts.push_back(ggml_backend_get_default_buffer_type(b));
-        const int max_nodes = 2048;
-        state_->sched = ggml_backend_sched_new(
-            backends.data(), bufts.data(), (int)backends.size(),
-            max_nodes, false, true);
-        if (!state_->sched) {
-            error_msg_ = "ggml_backend_sched_new failed";
-            delete state_;
-            state_ = nullptr;
-            return false;
-        }
-    }
-
     return true;
 }
 
@@ -448,116 +492,146 @@ bool TextEncoder::encode(
     const int   n_pos    = n_tokens;
     const float kq_scale = 1.0f / std::sqrt((float)d_head);
     const int   proj     = config_.projection_size;
+    const bool  has_mask = attention_mask != nullptr;
 
-    const int    max_nodes = 2048;
-    const size_t arena_sz  =
-        ggml_tensor_overhead() * 4096 +
-        ggml_graph_overhead_custom(max_nodes, false);
-    std::vector<uint8_t> arena(arena_sz);
-    struct ggml_init_params gp = {
-        /*.mem_size   =*/ arena.size(),
-        /*.mem_buffer =*/ arena.data(),
-        /*.no_alloc   =*/ true,
-    };
-    ggml_context * ctx = ggml_init(gp);
-    if (!ctx) {
-        error_msg_ = "ggml_init for graph_ctx failed";
-        return false;
-    }
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, max_nodes, false);
-
-    // Inputs
-    ggml_tensor * tok_inp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_pos);
-    ggml_set_name(tok_inp, "token_ids");
-    ggml_set_input(tok_inp);
-
-    // Position ids: 0..n_pos-1 (compile-time known, we feed at run time anyway).
-    ggml_tensor * pos_inp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_pos);
-    ggml_set_name(pos_inp, "position_ids");
-    ggml_set_input(pos_inp);
-
-    // Attention mask (n_pos x n_pos), f32, 0 or -inf.
-    ggml_tensor * mask_inp = nullptr;
-    if (attention_mask) {
-        mask_inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_pos, n_pos);
-        ggml_set_name(mask_inp, "attn_mask");
-        ggml_set_input(mask_inp);
-    }
-
-    // FA path uses a F16-cast of the mask reused across all layers.
     static const bool use_fa = std::getenv("SIGLIP2_DISABLE_FA") == nullptr;
-    ggml_tensor * fa_mask_f16 = nullptr;
-    if (use_fa && mask_inp) {
-        fa_mask_f16 = ggml_cast(ctx, mask_inp, GGML_TYPE_F16);
+
+    // Cache lookup by (n_pos, n_batch=1, has_mask).
+    GraphCacheEntry * pe = nullptr;
+    for (auto & ce : state_->graph_cache) {
+        if (ce.n_pos == n_pos && ce.n_batch == 1 && ce.has_mask == has_mask) {
+            pe = &ce;
+            break;
+        }
+    }
+    bool was_miss = pe == nullptr;
+    if (!pe) {
+        // Miss: build entry. LRU evict if at cap.
+        if (state_->graph_cache.size() >= State::kCacheCap) {
+            state_->graph_cache.erase(state_->graph_cache.begin());
+        }
+        state_->graph_cache.emplace_back();
+        GraphCacheEntry & e = state_->graph_cache.back();
+        e.n_pos = n_pos;
+        e.n_batch = 1;
+        e.has_mask = has_mask;
+
+        const int    max_nodes = 2048;
+        const size_t arena_sz  =
+            ggml_tensor_overhead() * 4096 +
+            ggml_graph_overhead_custom(max_nodes, false);
+        e.arena.assign(arena_sz, 0);
+        struct ggml_init_params gp = {
+            /*.mem_size   =*/ e.arena.size(),
+            /*.mem_buffer =*/ e.arena.data(),
+            /*.no_alloc   =*/ true,
+        };
+        e.ctx = ggml_init(gp);
+        if (!e.ctx) {
+            state_->graph_cache.pop_back();
+            error_msg_ = "ggml_init for graph_ctx failed";
+            return false;
+        }
+        e.gf = ggml_new_graph_custom(e.ctx, max_nodes, false);
+
+        // Inputs.
+        e.tok_inp = ggml_new_tensor_1d(e.ctx, GGML_TYPE_I32, n_pos);
+        ggml_set_name(e.tok_inp, "token_ids");
+        ggml_set_input(e.tok_inp);
+
+        e.pos_inp = ggml_new_tensor_1d(e.ctx, GGML_TYPE_I32, n_pos);
+        ggml_set_name(e.pos_inp, "position_ids");
+        ggml_set_input(e.pos_inp);
+
+        if (has_mask) {
+            e.mask_inp = ggml_new_tensor_2d(e.ctx, GGML_TYPE_F32, n_pos, n_pos);
+            ggml_set_name(e.mask_inp, "attn_mask");
+            ggml_set_input(e.mask_inp);
+        }
+
+        ggml_tensor * fa_mask_f16 = nullptr;
+        if (use_fa && e.mask_inp) {
+            fa_mask_f16 = ggml_cast(e.ctx, e.mask_inp, GGML_TYPE_F16);
+        }
+
+        ggml_tensor * x = ggml_get_rows(e.ctx, state_->token_embd, e.tok_inp);
+        ggml_tensor * p = ggml_get_rows(e.ctx, state_->position_embd, e.pos_inp);
+        x = ggml_add(e.ctx, x, p);
+
+        for (int il = 0; il < config_.num_hidden_layers; ++il) {
+            x = build_block(e.ctx, state_->blocks[il], x, e.mask_inp, fa_mask_f16,
+                            n_pos, d_head, n_head, config_.layer_norm_eps, kq_scale, use_fa);
+        }
+
+        x = build_layernorm(e.ctx, x, state_->final_ln_w, state_->final_ln_b, config_.layer_norm_eps);
+
+        e.pool_idx = ggml_new_tensor_1d(e.ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(e.pool_idx, "pool_idx");
+        ggml_set_input(e.pool_idx);
+        ggml_tensor * pooled = ggml_get_rows(e.ctx, ggml_cont(e.ctx, x), e.pool_idx);
+
+        e.proj_out = ggml_add(e.ctx, ggml_mul_mat(e.ctx, state_->head_w, pooled), state_->head_b);
+        ggml_set_name(e.proj_out, "text_embed");
+        ggml_set_output(e.proj_out);
+        ggml_build_forward_expand(e.gf, e.proj_out);
+
+        // Allocate the activation buffer + derive offsets. After this call every
+        // node->data is a stable pointer into the gallocr's CUDA buffer; subsequent
+        // alloc_graph(s) on this gf are no-ops.
+        e.gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(state_->backend));
+        if (!e.gallocr || !ggml_gallocr_reserve(e.gallocr, e.gf)) {
+            state_->graph_cache.pop_back();
+            error_msg_ = "ggml_gallocr_reserve failed";
+            return false;
+        }
+
+        pe = &e;
+    }
+    GraphCacheEntry & ce = *pe;
+
+    if (was_miss) {
+        // First-time bind: assigns gallocr offsets to every tensor's data field.
+        // After this every node->data is a stable pointer into our gallocr
+        // buffer. Subsequent calls don't need to rebind because nothing else
+        // touches our buffer (single backend, no scheduler).
+        if (!ggml_gallocr_alloc_graph(ce.gallocr, ce.gf)) {
+            error_msg_ = "ggml_gallocr_alloc_graph failed";
+            return false;
+        }
     }
 
-    // Token + position embedding lookups.
-    ggml_tensor * x = ggml_get_rows(ctx, state_->token_embd, tok_inp);    // (H, n_pos)
-    ggml_tensor * p = ggml_get_rows(ctx, state_->position_embd, pos_inp); // (H, n_pos)
-    x = ggml_add(ctx, x, p);
-
-    for (int il = 0; il < config_.num_hidden_layers; ++il) {
-        x = build_block(ctx, state_->blocks[il], x, mask_inp, fa_mask_f16, n_pos, d_head, n_head,
-                        config_.layer_norm_eps, kq_scale, use_fa);
-    }
-
-    x = build_layernorm(ctx, x, state_->final_ln_w, state_->final_ln_b, config_.layer_norm_eps);
-
-    // Pool last position: x has ne=[H, n_pos]; ggml_get_rows indexes along ne[1].
-    ggml_tensor * pool_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
-    ggml_set_name(pool_idx, "pool_idx");
-    ggml_set_input(pool_idx);
-    ggml_tensor * pooled = ggml_get_rows(ctx, ggml_cont(ctx, x), pool_idx); // ne=[H, 1]
-
-    // Linear projection head: head_w stored ne=[H, proj_size]; mul_mat -> ne=[proj_size, 1]
-    ggml_tensor * proj_out = ggml_add(ctx, ggml_mul_mat(ctx, state_->head_w, pooled), state_->head_b);
-    ggml_set_name(proj_out, "text_embed");
-    ggml_set_output(proj_out);
-    ggml_build_forward_expand(gf, proj_out);
-
-    if (!ggml_backend_sched_alloc_graph(state_->sched, gf)) {
-        ggml_free(ctx);
-        error_msg_ = "ggml_backend_sched_alloc_graph failed";
-        return false;
-    }
-
-    ggml_backend_tensor_set(tok_inp, token_ids, 0, sizeof(int32_t) * n_pos);
+    ggml_backend_tensor_set(ce.tok_inp, token_ids, 0, sizeof(int32_t) * n_pos);
     {
         std::vector<int32_t> pos(n_pos);
         for (int i = 0; i < n_pos; ++i) pos[i] = i;
-        ggml_backend_tensor_set(pos_inp, pos.data(), 0, sizeof(int32_t) * n_pos);
+        ggml_backend_tensor_set(ce.pos_inp, pos.data(), 0, sizeof(int32_t) * n_pos);
     }
-    if (mask_inp) {
+    if (ce.mask_inp) {
         std::vector<float> mask((size_t)n_pos * n_pos, 0.0f);
         const float neg_inf = -std::numeric_limits<float>::infinity();
         for (int k = 0; k < n_pos; ++k) {
             if (attention_mask[k] == 0) {
                 for (int q = 0; q < n_pos; ++q) {
-                    // Mask layout: ne[0]=n_pos_k innermost, ne[1]=n_pos_q outer.
                     mask[(size_t)q * n_pos + k] = neg_inf;
                 }
             }
         }
-        ggml_backend_tensor_set(mask_inp, mask.data(), 0, sizeof(float) * mask.size());
+        ggml_backend_tensor_set(ce.mask_inp, mask.data(), 0, sizeof(float) * mask.size());
     }
     {
         const int32_t idx = (int32_t)(n_pos - 1);
-        ggml_backend_tensor_set(pool_idx, &idx, 0, sizeof(int32_t));
+        ggml_backend_tensor_set(ce.pool_idx, &idx, 0, sizeof(int32_t));
     }
 
-    enum ggml_status st = ggml_backend_sched_graph_compute(state_->sched, gf);
+    enum ggml_status st = ggml_backend_graph_compute(state_->backend, ce.gf);
     if (st != GGML_STATUS_SUCCESS) {
-        ggml_backend_sched_reset(state_->sched);
-        ggml_free(ctx);
         error_msg_ = std::string("graph compute failed status=") + std::to_string((int)st);
         return false;
     }
 
     out_embedding.assign((size_t)proj, 0.0f);
-    ggml_backend_tensor_get(proj_out, out_embedding.data(), 0, sizeof(float) * (size_t)proj);
+    ggml_backend_tensor_get(ce.proj_out, out_embedding.data(), 0, sizeof(float) * (size_t)proj);
 
-    ggml_backend_sched_reset(state_->sched);
-    ggml_free(ctx);
     return true;
 }
 
@@ -575,7 +649,7 @@ bool TextEncoder::encode_batch(
         error_msg_ = "n_batch must be > 0";
         return false;
     }
-    // Single-prompt: dispatch to encode() so megakernel hooks fire.
+    // Single-prompt: dispatch to encode() so megakernel hooks fire on the 3D path.
     if (n_batch == 1) {
         return encode(token_ids, n_tokens, attention_mask, out_embeddings);
     }
@@ -608,75 +682,100 @@ bool TextEncoder::encode_batch(
     const float kq_scale = 1.0f / std::sqrt((float)d_head);
     const int   proj     = config_.projection_size;
 
-    const int    max_nodes = 2048;
-    const size_t arena_sz  =
-        ggml_tensor_overhead() * 4096 +
-        ggml_graph_overhead_custom(max_nodes, false);
-    std::vector<uint8_t> arena(arena_sz);
-    struct ggml_init_params gp = {
-        /*.mem_size   =*/ arena.size(),
-        /*.mem_buffer =*/ arena.data(),
-        /*.no_alloc   =*/ true,
-    };
-    ggml_context * ctx = ggml_init(gp);
-    if (!ctx) {
-        error_msg_ = "ggml_init for graph_ctx failed";
-        return false;
-    }
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, max_nodes, false);
-    auto t_init = tnow();
-
-    // ggml_get_rows asserts source->ne[2] == idx->ne[1] (batched-table semantic),
-    // which doesn't fit our shared-vocab/shared-pos-table lookups. Flatten the
-    // indices to 1D, then reshape the result to 3D.
-    ggml_tensor * tok_inp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t)n_pos * n_batch);
-    ggml_set_name(tok_inp, "token_ids");
-    ggml_set_input(tok_inp);
-
-    ggml_tensor * pos_inp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t)n_pos * n_batch);
-    ggml_set_name(pos_inp, "position_ids");
-    ggml_set_input(pos_inp);
-
     static const bool use_fa = std::getenv("SIGLIP2_DISABLE_FA") == nullptr;
 
-    // tok_emb / pos_emb: (H, n_pos*n_batch) → reshape_3d → (H, n_pos, n_batch)
-    ggml_tensor * x = ggml_get_rows(ctx, state_->token_embd, tok_inp);
-    ggml_tensor * p = ggml_get_rows(ctx, state_->position_embd, pos_inp);
-    x = ggml_reshape_3d(ctx, x, H, n_pos, n_batch);
-    p = ggml_reshape_3d(ctx, p, H, n_pos, n_batch);
-    x = ggml_add(ctx, x, p);
-
-    for (int il = 0; il < config_.num_hidden_layers; ++il) {
-        x = build_block_batched(ctx, state_->blocks[il], x, /*fa_mask_f16=*/nullptr,
-                                n_pos, n_batch, d_head, n_head,
-                                config_.layer_norm_eps, kq_scale, use_fa);
+    GraphCacheEntry * pe = nullptr;
+    for (auto & ce : state_->graph_cache) {
+        if (ce.n_pos == n_pos && ce.n_batch == n_batch && ce.has_mask == false) {
+            pe = &ce;
+            break;
+        }
     }
+    bool was_miss = pe == nullptr;
+    if (was_miss) {
+        if (state_->graph_cache.size() >= State::kCacheCap) {
+            state_->graph_cache.erase(state_->graph_cache.begin());
+        }
+        state_->graph_cache.emplace_back();
+        GraphCacheEntry & e = state_->graph_cache.back();
+        e.n_pos = n_pos;
+        e.n_batch = n_batch;
+        e.has_mask = false;
 
-    x = build_layernorm(ctx, x, state_->final_ln_w, state_->final_ln_b, config_.layer_norm_eps);
+        const int    max_nodes = 2048;
+        const size_t arena_sz  =
+            ggml_tensor_overhead() * 4096 +
+            ggml_graph_overhead_custom(max_nodes, false);
+        e.arena.assign(arena_sz, 0);
+        struct ggml_init_params gp = {
+            /*.mem_size   =*/ e.arena.size(),
+            /*.mem_buffer =*/ e.arena.data(),
+            /*.no_alloc   =*/ true,
+        };
+        e.ctx = ggml_init(gp);
+        if (!e.ctx) {
+            state_->graph_cache.pop_back();
+            error_msg_ = "ggml_init for graph_ctx failed";
+            return false;
+        }
+        e.gf = ggml_new_graph_custom(e.ctx, max_nodes, false);
 
-    // Pool last position per batch. pool_idx is (1, n_batch); ggml_get_rows on
-    // a 3D tensor with a 2D index yields (H, 1, n_batch) — each batch picks
-    // its own row from its own slice along ne[2].
-    ggml_tensor * pool_idx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_batch);
-    ggml_set_name(pool_idx, "pool_idx");
-    ggml_set_input(pool_idx);
-    ggml_tensor * pooled = ggml_get_rows(ctx, ggml_cont(ctx, x), pool_idx);
-    pooled = ggml_reshape_2d(ctx, pooled, H, n_batch);
+        // ggml_get_rows asserts source->ne[2] == idx->ne[1] (batched-table semantic),
+        // which doesn't fit our shared-vocab/shared-pos-table lookups. Flatten the
+        // indices to 1D, then reshape the result to 3D.
+        e.tok_inp = ggml_new_tensor_1d(e.ctx, GGML_TYPE_I32, (int64_t)n_pos * n_batch);
+        ggml_set_name(e.tok_inp, "token_ids");
+        ggml_set_input(e.tok_inp);
 
-    ggml_tensor * proj_out = ggml_add(ctx, ggml_mul_mat(ctx, state_->head_w, pooled), state_->head_b);
-    ggml_set_name(proj_out, "text_embed_batch");
-    ggml_set_output(proj_out);
-    ggml_build_forward_expand(gf, proj_out);
+        e.pos_inp = ggml_new_tensor_1d(e.ctx, GGML_TYPE_I32, (int64_t)n_pos * n_batch);
+        ggml_set_name(e.pos_inp, "position_ids");
+        ggml_set_input(e.pos_inp);
+
+        ggml_tensor * x = ggml_get_rows(e.ctx, state_->token_embd, e.tok_inp);
+        ggml_tensor * p = ggml_get_rows(e.ctx, state_->position_embd, e.pos_inp);
+        x = ggml_reshape_3d(e.ctx, x, H, n_pos, n_batch);
+        p = ggml_reshape_3d(e.ctx, p, H, n_pos, n_batch);
+        x = ggml_add(e.ctx, x, p);
+
+        for (int il = 0; il < config_.num_hidden_layers; ++il) {
+            x = build_block_batched(e.ctx, state_->blocks[il], x, /*fa_mask_f16=*/nullptr,
+                                    n_pos, n_batch, d_head, n_head,
+                                    config_.layer_norm_eps, kq_scale, use_fa);
+        }
+
+        x = build_layernorm(e.ctx, x, state_->final_ln_w, state_->final_ln_b, config_.layer_norm_eps);
+
+        e.pool_idx = ggml_new_tensor_2d(e.ctx, GGML_TYPE_I32, 1, n_batch);
+        ggml_set_name(e.pool_idx, "pool_idx");
+        ggml_set_input(e.pool_idx);
+        ggml_tensor * pooled = ggml_get_rows(e.ctx, ggml_cont(e.ctx, x), e.pool_idx);
+        pooled = ggml_reshape_2d(e.ctx, pooled, H, n_batch);
+
+        e.proj_out = ggml_add(e.ctx, ggml_mul_mat(e.ctx, state_->head_w, pooled), state_->head_b);
+        ggml_set_name(e.proj_out, "text_embed_batch");
+        ggml_set_output(e.proj_out);
+        ggml_build_forward_expand(e.gf, e.proj_out);
+
+        e.gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(state_->backend));
+        if (!e.gallocr || !ggml_gallocr_reserve(e.gallocr, e.gf)) {
+            state_->graph_cache.pop_back();
+            error_msg_ = "ggml_gallocr_reserve failed";
+            return false;
+        }
+
+        pe = &e;
+    }
+    GraphCacheEntry & ce = *pe;
     auto t_build = tnow();
 
-    if (!ggml_backend_sched_alloc_graph(state_->sched, gf)) {
-        ggml_free(ctx);
-        error_msg_ = "ggml_backend_sched_alloc_graph failed";
-        return false;
+    if (was_miss) {
+        if (!ggml_gallocr_alloc_graph(ce.gallocr, ce.gf)) {
+            error_msg_ = "ggml_gallocr_alloc_graph failed";
+            return false;
+        }
     }
-    auto t_alloc = tnow();
 
-    ggml_backend_tensor_set(tok_inp, token_ids, 0,
+    ggml_backend_tensor_set(ce.tok_inp, token_ids, 0,
                             sizeof(int32_t) * (size_t)n_pos * (size_t)n_batch);
     {
         // pos_inp is 1D (n_pos*n_batch); each batch's slice is 0..n_pos-1.
@@ -686,40 +785,34 @@ bool TextEncoder::encode_batch(
                 pos[(size_t)b * (size_t)n_pos + (size_t)i] = i;
             }
         }
-        ggml_backend_tensor_set(pos_inp, pos.data(), 0,
+        ggml_backend_tensor_set(ce.pos_inp, pos.data(), 0,
                                 sizeof(int32_t) * (size_t)n_pos * (size_t)n_batch);
     }
     {
         std::vector<int32_t> idx(n_batch, (int32_t)(n_pos - 1));
-        ggml_backend_tensor_set(pool_idx, idx.data(), 0, sizeof(int32_t) * (size_t)n_batch);
+        ggml_backend_tensor_set(ce.pool_idx, idx.data(), 0, sizeof(int32_t) * (size_t)n_batch);
     }
     auto t_inputs = tnow();
 
-    enum ggml_status st = ggml_backend_sched_graph_compute(state_->sched, gf);
+    enum ggml_status st = ggml_backend_graph_compute(state_->backend, ce.gf);
     if (st != GGML_STATUS_SUCCESS) {
-        ggml_backend_sched_reset(state_->sched);
-        ggml_free(ctx);
         error_msg_ = std::string("graph compute failed status=") + std::to_string((int)st);
         return false;
     }
     auto t_compute = tnow();
 
     out_embeddings.assign((size_t)proj * (size_t)n_batch, 0.0f);
-    ggml_backend_tensor_get(proj_out, out_embeddings.data(), 0,
+    ggml_backend_tensor_get(ce.proj_out, out_embeddings.data(), 0,
                             sizeof(float) * (size_t)proj * (size_t)n_batch);
     auto t_get = tnow();
-
-    ggml_backend_sched_reset(state_->sched);
-    ggml_free(ctx);
-    auto t_done = tnow();
+    auto t_done = t_get;
 
     if (timing) {
         std::fprintf(stderr,
-            "[encode_batch n_batch=%d n_pos=%d] init=%.2f build=%.2f alloc=%.2f inputs=%.2f compute=%.2f get=%.2f reset=%.2f total=%.2f ms\n",
-            n_batch, n_pos,
-            tms(t0, t_init), tms(t_init, t_build), tms(t_build, t_alloc),
-            tms(t_alloc, t_inputs), tms(t_inputs, t_compute),
-            tms(t_compute, t_get), tms(t_get, t_done), tms(t0, t_done));
+            "[encode_batch n_batch=%d n_pos=%d cache=%s] build=%.2f inputs=%.2f compute=%.2f get=%.2f total=%.2f ms\n",
+            n_batch, n_pos, was_miss ? "miss" : "hit",
+            tms(t0, t_build), tms(t_build, t_inputs),
+            tms(t_inputs, t_compute), tms(t_compute, t_get), tms(t0, t_done));
     }
     return true;
 }

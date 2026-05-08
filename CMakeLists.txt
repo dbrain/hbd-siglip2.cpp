@@ -55,6 +55,14 @@ set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 set(CMAKE_BUILD_RPATH_USE_ORIGIN TRUE)
 
 set(GGML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml")
+
+# Phase B (megakernel-v0): turn on CUDA graphs by default. With per-shape graph
+# caching in TextEncoder/VisionEncoder (path 2 — bypass scheduler, per-entry
+# gallocr), tensor pointers are stable across calls and ggml-cuda's warmup
+# graph fires after 2 calls per cached shape. Drops text n=5 compute ~30 → ~19
+# ms on RTX 3060. Override on the cmake line if needed.
+set(GGML_CUDA_GRAPHS ON CACHE BOOL "ggml: use CUDA graphs (default-on for siglip2 path-2 graph cache)")
+
 add_subdirectory(${GGML_DIR})
 
 # Phase A megakernel — fused per-pattern CUDA kernels (LayerNorm-with-affine

@@ -30,24 +30,23 @@
 
 ## Cold-pickup orientation
 
-The win you're chasing: **text path is launch-overhead-bound**, ~80%
-of the 38 ms / 5-prompt p50 is CUDA kernel launch overhead (~745
-launches per encode × ~10-12 µs each — a hair lower than the original
-12-15 µs estimate; A0 measurements re-grounded the per-launch cost).
-PyTorch beats us at ~26 ms because it issues maybe 100-200 launches
-via cuDNN/cuBLAS fusion.
+**Phase A (A0-A4) and Phase B all landed.** Megakernel collapsed text
+launches ~745 → ~30. Phase B added per-shape graph caching (TextEncoder
++ VisionEncoder) and bypassed `ggml_backend_sched`, which unlocked
+ggml-cuda's CUDA-graph warmup path → ~30 → 1 submit per encode.
 
-Megakernel collapses that ~745 → ~30, putting text encode at
-**~2-3 ms per prompt** (well below Python). /v1/text_embeddings and
-/v1/classify_from_embeddings drop from 1.43× and 1.79× python to
-sub-1×. /v1/classify (vision + text loop) closes too because the
-text-loop cost dominated.
+Current state on `dbrain/siglip2-v0`:
 
-Vision (n_pos=729) is **already 1.07× python** because it's
-compute-bound at that batch size — megakernel saves ~1-2 ms there
-(launches are <10% of the encode). Phase A targets text. Phase B
-targets vision but the ROI is much smaller; consider that phase
-optional.
+- All 4 endpoints beat python clean (0.76-0.98×, see Phase B receipts below).
+- Internal text n=5 compute = **19.1 ms ±0.05** (rock-steady; CUDA graph
+  replay killed jitter).
+- All 4 parity scripts PASS, bit-identical to A4.
+- VRAM unchanged ~1.5 GiB full-tower post-warmup.
+
+**Phase C is the kernel/quant lap** — see "Phase C — handoff for the
+kernel/quant lap" below. Graph-layer is exhausted; further gains need
+custom MMQ for siglip2's M-shapes or Q4_K_M quant. Target: cfe ≤ 0.85×
+python ("real embarrassment").
 
 ## ✅ Phase A0 landed (2026-05-09)
 
@@ -365,153 +364,228 @@ The remaining theoretical ceiling on cpp text encode at n_pos=64×n_batch=5:
 layer. Going below ~17 ms cfe needs a different layer of attack (either kernel-
 level MMQ work or CUDA graph capture, both multi-day projects).
 
-## Phase B — handoff for the CUDA-graph-capture lap
+## ✅ Phase B landed (2026-05-08) — graph cache + CUDA graphs
 
-**Mood from the user 2026-05-09:** they want 2× embarrassment of python on
-classify_from_embeddings. A4 got us to "tied," not "embarrassed." CUDA graphs
-is the named next move. Trim n_pos is dead (don't relitigate; see the dead-end
-section above and `feedback_no_hf_publish` adjacent in memory if you find
-yourself measuring rank parity again — the rank-parity test recipe lives in
-`/home/dbrain/.claude/projects/-home-dbrain-dev-kobbler/memory/project_siglip2_n_pos_trim_dead.md`).
+**Headline: every endpoint now beats python clean.** Internal text n=5 compute
+collapsed **30 → 19.1 ms** (-36%) once the warmup-graph path could fire, and
+p95 sits within 0.5 ms of p50 across all four endpoints — CUDA graphs killed
+the jitter. cfe crossed below 1× python for the first time.
 
-### What's already known (read these first, save your context window)
+### Bench A/B (clean GPU, kobbler-vision-1 active, 50 runs each, p50 ms)
 
-1. **Parent doc `HANDOFF.md` "Dead ends and partial attempts" section.** Path 1
-   (shared sched) and Path 2 (per-entry sched) both crash on call 2 with
-   illegal memory access. **Path 3 (cache build, refresh gf each call) was
-   never tried — that's the recommended starting experiment.**
-2. **`-DGGML_CUDA_GRAPHS=ON` was tried with the flag flipped at the cmake
-   level — no-op with a slight regression** because `ggml_cuda_graph_get_key`
-   keys on `cgraph->nodes[0]`, which is a freshly-allocated tensor pointer
-   every call. Won't kick in until tensor pointers are stable across calls.
-   Path 3 fixes that.
-3. **The diagnosis from the parent doc:** `ggml_backend_sched_split_graph`
-   frees `sched->ctx` and creates fresh split-copy tensors at same context
-   offsets each call. Per-entry isolation doesn't help; the gallocr's
-   `node_allocs[]` is keyed by position in `sched->graph`, and on call 2
-   position N may point to a fresh split-copy tensor whose `data == NULL`,
-   triggering an allocation that overlaps a cached tensor.
+| Endpoint                              | A4 cpp | A4 ratio | **Phase B cpp** | **Phase B ratio** |
+|---------------------------------------|-------:|---------:|----------------:|------------------:|
+| `/v1/embeddings`                      | 45.6   | 0.84×    | **43.3**        | **0.81×**         |
+| `/v1/text_embeddings` (n=5)           | 21.7   | 0.81×    | **20.1**        | **0.76×**         |
+| `/v1/classify`                        | 65.2   | 0.93×    | **62.6**        | **0.91×**         |
+| `/v1/classify_from_embeddings`        | 21.9   | 1.02×    | **19.9**        | **0.98×**         |
 
-### What changed in A4 that affects this
+Internal `encode_batch n=5` compute (`SIGLIP2_TIME_ENCODE=1`, post-warmup):
+**19.14 ms ±0.05** rock-steady across 30+ samples. p95 within 0.5 ms of p50
+on every endpoint — CUDA-graph replay is deterministic.
 
-**Cache keys now need `n_batch`.** The text path runs three different graphs
-in production: `encode()` for n_batch=1 (CLI parity, single-prompt server
-calls), `encode_batch(n_batch=N)` for the prompt-list endpoints. Vision is
-still single-encode. Suggested cache keying:
+### Parity unchanged from A4
 
-- text encode: `(n_pos, n_batch)` — typically `(64, 1)` and `(64, 5)`, but
-  callers may hit other batch sizes. LRU with 3-4 entries is plenty.
-- vision encode: `(n_patches_h, n_patches_w)` (unchanged from parent doc
-  guidance).
+- text 0.999756 / vision 0.999944 / image 0.999523 / score 0.999986 / probs MAE 5.6e-7
+- 200/200 alternating-cache stress test passes (single n=1 ⟷ batched n=5
+  with both shapes hot in the LRU).
 
-**4D Q/K/V views are new.** A4 made the QKV views 4D in `encode_batch` (for
-the prompt-batch on `ne[3]`). `ggml_cuda_graph_update_required`'s
-`memcmp(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor))` check is bytewise
-on the full `ggml_tensor` struct — fresh tensors will still differ even
-on identical shapes. Path 3 has to keep the cached tensor objects alive,
-not just their data pointers, for ggml-cuda's own warmup-graph logic to
-match across calls.
+### What landed in code
 
-### Where to start — Path 3 in concrete steps
+1. **`src/siglip2_text.cpp`** — `GraphCacheEntry` (n_pos, n_batch, has_mask
+   key) holding `(arena, ctx, gf, gallocr, named tensors)`. Both `encode()`
+   and `encode_batch()` look up / build / reuse. Cap = 8 entries (LRU evicts
+   front). On miss: `ggml_gallocr_new` + `reserve` + `alloc_graph`. On hit:
+   skip rebuild, no alloc_graph, just `tensor_set` inputs → `ggml_backend_graph_compute`
+   → `tensor_get`. **No scheduler in the path** (see "Path 2 unlock" below).
+2. **`src/siglip2_vision.cpp`** — `VisionGraphCacheEntry` (n_patches_h,
+   n_patches_w, pooling key). LRU cap = 4 (NaFlex hits a small finite set
+   per max_num_patches). Same gallocr/direct-compute pattern.
+3. **`CMakeLists.txt`** — `set(GGML_CUDA_GRAPHS ON CACHE BOOL ...)` before
+   `add_subdirectory(${GGML_DIR})`. Default-on; override on cmake line if
+   needed. Drives `GGML_CUDA_USE_GRAPHS` → `USE_CUDA_GRAPH` define in
+   `ggml-cuda.cu`. Without stable tensor pointers across calls (provided
+   by the cache) this flag was a no-op-with-overhead in A4.
 
-Pull the build and `gf` cache into `TextEncoder::State` (and a similar
-`VisionEncoder::State`):
+### Path 3 was a dead end (Path 2 — bypass scheduler — won)
 
-```cpp
-struct CacheEntry {
-    int n_pos;
-    int n_batch;
-    std::vector<uint8_t> arena;
-    ggml_context *       ctx = nullptr;
-    ggml_cgraph *        gf  = nullptr;
-    ggml_tensor *        tok_inp;
-    ggml_tensor *        pos_inp;
-    ggml_tensor *        pool_idx;
-    ggml_tensor *        proj_out;
-    // ...other named inputs/outputs you set or get
-};
-std::vector<CacheEntry> cache_;  // small LRU
-```
+**Path 3 (the recommended starting experiment from the prior handoff)
+crashed on call 2 with the same gallocr-aliasing CUDA error as Variants
+1 and 2.** Caching `(ctx, gf)` and re-running `ggml_graph_clear` +
+`ggml_build_forward_expand` doesn't help because **`ggml_backend_sched_split_graph`
+creates fresh split-copy tensors per call regardless of how we manage our
+own ctx.** The gallocr's `node_allocs[]` is keyed by position in
+`sched->graph`, and on call 2 position N points to a fresh split-copy
+tensor whose `data == NULL`, so the gallocr re-allocates at the saved
+offset and overlaps a still-live cached tensor.
 
-On encode call:
-1. Look up by `(n_pos, n_batch)`. On miss, build the entry: `ggml_init` with
-   the same arena pattern, build the full graph (call `build_block_batched`
-   per layer), keep `ctx + gf + named tensors` alive in the entry.
-2. On hit, do **not** rebuild. Keep `ctx`/`gf` alive. Call
-   `ggml_graph_clear(gf)` then `ggml_build_forward_expand(gf, proj_out)`
-   from the cached output tensor — this re-runs the topo expansion fresh
-   while reusing the construction work (the `build_block_batched` traversal
-   is the expensive bit; expansion is cheap).
-3. Then `ggml_backend_sched_alloc_graph` / set inputs / compute / get
-   output / **don't ggml_free**. `ggml_backend_sched_reset` is still fine.
+**Pivot: skip the scheduler entirely (Path 2 from the parent doc).**
+`GGML_SCHED_DEBUG=1` confirms the text/vision encoders run as ONE split on
+ONE backend (CUDA) — sched is pure overhead for us. Per-entry
+`ggml_gallocr_t` + `ggml_backend_graph_compute(backend, gf)` directly:
 
-The hypothesis: re-running `build_forward_expand` puts fresh node references
-into `gf`, but reusing the *same* `ctx` keeps the underlying tensor objects
-alive at stable pointers across calls — gallocr's offset table stays valid,
-and `ggml_cuda_graph_update_required`'s memcmp matches.
+- gallocr's offset table is per-entry, derived once at `reserve()` time,
+  reused on each `alloc_graph()` (we only call `alloc_graph` once at miss
+  time; the binding sticks across `graph_compute`s for our private
+  buffer).
+- Tensor pointers stay stable across calls (we own the ctx; nothing
+  recreates them) → `ggml_cuda_graph_update_required`'s `memcmp` matches
+  → warmup completes after 2 calls → CUDA graph replay takes over.
 
-Once Path 3 stops crashing on call 2:
-1. Verify parity scripts still pass (single-prompt + batched server smoke).
-2. Flip `-DGGML_CUDA_GRAPHS=ON` in `CMakeLists.txt`. Don't change anything
-   else — ggml-cuda's warmup path takes over after two calls per cached
-   shape.
-3. Bench. Expected: text encode drops ~3-5 ms (from ~22 ms to ~17-19 ms).
-   That puts cfe at **~0.85× python** = real embarrassment.
+### The trap: std::vector<CacheEntry> emplace_back UAF
 
-### Risks to watch for
+First Path-2 cut crashed silently (SEGV in `set_tensor`, no CUDA error)
+on the third call after the cache had two entries. **Cause: vector
+growth on `emplace_back` triggers a move of existing entries to the new
+underlying array. `GraphCacheEntry`'s default move = memberwise copy of
+raw pointers WITHOUT nulling the source. The destructor on the moved-from
+slot then frees the `ggml_gallocr_t` + `ggml_context *` that the live
+entry in the new array still owns.**
 
-- **Per-shape activation VRAM.** Each cached entry holds its own activation
-  buffer (after `sched_alloc_graph`). Estimate ~50-100 MiB per cached shape.
-  For 4 cached entries that's <500 MiB — fine on the 12 GB GPU but worth
-  measuring. The user's standing rule: full-tower VRAM is the metric; A4
-  current is 1504 MiB post-load.
-- **Megakernel hooks have to keep firing.** The plan-builder runs at
-  `siglip2_graph_begin_hook`. If the cached `gf` keeps the same node objects
-  call-to-call, the plan builds once and then... actually does it rebuild?
-  Check this: `siglip2_graph_begin_hook` clears and re-populates
-  `g_*_anchors` on every call. With cached graph, the node pointers are
-  stable, so the plan rebuild is idempotent — should be fine, but worth
-  verifying with `SIGLIP2_MEGAKERNEL_VERBOSE=1` after wiring.
-- **Self-parity matters more than HF parity here.** Path 3 doesn't change
-  math; if it crashes-or-corrupts, the bug is in graph reuse, not parity.
-  Use the n=5-batched-vs-n=1-sequential cosine check (≥0.99994 today)
-  as your fast smoke; if that drops, you've corrupted state.
-- **The ggml-cuda warmup is bytewise-strict.** It memcmp's the entire
-  `ggml_tensor` struct. Even if Path 3 stabilizes pointers, the `data`
-  field may differ between alloc and reset. If the warmup never converges,
-  read `ggml/src/ggml-cuda/ggml-cuda.cu` around `ggml_cuda_graph_update_required`
-  and consider patching the comparison to skip `data` (or whichever field
-  cycles).
+Fix: explicit move ctor / assign that transfers and nulls source pointers.
+Same pattern used in `VisionGraphCacheEntry`. **Any RAII-pointer member
+in a `std::vector<T>` element type needs this** — common pitfall, easy
+to miss because `=default` looks correct.
 
-### What "done" looks like
+### Files touched (commits ahead of A4 head)
 
-- Path 3 holds for 1000+ encode calls without crash.
-- All four parity scripts PASS (no regression on single-prompt).
-- Server-batched parity (5-prompt vs 1-prompt sequential cosine) ≥ 0.99994.
-- `-DGGML_CUDA_GRAPHS=ON` shows the warmup-graph path firing
-  (instrument `ggml-cuda.cu`'s warmup path with a printf if you want
-  verification).
-- Bench: text 22 → ≤19 ms. Cfe 22 → ≤19 ms. Real ≤0.9× ratios across the
-  board, not just text/classify. Add a Phase B section here mirroring A4's
-  receipts table.
+- `src/siglip2_text.cpp` (+158, -67) — GraphCacheEntry + encode/encode_batch refactor
+- `src/siglip2_vision.cpp` (+128, -54) — VisionGraphCacheEntry + encode refactor
+- `CMakeLists.txt` (+8, -0) — flip GGML_CUDA_GRAPHS default
+- `HANDOFF-megakernel-v0.md` (this file)
 
-If Path 3 also crashes (despite the diagnosis suggesting it shouldn't),
-fall back to Path 1 from the parent doc: fork ggml's gallocr to add an
-explicit re-bind entry point that doesn't skip on `data != NULL`. ~50 LOC
-in `src/ggml-alloc.c`. Cleaner unlock but bigger blast radius.
+VRAM (full-tower post-warmup): unchanged at ~1.5 GiB. Each per-shape
+activation buffer is ~30-50 MiB; with two text shapes + 1 vision shape
+typically resident the activation budget is ~150 MiB total — well under
+the previous A4 sched arena.
 
-### Files you'll touch
+## Phase C — handoff for the kernel/quant lap
 
-- `src/siglip2_text.cpp` — extract the build-the-graph logic from `encode`
-  and `encode_batch` into a function that takes a `CacheEntry &`. Both
-  encoders dispatch to this.
-- `src/siglip2_text.h` — `TextEncoder::State` gets a small LRU member.
-- `src/siglip2_vision.cpp` / `.h` — same pattern. (Vision is bigger ROI per
-  cache hit since 49 ms encode → ~3-5 ms launch overhead saved.)
-- Possibly `ggml/src/ggml-cuda/ggml-cuda.cu` if the warmup-graph memcmp
-  needs relaxing.
-- `CMakeLists.txt` — flip `-DGGML_CUDA_GRAPHS=ON` once Path 3 is stable.
-- `HANDOFF-megakernel-v0.md` — add Phase B receipts when shipping.
+**Mood from the user 2026-05-08:** "we've hit our target, lets blow it
+away." Phase B beat python on every endpoint, but cfe is at 0.98× — tied,
+not embarrassed. Going below 0.9× ratio needs a different layer of attack;
+graph-layer is exhausted.
+
+### Why graph-layer is done
+
+The 19.1 ms cfe compute is GPU-compute-bound on Q8_0×F32 matmuls at M=320
+(text n_pos=64 × n_batch=5). Both backends hit the same RTX 3060
+TensorCores (or scalar dp4a path) at roughly the same throughput.
+Megakernel collapsed launch overhead from ~745 → ~30 launches; CUDA
+graphs collapsed ~30 → 1 submit. **There is no launch-overhead left
+to recover.**
+
+Quick math: 27 layers × 4 matmuls/layer = 108 Q8_0×F32 matmuls per
+encode, plus FA. At M=320 each Q8_0×F32 is M×K×N flops with M=320,
+K=1152, N∈{1152, 3456, 4304}. Total ≈ 27 GFLOPS per encode. RTX 3060 at
+~10 TFLOPS Q8 peak ≈ 2.7 ms compute floor. We're at 19 ms — 7× the
+peak. The gap is in matmul efficiency at small M (cuBLAS GEMM at M=320
+gets ~30% peak), not launch overhead.
+
+### Levers ranked by ROI
+
+| Lever                                  | Est. cfe gain | Difficulty | Parity risk |
+|----------------------------------------|--------------:|-----------:|------------:|
+| **Custom MMQ for siglip2 shapes**      | -5 to -7 ms   | Multi-week | High (FP rounding per kernel) |
+| **Q4_K_M weights + rank-parity bench** | -3 to -5 ms   | 1-2 weeks  | Medium (need rank-parity infra first) |
+| Pre-pad weights at conversion time     | <0.5 ms       | 1 day      | None |
+| Probe-head fusion (vision only)        | ~0.5 ms       | 2 days     | None |
+| FA d_head=72 fast path on GA106        | -1 to -2 ms   | 1 week     | High |
+
+The first two are where the next agent should plant their flag. The rest
+are "while you're here" cleanup that don't move the needle on the headline
+ratios.
+
+### Lever 1: custom MMQ for M=320, K=1152, N∈{1152, 3456, 4304}
+
+ggml's MMQ dispatcher specializes on small M (vector path, `mmvq.cu`)
+and falls back to dequantize+cuBLAS for M > some threshold. siglip2
+text at M=320 (or vision at M=729) lands in cuBLAS-GEMM territory, which
+isn't tuned for these specific shapes.
+
+The qwen3-tts megakernel's `mmvq_q8_0_q8_1_kernel` is the reference for
+small-M MMQ on Ampere. **Don't lift that kernel directly** — it's M=1
+specialized. siglip2 needs M=64, M=320, M=729. The right move is a fresh
+kernel templated on `(M_tile, K_tile, N_tile)`, picked per shape, with
+mma.m16n8k32 tensor cores.
+
+**Critical:** the auto-memory entry `project_qwen3tts_int8_mma_kill.md`
+says mma m16n8k32 is *0.31-0.70× dp4a* on hot wide-N shapes on RTX 3060
+(consumer GA106 is 1:1 mma:dp4a peak, not 16:1 like A100). Verify mma
+beats dp4a *for this specific (M, K, N)* before committing — bench the
+shape at M=320 with both paths. dp4a may still be the winner here, in
+which case the lever is "specialize the dp4a path for these shapes,"
+not "use mma."
+
+Parity discipline: every kernel rewrite is a fresh source of FP-reduction
+order. Use the **5-prompt batched vs 1-prompt sequential cosine ≥ 0.99994**
+self-parity check as your fast smoke (it ran 0.99994-0.99996 in A4 and
+hasn't drifted). HF parity (text/vision/image/score) must stay ≥ 0.999.
+
+### Lever 2: Q4_K_M weights + rank-parity bench
+
+Weight bandwidth halves (Q8_0 → Q4_K_M = 8 → 4.5 bits/weight). On a
+bandwidth-bound shape (which SigLIP2 text at M=320 is), that's a direct
+proportional speedup on matmul time. Estimate: ~3-5 ms off cfe.
+
+VRAM also halves: 1504 MiB → ~750 MiB post-load. Big win for the multi-
+service deploy where qwen3-tts is co-resident.
+
+**Blocker for shipping:** rank-parity test infrastructure. The user's
+position is documented in `feedback_no_hf_publish.md` and adjacent: the
+0.999 cosine floor is the bar, AND we need to verify that classification
+RANKS don't shuffle on real workloads (top-1 image-prompt match must
+stay correct). The recipe is in
+`/home/dbrain/.claude/projects/-home-dbrain-dev-kobbler/memory/project_siglip2_n_pos_trim_dead.md`
+— that file documents the n_pos-trim dead end but the rank-test framework
+is the same one Q4_K_M needs. Rebuild that test bed first, THEN convert.
+
+### Lever 3 (small): pre-pad weights at conversion
+
+`scripts/convert_siglip2_to_gguf.py` writes qkv_w / o_w at native d_head=72.
+The runtime pads to d_head=80 for tensor-core MMA-FA via `ggml_pad`. Pad
+at conversion → eliminate 27 × 3 = 81 launches per encode. Already
+collapsed by megakernel A1, but the actual padding compute happens
+inside the megakernel kernel — pre-padding the weights would let A1's
+copy-to-scratch read directly without runtime padding logic.
+
+ROI is small (<0.5 ms) but the change is mechanical and reduces complexity.
+
+### What's NOT a lever (don't relitigate)
+
+- **n_pos trim** — `project_siglip2_n_pos_trim_dead.md`. Pad-to-64 is
+  load-bearing for SigLIP2's pooler. Confidence collapses 5+ orders of
+  magnitude with shorter padding.
+- **CUDA graphs alone** — already on. Won't help further.
+- **Sched re-introduction** — landed Path 2 to skip it. Don't reverse.
+- **Lever J (ffn_down padding)** — parked per the standing rule (126 MiB
+  doesn't justify sub-0.999 cosine on 12 GB GPU).
+
+### What "done" looks like for Phase C
+
+- cfe (`/v1/classify_from_embeddings`) **≤ 0.85× python p50** on a clean
+  GPU with kobbler-vision-1 co-resident. (Equivalent to **≤ ~17 ms**
+  absolute at current python ratios.) That's "real embarrassment."
+- All four parity scripts PASS — vision/text/image/score cosines ≥ 0.999,
+  probs MAE ≤ 5e-3.
+- 5-prompt batched vs 1-prompt sequential self-parity ≥ 0.99994.
+- VRAM regression is OK if the lever justifies it (Q4_K_M halves; MMQ
+  may grow scratch by ~50 MiB) — full-tower post-warmup VRAM target
+  is the metric. Today: ~1.5 GiB.
+- Add a Phase C receipts section here mirroring Phase B's table.
+
+### Files the next agent will likely touch
+
+- `src/cuda/siglip2_megakernel.cu` — add a custom MMQ kernel under a new
+  function (`launch_siglip2_mmq_q8_0_f32_kernel`?). Plumb through the
+  op_hook for `MUL_MAT` ops on attn/o/up/down weights.
+- `src/cuda/siglip2_megakernel.cuh` — kernel forward decls.
+- `scripts/convert_siglip2_to_gguf.py` — Q4_K_M conversion option +
+  optional pre-padded qkv_w/o_w.
+- `scripts/parity_check_*.py` — rank-parity test bed (top-1 stability
+  on a labeled image+prompt corpus). Probably new
+  `scripts/rank_parity_check.py` script.
+- `models/` — emit `siglip2-so400m-naflex-q4_k_m.gguf` alongside Q8_0.
 
 ## Phase A2 — gallocr trap take 2 (read before extending)
 

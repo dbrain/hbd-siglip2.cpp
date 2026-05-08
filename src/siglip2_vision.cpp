@@ -254,14 +254,56 @@ ggml_tensor * build_probe_head(
 
 } // anonymous namespace
 
+// Phase B Path 2: cache (ctx, gf, gallocr, named tensors) per (n_patches_h, n_patches_w, pooling).
+//
+// Same approach as TextEncoder — bypass ggml_backend_sched, use a per-entry
+// gallocr + ggml_backend_graph_compute. Stable tensor pointers across calls
+// unlock ggml-cuda's CUDA-graph warmup path.
+struct VisionGraphCacheEntry {
+    int     n_patches_h = 0;
+    int     n_patches_w = 0;
+    Pooling pooling     = Pooling::MEAN;
+
+    std::vector<uint8_t> arena;
+    ggml_context *       ctx     = nullptr;
+    ggml_cgraph *        gf      = nullptr;
+    ggml_gallocr_t       gallocr = nullptr;
+
+    ggml_tensor * inp    = nullptr; // pixel_values input
+    ggml_tensor * pooled = nullptr; // output
+
+    VisionGraphCacheEntry() = default;
+    VisionGraphCacheEntry(const VisionGraphCacheEntry &) = delete;
+    VisionGraphCacheEntry & operator=(const VisionGraphCacheEntry &) = delete;
+    VisionGraphCacheEntry(VisionGraphCacheEntry && o) noexcept { *this = std::move(o); }
+    VisionGraphCacheEntry & operator=(VisionGraphCacheEntry && o) noexcept {
+        if (this != &o) {
+            if (gallocr) ggml_gallocr_free(gallocr);
+            if (ctx) ggml_free(ctx);
+            n_patches_h = o.n_patches_h;
+            n_patches_w = o.n_patches_w;
+            pooling     = o.pooling;
+            arena       = std::move(o.arena);
+            ctx         = o.ctx;     o.ctx = nullptr;
+            gf          = o.gf;      o.gf  = nullptr;
+            gallocr     = o.gallocr; o.gallocr = nullptr;
+            inp         = o.inp;     o.inp = nullptr;
+            pooled      = o.pooled;  o.pooled = nullptr;
+        }
+        return *this;
+    }
+    ~VisionGraphCacheEntry() {
+        if (gallocr) ggml_gallocr_free(gallocr);
+        if (ctx) ggml_free(ctx);
+    }
+};
+
 struct VisionEncoder::State {
     qwen3_tts::GGUFLoader loader;
 
     ggml_backend_t        backend     = nullptr;
-    ggml_backend_t        backend_cpu = nullptr; // scheduler fallback when backend != CPU
     ggml_backend_buffer_t weights_buf = nullptr;
     ggml_context *        weights_ctx = nullptr;
-    ggml_backend_sched_t  sched       = nullptr;
 
     // Weight tensors (in weights_ctx)
     ggml_tensor * patch_embd_w = nullptr;
@@ -273,18 +315,19 @@ struct VisionEncoder::State {
     std::vector<Block> blocks;
     ProbeHead          head;
 
+    // NaFlex hits a finite set of (h, w) shapes per max_num_patches; 4 entries
+    // covers the binary-search outcomes for max_num_patches=729 (square + a
+    // few aspect-clamped variants). LRU evicts further shapes.
+    static constexpr size_t kCacheCap = 4;
+    std::vector<VisionGraphCacheEntry> graph_cache;
+
     ~State() {
-        if (sched) {
-            ggml_backend_sched_free(sched);
-        }
+        graph_cache.clear();
         if (weights_buf) {
             ggml_backend_buffer_free(weights_buf);
         }
         if (weights_ctx) {
             ggml_free(weights_ctx);
-        }
-        if (backend_cpu && backend_cpu != backend) {
-            ggml_backend_free(backend_cpu);
         }
         if (backend) {
             qwen3_tts::release_preferred_backend(backend);
@@ -337,11 +380,6 @@ bool VisionEncoder::load(const std::string & gguf_path) {
         delete state_;
         state_ = nullptr;
         return false;
-    }
-    if (ggml_backend_dev_type(ggml_backend_get_device(state_->backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-        state_->backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    } else {
-        state_->backend_cpu = state_->backend;
     }
 
     const int64_t n_total = state_->loader.get_n_tensors();
@@ -446,27 +484,6 @@ bool VisionEncoder::load(const std::string & gguf_path) {
         return false;
     }
 
-    // Compute scheduler.
-    {
-        std::vector<ggml_backend_t> backends;
-        backends.push_back(state_->backend);
-        if (state_->backend_cpu && state_->backend_cpu != state_->backend) {
-            backends.push_back(state_->backend_cpu);
-        }
-        std::vector<ggml_backend_buffer_type_t> bufts;
-        for (auto b : backends) bufts.push_back(ggml_backend_get_default_buffer_type(b));
-        const int max_nodes = 2048;
-        state_->sched = ggml_backend_sched_new(
-            backends.data(), bufts.data(), (int)backends.size(),
-            max_nodes, /*parallel=*/false, /*op_offload=*/true);
-        if (!state_->sched) {
-            error_msg_ = "ggml_backend_sched_new failed";
-            delete state_;
-            state_ = nullptr;
-            return false;
-        }
-    }
-
     return true;
 }
 
@@ -497,100 +514,111 @@ bool VisionEncoder::encode(
     const int   feat     = config_.num_channels * config_.patch_size * config_.patch_size;
     const float kq_scale = 1.0f / std::sqrt((float)d_head);
 
-    const int    max_nodes = 2048;
-    const size_t arena_sz  =
-        ggml_tensor_overhead() * 4096 +
-        ggml_graph_overhead_custom(max_nodes, false);
-    std::vector<uint8_t> arena(arena_sz);
-    struct ggml_init_params gp = {
-        /*.mem_size   =*/ arena.size(),
-        /*.mem_buffer =*/ arena.data(),
-        /*.no_alloc   =*/ true,
-    };
-    ggml_context * ctx = ggml_init(gp);
-    if (!ctx) {
-        error_msg_ = "ggml_init for graph_ctx failed";
-        return false;
-    }
-
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, max_nodes, false);
-
-    // Input: pixel_values [feat, n_pos] in ggml convention (ne[0]=feat innermost).
-    ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, feat, n_pos);
-    ggml_set_name(inp, "pixel_values");
-    ggml_set_input(inp);
-
-    // Patch embed: Linear(feat -> H). Weight stored (feat, H); mul_mat -> (H, n_pos).
-    ggml_tensor * x = ggml_mul_mat(ctx, state_->patch_embd_w, inp);
-    x = ggml_add(ctx, x, state_->patch_embd_b);
-
-    // Position embedding: bilinear interpolate from native (n_per_side, n_per_side, H)
-    // to target (n_patches_w, n_patches_h, H), then add. Skip the interpolation when
-    // the target matches native (avoids small numerical noise from the resampler).
-    ggml_tensor * pos_embd = state_->pos_embd; // (H, num_patches)
-    if (n_patches_h != n_per_side || n_patches_w != n_per_side) {
-        pos_embd = ggml_reshape_3d(ctx, pos_embd, H, n_per_side, n_per_side);
-        pos_embd = ggml_permute(ctx, pos_embd, 2, 0, 1, 3);              // (n_per_side, n_per_side, H)
-        // BILINEAR + ANTIALIAS matches HF Siglip2VisionEmbeddings.resize_positional_embeddings
-        // exactly (which uses F.interpolate(mode='bilinear', antialias=True)).
-        pos_embd = ggml_interpolate(
-            ctx, pos_embd,
-            n_patches_w, n_patches_h, H, 1,
-            GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS);       // (n_w, n_h, H)
-        pos_embd = ggml_permute(ctx, pos_embd, 1, 2, 0, 3);              // (H, n_w, n_h)
-        pos_embd = ggml_cont_2d(ctx, pos_embd, H, n_pos);                // (H, n_pos)
-    }
-    x = ggml_add(ctx, x, pos_embd);
-
-    // Flash attention is enabled by default — saves the per-layer KQ activation
-    // (n_pos² × n_head × 4 bytes). For SigLIP2's d_head=72 the CUDA dispatcher
-    // routes to the tile kernel (MMA paths skip 72), but it's still a clear win
-    // on activation memory and end-to-end perf vs vanilla 3-op attention.
-    // SIGLIP2_DISABLE_FA=1 falls back if a parity issue surfaces.
     static const bool use_fa = std::getenv("SIGLIP2_DISABLE_FA") == nullptr;
 
-    for (int il = 0; il < config_.num_hidden_layers; ++il) {
-        x = build_block(ctx, state_->blocks[il], x, n_pos, d_head, n_head, config_.layer_norm_eps, kq_scale, use_fa);
+    VisionGraphCacheEntry * pe = nullptr;
+    for (auto & ce : state_->graph_cache) {
+        if (ce.n_patches_h == n_patches_h && ce.n_patches_w == n_patches_w && ce.pooling == pooling) {
+            pe = &ce;
+            break;
+        }
+    }
+    bool was_miss = pe == nullptr;
+    if (was_miss) {
+        if (state_->graph_cache.size() >= State::kCacheCap) {
+            state_->graph_cache.erase(state_->graph_cache.begin());
+        }
+        state_->graph_cache.emplace_back();
+        VisionGraphCacheEntry & e = state_->graph_cache.back();
+        e.n_patches_h = n_patches_h;
+        e.n_patches_w = n_patches_w;
+        e.pooling     = pooling;
+
+        const int    max_nodes = 2048;
+        const size_t arena_sz  =
+            ggml_tensor_overhead() * 4096 +
+            ggml_graph_overhead_custom(max_nodes, false);
+        e.arena.assign(arena_sz, 0);
+        struct ggml_init_params gp = {
+            /*.mem_size   =*/ e.arena.size(),
+            /*.mem_buffer =*/ e.arena.data(),
+            /*.no_alloc   =*/ true,
+        };
+        e.ctx = ggml_init(gp);
+        if (!e.ctx) {
+            state_->graph_cache.pop_back();
+            error_msg_ = "ggml_init for graph_ctx failed";
+            return false;
+        }
+        e.gf = ggml_new_graph_custom(e.ctx, max_nodes, false);
+
+        e.inp = ggml_new_tensor_2d(e.ctx, GGML_TYPE_F32, feat, n_pos);
+        ggml_set_name(e.inp, "pixel_values");
+        ggml_set_input(e.inp);
+
+        ggml_tensor * x = ggml_mul_mat(e.ctx, state_->patch_embd_w, e.inp);
+        x = ggml_add(e.ctx, x, state_->patch_embd_b);
+
+        ggml_tensor * pos_embd = state_->pos_embd;
+        if (n_patches_h != n_per_side || n_patches_w != n_per_side) {
+            pos_embd = ggml_reshape_3d(e.ctx, pos_embd, H, n_per_side, n_per_side);
+            pos_embd = ggml_permute(e.ctx, pos_embd, 2, 0, 1, 3);
+            pos_embd = ggml_interpolate(
+                e.ctx, pos_embd,
+                n_patches_w, n_patches_h, H, 1,
+                GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS);
+            pos_embd = ggml_permute(e.ctx, pos_embd, 1, 2, 0, 3);
+            pos_embd = ggml_cont_2d(e.ctx, pos_embd, H, n_pos);
+        }
+        x = ggml_add(e.ctx, x, pos_embd);
+
+        for (int il = 0; il < config_.num_hidden_layers; ++il) {
+            x = build_block(e.ctx, state_->blocks[il], x, n_pos, d_head, n_head, config_.layer_norm_eps, kq_scale, use_fa);
+        }
+
+        x = build_layernorm(e.ctx, x, state_->post_ln_w, state_->post_ln_b, config_.layer_norm_eps);
+
+        if (pooling == Pooling::MEAN) {
+            e.pooled = ggml_cont(e.ctx, ggml_transpose(e.ctx, x));
+            e.pooled = ggml_mean(e.ctx, e.pooled);
+        } else {
+            e.pooled = build_probe_head(
+                e.ctx, state_->head, x,
+                n_pos, H, d_head, n_head, config_.layer_norm_eps, kq_scale, use_fa);
+        }
+        ggml_set_name(e.pooled, "pooled");
+        ggml_set_output(e.pooled);
+        ggml_build_forward_expand(e.gf, e.pooled);
+
+        e.gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(state_->backend));
+        if (!e.gallocr || !ggml_gallocr_reserve(e.gallocr, e.gf)) {
+            state_->graph_cache.pop_back();
+            error_msg_ = "ggml_gallocr_reserve failed";
+            return false;
+        }
+
+        pe = &e;
+    }
+    VisionGraphCacheEntry & ce = *pe;
+
+    if (was_miss) {
+        if (!ggml_gallocr_alloc_graph(ce.gallocr, ce.gf)) {
+            error_msg_ = "ggml_gallocr_alloc_graph failed";
+            return false;
+        }
     }
 
-    x = build_layernorm(ctx, x, state_->post_ln_w, state_->post_ln_b, config_.layer_norm_eps);
+    ggml_backend_tensor_set(ce.inp, pixel_values, 0, sizeof(float) * (size_t)feat * n_pos);
 
-    ggml_tensor * pooled = nullptr;
-    if (pooling == Pooling::MEAN) {
-        // Mean-pool over patches: x is (H, n_pos); transpose to (n_pos, H) so ggml_mean reduces n_pos.
-        pooled = ggml_cont(ctx, ggml_transpose(ctx, x));
-        pooled = ggml_mean(ctx, pooled);
-    } else { // PROBE
-        pooled = build_probe_head(
-            ctx, state_->head, x,
-            n_pos, H, d_head, n_head, config_.layer_norm_eps, kq_scale, use_fa);
-    }
-    ggml_set_name(pooled, "pooled");
-    ggml_set_output(pooled);
-
-    ggml_build_forward_expand(gf, pooled);
-
-    if (!ggml_backend_sched_alloc_graph(state_->sched, gf)) {
-        ggml_free(ctx);
-        error_msg_ = "ggml_backend_sched_alloc_graph failed";
-        return false;
-    }
-
-    ggml_backend_tensor_set(inp, pixel_values, 0, sizeof(float) * (size_t)feat * n_pos);
-
-    enum ggml_status st = ggml_backend_sched_graph_compute(state_->sched, gf);
+    enum ggml_status st = ggml_backend_graph_compute(state_->backend, ce.gf);
     if (st != GGML_STATUS_SUCCESS) {
-        ggml_backend_sched_reset(state_->sched);
-        ggml_free(ctx);
         error_msg_ = std::string("graph compute failed status=") + std::to_string((int)st);
         return false;
     }
 
     out_embedding.assign((size_t)H, 0.0f);
-    ggml_backend_tensor_get(pooled, out_embedding.data(), 0, sizeof(float) * (size_t)H);
+    ggml_backend_tensor_get(ce.pooled, out_embedding.data(), 0, sizeof(float) * (size_t)H);
 
-    ggml_backend_sched_reset(state_->sched);
-    ggml_free(ctx);
     return true;
 }
 
