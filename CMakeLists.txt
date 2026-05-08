@@ -210,10 +210,15 @@ endif()
 # whole point.
 if(GGML_CUDA)
     find_package(CUDAToolkit REQUIRED)
-    add_executable(microbench_mmq bench/microbench_mmq.cpp)
-    target_link_libraries(microbench_mmq PRIVATE ggml siglip2_megakernel CUDA::cudart)
+    add_executable(microbench_mmq
+        bench/microbench_mmq.cpp
+        bench/microbench_cublaslt_helpers.cu)
+    target_link_libraries(microbench_mmq PRIVATE
+        ggml siglip2_megakernel
+        CUDA::cudart CUDA::cublas CUDA::cublasLt)
     target_include_directories(microbench_mmq PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda
+        ${CMAKE_CURRENT_SOURCE_DIR}/bench
         ${GGML_DIR}/src
     )
 endif()

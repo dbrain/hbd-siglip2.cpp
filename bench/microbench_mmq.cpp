@@ -24,7 +24,9 @@
 #include "ggml-cuda.h"
 
 #include "siglip2_custom_mmq.cuh"
+#include "microbench_cublaslt_helpers.cuh"
 
+#include <cublasLt.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -284,6 +286,256 @@ bool run_custom_path(const Shape & s,
     return true;
 }
 
+// ----------------------------------------------------------------------------
+// cuBLASLt int8 path
+// ----------------------------------------------------------------------------
+//
+// Goal: settle "does cuBLASLt int8 IMMA on Ampere beat ggml-mma at our shapes"
+// before doing the full weight-packing + op_hook integration work (per
+// HANDOFF-perf-next.md target 3 gating step). The runtime weight format here
+// is per-row int8 with one fp32 scale per row of W and one fp32 scale per row
+// of X; the matmul is cuBLASLt's int32 IMMA accumulator, then a custom
+// rescale kernel multiplies the (m,n) cell by W_scale[n] * X_scale[m].
+//
+// Per-row scaling LOSES Q8_0's per-32-element block fidelity by design — the
+// cosine reported here will fail the 0.999 floor on most shapes. That's
+// expected: this column is a SPEED upper bound. If even this loose form
+// can't beat ggml-mma, the per-K-tile scaling form (which is more expensive
+// — multiple sub-GEMMs or a scale-aware custom output kernel) won't either,
+// and target 3 is dead. If it DOES beat ggml-mma, the next step is to put
+// a faithful per-block-scale path in place (likely K-blocked sub-GEMMs or
+// dequant-to-bf16 + cuBLASLt HGEMM, depending on which is faster).
+
+#define CHECK_CUBLAS(call) do {                                              \
+    auto _s = (call);                                                        \
+    if (_s != CUBLAS_STATUS_SUCCESS) {                                       \
+        fprintf(stderr, "cuBLASLt error %d at %s:%d (%s)\n",                 \
+                (int) _s, __FILE__, __LINE__, #call);                        \
+        return false;                                                        \
+    }                                                                        \
+} while (0)
+
+// Repack Q8_0 weight rows to row-wise int8 + per-row fp32 scale. Q8_0 stores
+// 32 elements per block, 36 blocks per K=1152, each with an fp16 scale. We
+// dequant to fp32 then re-quantize per-row. Matches what the runtime would
+// have to do; runs once at "load time".
+static void repack_q8_to_rowscale_int8(const std::vector<uint8_t> & q8,
+                                       int K, int N,
+                                       std::vector<int8_t> & out_int8,
+                                       std::vector<float>  & out_row_scales) {
+    const int blocks_per_row = K / 32;  // Q8_0 block size is 32
+    const size_t block_bytes = sizeof(uint16_t) /*scale*/ + 32 /*qs*/;
+    out_int8.assign((size_t) N * (size_t) K, 0);
+    out_row_scales.assign((size_t) N, 0.0f);
+
+    std::vector<float> row_f32(K);
+    for (int n = 0; n < N; ++n) {
+        const uint8_t * row = q8.data() + (size_t) n * blocks_per_row * block_bytes;
+        // Dequant the row.
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const uint8_t * blk = row + (size_t) b * block_bytes;
+            uint16_t s_u16; std::memcpy(&s_u16, blk, sizeof(uint16_t));
+            const float scale = ggml_fp16_to_fp32(s_u16);
+            const int8_t * qs = (const int8_t *)(blk + sizeof(uint16_t));
+            for (int i = 0; i < 32; ++i) {
+                row_f32[b * 32 + i] = scale * (float) qs[i];
+            }
+        }
+        // Per-row scale = max(|row|) / 127.
+        float maxabs = 0.0f;
+        for (int k = 0; k < K; ++k) maxabs = std::max(maxabs, std::fabs(row_f32[k]));
+        const float scale = maxabs > 0.0f ? maxabs / 127.0f : 1.0f;
+        const float inv   = 1.0f / scale;
+        for (int k = 0; k < K; ++k) {
+            int v = (int) std::lround(row_f32[k] * inv);
+            v = std::max(-127, std::min(127, v));
+            out_int8[(size_t) n * (size_t) K + (size_t) k] = (int8_t) v;
+        }
+        out_row_scales[n] = scale;
+    }
+}
+
+// Run the cuBLASLt int8 path for one shape. Reuses host_x_f32, host_w_quant
+// from the ggml run; computes its own packings.
+static bool run_cublaslt_path(cublasLtHandle_t lt,
+                              const Shape & s,
+                              const std::vector<float>   & host_x_f32,
+                              const std::vector<uint8_t> & host_w_quant,
+                              const std::vector<float>   & ref_dst,
+                              Result & out) {
+    if (s.w_type != GGML_TYPE_Q8_0) {
+        out.ran = false;
+        return true;  // not applicable
+    }
+
+    // 1) Pack weights: Q8_0 → row-wise int8 [N, K] + fp32 scale [N].
+    std::vector<int8_t> w_int8;
+    std::vector<float>  w_scales;
+    repack_q8_to_rowscale_int8(host_w_quant, (int) s.K, (int) s.N, w_int8, w_scales);
+
+    // 2) Allocate device buffers.
+    int8_t  * d_w        = nullptr;
+    int8_t  * d_x_int8   = nullptr;
+    int32_t * d_dst_int32 = nullptr;
+    float   * d_dst_f32  = nullptr;
+    float   * d_w_scales = nullptr;
+    float   * d_x_scales = nullptr;
+    float   * d_x_f32    = nullptr;
+    cudaMalloc(&d_w,          w_int8.size());
+    cudaMalloc(&d_x_int8,     (size_t) s.M * s.K);
+    cudaMalloc(&d_dst_int32,  (size_t) s.M * s.N * sizeof(int32_t));
+    cudaMalloc(&d_dst_f32,    (size_t) s.M * s.N * sizeof(float));
+    cudaMalloc(&d_w_scales,   (size_t) s.N * sizeof(float));
+    cudaMalloc(&d_x_scales,   (size_t) s.M * sizeof(float));
+    cudaMalloc(&d_x_f32,      host_x_f32.size() * sizeof(float));
+    cudaMemcpy(d_w,        w_int8.data(),    w_int8.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_w_scales, w_scales.data(),  w_scales.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_x_f32,    host_x_f32.data(), host_x_f32.size() * sizeof(float), cudaMemcpyHostToDevice);
+
+    cudaStream_t stream = 0;
+
+    // 3) Quantize x: F32 [K, M] → int8 [M, K] row-major + per-row scale [M].
+    launch_quantize_x_to_rowscale_int8(d_x_f32, d_x_int8, d_x_scales,
+                                       (int) s.M, (int) s.K, stream);
+
+    // 4) cuBLASLt int8 IMMA setup.
+    //
+    // We compute Y[M, N] = X[M, K] · W[N, K]^T. cuBLASLt's strict layout is
+    // column-major; we lay out X and W in row-major K-fastest, treat them
+    // as transposed cm matrices (K rows, M/N cols) and use the OP_T flag.
+    //
+    // Op shape (column-major):
+    //   A: int8 K x N  (which is W's row-major [N, K] viewed transposed)
+    //   B: int8 K x M  (which is X's row-major [M, K] viewed transposed)
+    //   C: int32 N x M (column-major)
+    // We swap A/B so the column-major output is N x M, then read it as M x N
+    // row-major below for the rescale.
+
+    cublasLtMatmulDesc_t op_desc = nullptr;
+    cublasLtMatrixLayout_t a_layout = nullptr, b_layout = nullptr, c_layout = nullptr;
+
+    CHECK_CUBLAS(cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32I, CUDA_R_32I));
+    cublasOperation_t op_t = CUBLAS_OP_T;
+    cublasOperation_t op_n = CUBLAS_OP_N;
+    CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_t, sizeof(op_t)));
+    CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_n, sizeof(op_n)));
+
+    // A = W_int8, row-major [N, K] → cm view [K, N], ld=K
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&a_layout, CUDA_R_8I, s.K, s.N, s.K));
+    // B = X_int8, row-major [M, K] → cm view [K, M], ld=K
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&b_layout, CUDA_R_8I, s.K, s.M, s.K));
+    // C = int32 cm [N, M], ld=N — we then transpose-read as row-major [M, N]
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&c_layout, CUDA_R_32I, s.N, s.M, s.N));
+
+    int32_t alpha = 1, beta = 0;
+
+    auto do_gemm = [&]() {
+        return cublasLtMatmul(lt, op_desc,
+                              &alpha,
+                              d_w,        a_layout,
+                              d_x_int8,   b_layout,
+                              &beta,
+                              d_dst_int32, c_layout,
+                              d_dst_int32, c_layout,
+                              /*algo=*/   nullptr,
+                              /*workspace=*/ nullptr, /*ws_bytes=*/ 0,
+                              stream);
+    };
+
+    auto run_one = [&]() {
+        // Re-quantize x each iteration so the timing reflects what the runtime
+        // will pay (the activation is fresh per encode).
+        launch_quantize_x_to_rowscale_int8(d_x_f32, d_x_int8, d_x_scales,
+                                           (int) s.M, (int) s.K, stream);
+        do_gemm();
+        // int32 → fp32 in-place rescale. cuBLASLt wrote int32 [N, M] cm; we
+        // multiply by w_scale[n] * x_scale[m] cell-by-cell and write fp32 at
+        // the same address (sizeof matches). The correctness probe re-runs
+        // and reads int32 to host without this kernel so we can compute
+        // cosine at full precision.
+        launch_int32_rescale_to_fp32_inplace(d_dst_int32, d_w_scales, d_x_scales,
+                                             (int) s.M, (int) s.N, stream);
+    };
+
+    // Warmup.
+    for (int i = 0; i < WARMUP_ITERS; ++i) run_one();
+    cudaStreamSynchronize(stream);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "  cublaslt warmup error: %s\n", cudaGetErrorString(err));
+        out.ran = false;
+        cublasLtMatrixLayoutDestroy(a_layout);
+        cublasLtMatrixLayoutDestroy(b_layout);
+        cublasLtMatrixLayoutDestroy(c_layout);
+        cublasLtMatmulDescDestroy(op_desc);
+        cudaFree(d_w); cudaFree(d_x_int8); cudaFree(d_dst_int32);
+        cudaFree(d_dst_f32); cudaFree(d_w_scales); cudaFree(d_x_scales); cudaFree(d_x_f32);
+        return false;
+    }
+
+    // Correctness probe — convert int32→fp32, then apply the rescale and
+    // compare against ref_dst (which is column-major [N, M] from ggml's
+    // mul_mat). A separate clean run since the in-place rescale above
+    // overwrote d_dst_int32 with floats.
+    {
+        // Re-do the gemm and convert to fp32 outside the timing loop.
+        launch_quantize_x_to_rowscale_int8(d_x_f32, d_x_int8, d_x_scales,
+                                           (int) s.M, (int) s.K, stream);
+        do_gemm();
+        // int32 cm[N, M] → fp32 cm[N, M] (same shape as ref_dst, no transpose).
+        std::vector<int32_t> raw_int32((size_t) s.M * (size_t) s.N);
+        cudaMemcpy(raw_int32.data(), d_dst_int32, raw_int32.size() * sizeof(int32_t), cudaMemcpyDeviceToHost);
+        std::vector<float> x_scales_h((size_t) s.M);
+        cudaMemcpy(x_scales_h.data(), d_x_scales, x_scales_h.size() * sizeof(float), cudaMemcpyDeviceToHost);
+
+        std::vector<float> our_dst((size_t) s.M * (size_t) s.N);
+        // ref_dst is what ggml_mul_mat(W, X) produced — shape from
+        // ggml's perspective is (N, M) column-major (W is K x N, X is K x M,
+        // result is N x M). Our raw_int32 is also cm [N, M]. So index match
+        // is: cell(n, m) at i = m * N + n.
+        double dot = 0.0, na = 0.0, nb = 0.0, max_abs = 0.0;
+        for (int m = 0; m < (int) s.M; ++m) {
+            const float xs = x_scales_h[m];
+            for (int n = 0; n < (int) s.N; ++n) {
+                const size_t i = (size_t) m * s.N + n;
+                const float v = (float) raw_int32[i] * xs * w_scales[n];
+                our_dst[i] = v;
+                const float r = ref_dst[i];
+                dot += v * r; na += v * v; nb += r * r;
+                max_abs = std::max(max_abs, (double) std::fabs(v - r));
+            }
+        }
+        out.cosine  = (na > 0 && nb > 0) ? dot / std::sqrt(na * nb) : 0.0;
+        out.max_abs = max_abs;
+    }
+
+    // Measure.
+    using clk = std::chrono::steady_clock;
+    std::vector<double> samples;
+    samples.reserve(MEASURE_ITERS);
+    for (int i = 0; i < MEASURE_ITERS; ++i) {
+        auto t0 = clk::now();
+        run_one();
+        cudaStreamSynchronize(stream);
+        auto t1 = clk::now();
+        samples.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+    }
+    out.ran     = true;
+    out.p50     = percentile(samples, 0.5);
+    out.p99     = percentile(samples, 0.99);
+    out.mn      = *std::min_element(samples.begin(), samples.end());
+    out.mean_ms = mean(samples);
+
+    cublasLtMatrixLayoutDestroy(a_layout);
+    cublasLtMatrixLayoutDestroy(b_layout);
+    cublasLtMatrixLayoutDestroy(c_layout);
+    cublasLtMatmulDescDestroy(op_desc);
+    cudaFree(d_w); cudaFree(d_x_int8); cudaFree(d_dst_int32);
+    cudaFree(d_dst_f32); cudaFree(d_w_scales); cudaFree(d_x_scales); cudaFree(d_x_f32);
+    return true;
+}
+
 }  // namespace
 
 // One-shot profile of the custom kernel at the cfe shape (M=320). Dumps
@@ -400,21 +652,32 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    cublasLtHandle_t lt = nullptr;
+    if (cublasLtCreate(&lt) != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "cublasLtCreate failed\n");
+        ggml_backend_free(backend);
+        return 1;
+    }
+
     char devname[256] = {0};
     ggml_backend_cuda_get_device_description(0, devname, sizeof(devname));
     printf("Device: %s\n", devname);
     printf("Warmup: %d iters    Measure: %d iters\n", WARMUP_ITERS, MEASURE_ITERS);
     printf("\n");
 
-    printf("%-32s | %10s %10s | %10s %10s | %8s | %s\n",
-           "shape (M K N)", "ggml p50", "ggml GFLP", "cust p50", "cust/ggml", "cosine", "maxabs");
-    printf("%-32s + %10s %10s + %10s %10s + %8s + %s\n",
+    printf("%-32s | %10s %10s | %10s %10s | %10s %10s %10s | %8s\n",
+           "shape (M K N)",
+           "ggml p50", "ggml GFLP",
+           "cust p50", "cust/ggml",
+           "cuBLLt p50", "cuBLLt/gg", "cuBLLt cos",
+           "cust cos");
+    printf("%-32s + %10s %10s + %10s %10s + %10s %10s %10s + %8s\n",
            "--------------------------------",
            "----------", "----------", "----------", "----------",
-           "--------", "----------");
+           "----------", "----------", "----------", "--------");
 
     for (const auto & s : SHAPES) {
-        Result rg, rc;
+        Result rg, rc, rl;
         std::vector<float>   host_x_f32;
         std::vector<uint8_t> host_w_quant;
         std::vector<float>   ref_dst;
@@ -423,17 +686,28 @@ int main(int argc, char ** argv) {
             continue;
         }
         run_custom_path(s, host_x_f32, host_w_quant, ref_dst, rc);
+        run_cublaslt_path(lt, s, host_x_f32, host_w_quant, ref_dst, rl);
 
         const double flops = 2.0 * (double)s.M * (double)s.K * (double)s.N;
         const double ggflops = flops / (rg.p50 * 1e-3) / 1e9;
 
+        // ggml + cuBLASLt + custom row.
+        printf("%-32s | %10.3f %10.1f", s.label, rg.p50, ggflops);
         if (rc.ran) {
-            const double ratio = rc.p50 / rg.p50;
-            printf("%-32s | %10.3f %10.1f | %10.3f %10.3fx | %8.6f | %.3e\n",
-                   s.label, rg.p50, ggflops, rc.p50, ratio, rc.cosine, rc.max_abs);
+            printf(" | %10.3f %9.3fx", rc.p50, rc.p50 / rg.p50);
         } else {
-            printf("%-32s | %10.3f %10.1f | %10s %10s | %8s | %s\n",
-                   s.label, rg.p50, ggflops, "—", "—", "—", "—");
+            printf(" | %10s %10s", "—", "—");
+        }
+        if (rl.ran) {
+            printf(" | %10.3f %9.3fx %10.6f",
+                   rl.p50, rl.p50 / rg.p50, rl.cosine);
+        } else {
+            printf(" | %10s %10s %10s", "—", "—", "—");
+        }
+        if (rc.ran) {
+            printf(" | %8.6f\n", rc.cosine);
+        } else {
+            printf(" | %8s\n", "—");
         }
 
         // Profile mode: run the cycle breakdown for the cfe shape after
@@ -443,6 +717,7 @@ int main(int argc, char ** argv) {
         }
     }
 
+    cublasLtDestroy(lt);
     ggml_backend_free(backend);
     return 0;
 }
