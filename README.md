@@ -1,6 +1,6 @@
 # siglip2.cpp
 
-> ⚠️ PSAs/TLDRs from the potato that told Claude to see if we could make siglip2 friendlier to run after poking at [dbrain/qwen3-tts.cpp](https://github.com/dbrain/qwen3-tts.cpp)
+> ⚠️ PSAs/TLDRs from the potato that told Claude to see if we could make siglip2 friendlier to run after poking at [dbrain/qwen3-tts.cpp](https://github.com/dbrain/qwen3-tts.cpp) which is a fork of a fork I also potatoed
 > - LLM generated noise - I'm a software engineer but I won't pretend to know anything about this space,
 > - Entirely tested and targetted at my hardware (RTX 3060 12GB, AMD misc), may explode on anything else or run slower. Likely any CUDA device would benefit but I'm no nvidiaologist, 0 attention paid outside of "works for me".
 > - Performance gains are ok - but thin margins - VRAM in my case was the more important bit, although my actual python server was running at around 2400 MiB after doing some magic so saving are overplayed based on "copy paste siglip2 example" VRAM
