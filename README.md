@@ -1,5 +1,6 @@
-# siglip2.cpp
+# hbd-siglip2.cpp
 
+> Here be dragons 🐲
 > ⚠️ PSAs/TLDRs from the potato that told Claude to see if we could make siglip2 friendlier to run after poking at [dbrain/qwen3-tts.cpp](https://github.com/dbrain/qwen3-tts.cpp) which is a fork of a fork I also potatoed
 > - LLM generated noise - I'm a software engineer but I won't pretend to know anything about this space.
 > - Entirely tested and targetted at my hardware (RTX 3060 12GB, AMD misc), may explode on anything else or run slower. Likely any CUDA device would benefit but I'm no nvidiaologist, 0 attention paid outside of "works for me".
