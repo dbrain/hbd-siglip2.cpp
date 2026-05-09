@@ -1,6 +1,6 @@
 # siglip2.cpp
 
-Pure C++/ggml port of [`google/siglip2-so400m-patch16-naflex`](https://huggingface.co/google/siglip2-so400m-patch16-naflex) — vision encoder, text encoder, multilingual tokenizer, sigmoid image–text scoring. CUDA-accelerated, HTTP-server-shaped, with Q8_0 quantization that holds parity against the HF reference.
+Runs Google's [`siglip2-so400m-patch16-naflex`](https://huggingface.co/google/siglip2-so400m-patch16-naflex) in pure C++/CUDA via ggml. Same outputs as the HF PyTorch reference, in roughly a third of the GPU memory at Q8. Ships an HTTP server.
 
 ## Why this exists
 
