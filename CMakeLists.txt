@@ -188,6 +188,8 @@ target_link_libraries(siglip2-text-cli PRIVATE
 if(SIGLIP2_SERVER)
     add_executable(siglip2-server
         src/siglip2_server.cpp
+        src/worker_ipc.cpp
+        src/worker_session.cpp
     )
     target_include_directories(siglip2-server PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/vendor

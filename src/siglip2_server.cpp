@@ -13,6 +13,7 @@
 #include "siglip2_tokenizer.h"
 #include "siglip2_score.h"
 #include "siglip2_preproc.h"
+#include "worker_session.h"
 #include "cuda/siglip2_megakernel.h"
 
 // stb_image is already linked into siglip2_preproc as the implementation;
@@ -57,6 +58,10 @@ struct ServerConfig {
     // return 503.
     bool        vision_only = false;
     bool        text_only   = false;
+    // worker-isolation: when set (via "--worker <fd>"), the process role
+    // flips from HTTP server to subprocess worker dispatch loop. The fd
+    // is the already-open Unix socketpair end inherited from the parent.
+    int         worker_fd   = -1;
 };
 
 ServerConfig parse_args(int argc, char ** argv) {
@@ -94,13 +99,18 @@ ServerConfig parse_args(int argc, char ** argv) {
         else if (a == "--lazy-load")   c.lazy_load   = true;
         else if (a == "--vision-only") c.vision_only = true;
         else if (a == "--text-only")   c.text_only   = true;
+        else if (a == "--worker" && i + 1 < argc) {
+            // Internal flag — set by spawn_worker() in the parent process.
+            c.worker_fd = std::atoi(argv[++i]);
+        }
         else if (a == "--help" || a == "-h") {
             fprintf(stderr,
                 "siglip2-server — kobbler-vision-compatible HTTP service\n\n"
                 "Usage: %s --model <gguf> --tokenizer <spm.model> [--port 8890] [--lazy-load]\n"
                 "         [--vision-only | --text-only]\n"
                 "Env: MODEL_PATH TOKENIZER_PATH HOST PORT DEFAULT_MAX_NUM_PATCHES\n"
-                "     IDLE_UNLOAD_SECONDS LAZY_LOAD VISION_ONLY TEXT_ONLY\n",
+                "     IDLE_UNLOAD_SECONDS LAZY_LOAD VISION_ONLY TEXT_ONLY\n"
+                "     SIGLIP2_WORKER_ISOLATION=0  (opt out of subprocess worker; default ON)\n",
                 argv[0]);
             std::exit(0);
         }
@@ -450,6 +460,15 @@ void send_json(httplib::Response & res, int status, const json & body) {
 
 int main(int argc, char ** argv) {
     ServerConfig cfg = parse_args(argc, argv);
+
+    // worker-isolation: when --worker <fd> was passed, this process is the
+    // GPU child. Hand off to the dispatch loop and exit. The parent's
+    // LOAD_REQ carries model_path/tokenizer_path/etc., so we don't validate
+    // them here.
+    if (cfg.worker_fd >= 0) {
+        return siglip2::run_worker_loop(cfg.worker_fd);
+    }
+
     if (cfg.model_path.empty()) {
         fprintf(stderr, "--model (or MODEL_PATH env) is required.\n");
         return 2;
@@ -458,18 +477,68 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "--tokenizer (or TOKENIZER_PATH env) is required unless --vision-only.\n");
         return 2;
     }
-    // Install fused CUDA kernels (Phase A0: layer-norm-with-affine). Must run
-    // before any encoder load so the hooks are live for the first graph
-    // compute. No-op when GGML_CUDA is OFF or SIGLIP2_DISABLE_MEGAKERNEL=1.
-    siglip2_megakernel::install();
+
+    // worker-isolation: GPU work runs in a forked child. The parent never
+    // touches CUDA, so /v1/admin/unload SIGKILLs the worker and reclaims
+    // ALL VRAM (CUDA primary context, kernel cache, ggml-cuda buffers —
+    // not just the in-process heap). Default ON; SIGLIP2_WORKER_ISOLATION=0
+    // forces single-process mode (e.g. for parity benches against the
+    // worker-iso path or when a tool wants to embed siglip2 directly).
+    bool worker_iso = true;
+    if (const char * env = std::getenv("SIGLIP2_WORKER_ISOLATION")) {
+        worker_iso = env[0] && env[0] != '0';
+    }
+    std::unique_ptr<siglip2::WorkerSession> worker_session;
+    siglip2::WorkerLoadConfig worker_cfg;
+    auto fill_worker_cfg = [&]() {
+        worker_cfg.model_path              = cfg.model_path;
+        worker_cfg.tokenizer_path          = cfg.tokenizer_path;
+        worker_cfg.default_max_num_patches = cfg.default_max_num_patches;
+        worker_cfg.vision_only             = cfg.vision_only;
+        worker_cfg.text_only               = cfg.text_only;
+        worker_cfg.lazy_load               = false;
+    };
+    fill_worker_cfg();
+
+    if (worker_iso) {
+        // Forward CLI args except --worker (set by spawn_worker itself) so
+        // the child sees the same model/tokenizer/--*-only options.
+        std::vector<std::string> child_argv;
+        for (int i = 1; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--worker" && i + 1 < argc) { i++; continue; }
+            child_argv.push_back(a);
+        }
+        worker_session = std::make_unique<siglip2::WorkerSession>(argv[0], child_argv);
+        fprintf(stderr, "[siglip2-server] worker-isolation: ON (subprocess owns GPU; "
+                        "/v1/admin/unload SIGKILLs the worker → 0 VRAM)\n");
+    } else {
+        // In-process mode (SIGLIP2_WORKER_ISOLATION=0): install fused CUDA
+        // kernels. Must run before any encoder load so the hooks are live
+        // for the first graph compute. No-op when GGML_CUDA is OFF or
+        // SIGLIP2_DISABLE_MEGAKERNEL=1.
+        fprintf(stderr, "[siglip2-server] worker-isolation: OFF (in-process; "
+                        "SIGLIP2_WORKER_ISOLATION=0 set)\n");
+        siglip2_megakernel::install();
+    }
+
     ServerState st;
     st.cfg = cfg;
-    if (!cfg.lazy_load) {
+    if (!worker_session && !cfg.lazy_load) {
         std::string err;
         if (!st.load_model(err)) {
             fprintf(stderr, "load failed: %s\n", err.c_str());
             return 1;
         }
+    }
+    if (worker_session && !cfg.lazy_load) {
+        if (!worker_session->ensure_loaded(worker_cfg)) {
+            fprintf(stderr, "fatal: worker model load failed: %s\n",
+                    worker_session->last_error().c_str());
+            return 1;
+        }
+        fprintf(stderr, "[siglip2-server] worker pid=%d loaded model OK\n",
+                (int) worker_session->pid());
     }
 
     httplib::Server srv;
@@ -479,23 +548,28 @@ int main(int argc, char ** argv) {
 
     // -- /health
     srv.Get("/health", [&](const httplib::Request &, httplib::Response & res) {
+        const bool loaded = worker_session ? worker_session->is_alive()
+                                           : st.loaded.load();
         json body = {
             {"status", "ok"},
             {"model", cfg.model_path},
-            {"model_loaded", st.loaded.load()},
+            {"model_loaded", loaded},
         };
+        if (worker_session) body["worker_pid"] = worker_session->pid();
         send_json(res, 200, body);
     });
 
-    // -- /unload
-    srv.Post("/unload", [&](const httplib::Request &, httplib::Response & res) {
-        st.unload();
-        send_json(res, 200, json{{"status", "unloaded"}});
-    });
-
-    // ensure-model helper
+    // ensure-model helper. In worker mode: spawn + LOAD if not running.
+    // In in-process mode: load encoder + tokenizer + score params.
     auto ensure = [&](httplib::Response & res) -> bool {
         st.touch();
+        if (worker_session) {
+            if (!worker_session->ensure_loaded(worker_cfg)) {
+                send_json(res, 503, json{{"error", worker_session->last_error()}});
+                return false;
+            }
+            return true;
+        }
         if (!st.loaded.load()) {
             std::string err;
             if (!st.load_model(err)) {
@@ -506,22 +580,81 @@ int main(int argc, char ** argv) {
         return true;
     };
 
+    // -- /unload (legacy) and /v1/admin/unload — both SIGKILL the worker
+    // when worker_session is active so VRAM is fully reclaimed (kernel
+    // cache + cuBLAS workspace + ggml-cuda buffers). In-process mode just
+    // resets the encoder unique_ptrs.
+    auto do_unload = [&](httplib::Response & res, const char * source) {
+        bool was_loaded = false;
+        if (worker_session) {
+            was_loaded = worker_session->is_alive();
+            worker_session->shutdown();
+        } else {
+            was_loaded = st.loaded.load();
+            if (was_loaded) st.unload();
+        }
+        const bool now_loaded = worker_session ? worker_session->is_alive()
+                                               : st.loaded.load();
+        json out = {{"unloaded", was_loaded}, {"model_loaded", now_loaded},
+                    {"source", source}};
+        if (worker_session) out["mode"] = "worker-isolation";
+        send_json(res, 200, out);
+    };
+    srv.Post("/unload", [&](const httplib::Request &, httplib::Response & res) {
+        do_unload(res, "/unload");
+    });
+    srv.Post("/v1/admin/unload", [&](const httplib::Request &, httplib::Response & res) {
+        do_unload(res, "/v1/admin/unload");
+    });
+
+    // -- /v1/admin/load — explicit reload (mirrors qwen3-tts admin path).
+    // In worker mode this is a synchronous spawn + LOAD_REQ; in in-process
+    // mode it loads the encoder + tokenizer.
+    srv.Post("/v1/admin/load", [&](const httplib::Request &, httplib::Response & res) {
+        bool was_loaded = false;
+        bool ok = false;
+        std::string err_msg;
+        if (worker_session) {
+            was_loaded = worker_session->is_alive();
+            ok = worker_session->ensure_loaded(worker_cfg);
+            if (!ok) err_msg = worker_session->last_error();
+        } else {
+            was_loaded = st.loaded.load();
+            ok = was_loaded || st.load_model(err_msg);
+        }
+        if (!ok) {
+            send_json(res, 500, json{{"error", err_msg}});
+            return;
+        }
+        const bool now_loaded = worker_session ? worker_session->is_alive()
+                                               : st.loaded.load();
+        json out = {{"loaded", !was_loaded}, {"model_loaded", now_loaded}};
+        if (worker_session) out["mode"] = "worker-isolation";
+        send_json(res, 200, out);
+    });
+
     auto require_vision = [&](httplib::Response & res) -> bool {
-        if (!st.vision) {
+        // In worker mode the encoders live in the child; gate on cfg flags.
+        const bool have_vision = worker_session ? !cfg.text_only : (st.vision != nullptr);
+        if (!have_vision) {
             send_json(res, 503, json{{"error", "vision tower not loaded (server started with --text-only)"}});
             return false;
         }
         return true;
     };
     auto require_text = [&](httplib::Response & res) -> bool {
-        if (!st.text || !st.tokenizer) {
+        const bool have_text = worker_session ? !cfg.vision_only
+                                              : (st.text != nullptr && st.tokenizer != nullptr);
+        if (!have_text) {
             send_json(res, 503, json{{"error", "text tower not loaded (server started with --vision-only)"}});
             return false;
         }
         return true;
     };
     auto require_score = [&](httplib::Response & res) -> bool {
-        if (!st.vision || !st.text || !st.tokenizer) {
+        const bool have_both = worker_session ? (!cfg.text_only && !cfg.vision_only)
+                                              : (st.vision != nullptr && st.text != nullptr && st.tokenizer != nullptr);
+        if (!have_both) {
             send_json(res, 503, json{{"error", "classify requires both towers loaded"}});
             return false;
         }
@@ -554,8 +687,17 @@ int main(int argc, char ** argv) {
         }
 
         std::vector<std::vector<float>> embs;
-        embs.reserve(images.size());
-        {
+        if (worker_session) {
+            std::vector<std::string> img_bytes;
+            img_bytes.reserve(images.size());
+            for (const auto & img : images) img_bytes.push_back(img.content);
+            if (!worker_session->encode_images(img_bytes, pooling_str.empty() ? "probe" : pooling_str,
+                                               max_num_patches, /*return_last_hidden=*/false, embs)) {
+                send_json(res, 500, json{{"error", worker_session->last_error()}});
+                return;
+            }
+        } else {
+            embs.reserve(images.size());
             std::lock_guard<std::mutex> lock(st.vision_mutex);
             for (const auto & img : images) {
                 std::vector<float> emb;
@@ -579,15 +721,23 @@ int main(int argc, char ** argv) {
         if (prompts.empty()) { send_json(res, 400, json{{"error", "No prompts provided"}}); return; }
 
         std::vector<std::vector<float>> embs;
-        std::string err;
-        {
-            std::lock_guard<std::mutex> lock(st.text_mutex);
-            if (!encode_text_batch(st, prompts, embs, err)) {
-                send_json(res, 500, json{{"error", err}});
+        if (worker_session) {
+            if (!worker_session->encode_texts(prompts, embs)) {
+                send_json(res, 500, json{{"error", worker_session->last_error()}});
                 return;
             }
+            // Worker already L2-normalizes.
+        } else {
+            std::string err;
+            {
+                std::lock_guard<std::mutex> lock(st.text_mutex);
+                if (!encode_text_batch(st, prompts, embs, err)) {
+                    send_json(res, 500, json{{"error", err}});
+                    return;
+                }
+            }
+            for (auto & e : embs) l2_normalize(e);
         }
-        for (auto & e : embs) l2_normalize(e);
         send_json(res, 200, json{{"embeddings", embs}});
     });
 
@@ -611,6 +761,22 @@ int main(int argc, char ** argv) {
         if (req.has_param("max_num_patches")) {
             const std::string v = req.get_param_value("max_num_patches");
             if (!v.empty()) max_num_patches = std::atoi(v.c_str());
+        }
+
+        if (worker_session) {
+            std::vector<std::string> img_bytes;
+            img_bytes.reserve(images.size());
+            for (const auto & img : images) img_bytes.push_back(img.content);
+            std::vector<std::vector<float>> scores_out, logits_out;
+            if (!worker_session->classify(img_bytes, prompts, max_num_patches,
+                                          return_logits, scores_out, logits_out)) {
+                send_json(res, 500, json{{"error", worker_session->last_error()}});
+                return;
+            }
+            json body = {{"scores", scores_out}};
+            if (return_logits) body["logits"] = logits_out;
+            send_json(res, 200, body);
+            return;
         }
 
         const int H = (int)st.vision->config().hidden_size;
@@ -709,7 +875,8 @@ int main(int argc, char ** argv) {
         if (!ensure(res)) return;
         // image embeddings are supplied by the client, but we still need text + score.
         if (!require_text(res)) return;
-        if (!st.vision) {
+        const bool have_vision = worker_session ? !cfg.text_only : (st.vision != nullptr);
+        if (!have_vision) {
             send_json(res, 503, json{{"error", "classify requires the model loaded with both towers"}});
             return;
         }
@@ -727,11 +894,42 @@ int main(int argc, char ** argv) {
         auto t_parse = tnow();
         const bool return_logits = body.value("return_logits", false);
 
-        const int H = (int)st.vision->config().hidden_size;
+        const int H = worker_session ? worker_session->hidden_size()
+                                     : (int)st.vision->config().hidden_size;
         const auto & imgs_json = body["image_embeddings"];
         const auto & prompts_json = body["prompts"];
         const int n_img = (int)imgs_json.size();
         const int n_txt = (int)prompts_json.size();
+
+        if (worker_session) {
+            std::vector<std::vector<float>> img_embs(n_img, std::vector<float>(H));
+            for (int i = 0; i < n_img; ++i) {
+                const auto & row = imgs_json[i];
+                if ((int)row.size() != H) {
+                    send_json(res, 400, json{{"error", "image_embedding row has wrong dim"}});
+                    return;
+                }
+                for (int c = 0; c < H; ++c) img_embs[i][c] = row[c].get<float>();
+            }
+            std::vector<std::string> prompts(n_txt);
+            for (int j = 0; j < n_txt; ++j) prompts[j] = prompts_json[j].get<std::string>();
+            std::vector<std::vector<float>> scores_out, logits_out;
+            if (!worker_session->classify_from_embeddings(img_embs, prompts, return_logits,
+                                                          scores_out, logits_out)) {
+                send_json(res, 500, json{{"error", worker_session->last_error()}});
+                return;
+            }
+            json out = {{"scores", scores_out}};
+            if (return_logits) out["logits"] = logits_out;
+            send_json(res, 200, out);
+            auto t_done = tnow();
+            if (timing) {
+                std::fprintf(stderr,
+                    "[cfe] parse=%.2f total(worker)=%.2f ms\n",
+                    tms(t0, t_parse), tms(t0, t_done));
+            }
+            return;
+        }
 
         std::vector<float> img_buf((size_t)n_img * H);
         for (int i = 0; i < n_img; ++i) {
