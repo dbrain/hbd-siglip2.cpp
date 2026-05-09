@@ -49,7 +49,7 @@ The latency wins are mild — 15–20 % on most endpoints, parity on `classify_f
 ### 1. Get the source
 
 ```bash
-git clone --recurse-submodules https://github.com/dbrain/siglip2.cpp.git
+git clone --recurse-submodules https://github.com/dbrain/hbd-siglip2.cpp.git
 cd siglip2.cpp
 ```
 
