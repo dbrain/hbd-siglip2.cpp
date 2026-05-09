@@ -165,4 +165,4 @@ Parity is verified by `scripts/parity_check_{vision,text,score,image,tokenizer}.
 
 ## License
 
-TODO.
+MIT — see [LICENSE](LICENSE).
