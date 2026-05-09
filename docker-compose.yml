@@ -1,0 +1,86 @@
+# Recommended operational setup for siglip2-server.
+#
+# Brings up the server with the lifecycle defaults that give ~0 MiB VRAM
+# at idle on consumer GPUs:
+#
+#   - Lazy load: container boots without touching GPU; first request
+#     materialises the model (~0.7 s extra cold path).
+#   - Idle-unload after 5 min of no requests.
+#   - Worker isolation: GPU work runs in a forked subprocess; idle-unload
+#     and POST /v1/admin/unload SIGKILL it so the CUDA primary context is
+#     torn down by the kernel and ALL VRAM is reclaimed.
+#
+# Pre-flight (once):
+#   1. Download the HF snapshot:
+#        huggingface-cli download google/siglip2-so400m-patch16-naflex \
+#          --local-dir hf-snapshot
+#   2. Convert to GGUF:
+#        python scripts/convert_siglip2_to_gguf.py \
+#          --input  hf-snapshot \
+#          --output models/siglip2-so400m-naflex-q8_0.gguf \
+#          --type   q8_0
+#   3. Place the tokenizer alongside:
+#        cp hf-snapshot/tokenizer.model models/tokenizer.model
+#
+# Bring up:
+#   docker compose up -d
+#   curl -sf http://localhost:8890/health
+#
+# Idle behaviour (after 5 min of no requests):
+#   docker exec ... nvidia-smi --query-compute-apps=pid,used_memory --format=csv
+#   # → no siglip2-server PID listed; full VRAM reclaim.
+
+services:
+  siglip2:
+    build:
+      context: .
+      args:
+        # Trim CUDA arch list to drop the idle CUDA-context VRAM floor on
+        # a single-arch host. Default builds for Turing→Hopper
+        # (75;80;86;89;90). RTX 3000-series = 86, RTX 4000 = 89, etc.
+        SIGLIP2_CUDA_ARCHS: "${SIGLIP2_CUDA_ARCHS:-75;80;86;89;90}"
+    init: true
+    restart: unless-stopped
+    ports:
+      - "${SIGLIP2_PORT:-8890}:8890"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      # Mount your converted GGUF + tokenizer here. Read-only — the server
+      # never writes to the model directory.
+      - ./models:/models:ro
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+
+      # ── Lifecycle ────────────────────────────────────────────────────
+      # Lazy-load: container boots without spiking VRAM. First request
+      # triggers reload (~0.7 s extra on cold path). Pairs with idle-
+      # unload + worker-isolation for the "no GPU at idle" pattern.
+      LAZY_LOAD: "1"
+      IDLE_UNLOAD_SECONDS: "300"
+      # Worker isolation: run the GPU work in a forked subprocess so
+      # /v1/admin/unload + idle-unload SIGKILL it, dropping post-unload
+      # VRAM to zero (no CUDA-context residual).
+      SIGLIP2_WORKER_ISOLATION: "1"
+
+      # ── Model paths (override if your file names differ) ─────────────
+      MODEL_PATH: /models/siglip2-so400m-naflex-q8_0.gguf
+      TOKENIZER_PATH: /models/tokenizer.model
+
+      # ── Optional ─────────────────────────────────────────────────────
+      # DEFAULT_MAX_NUM_PATCHES: "729"   # cap patches per image (default 729)
+      # VISION_ONLY: "1"                 # skip text-encoder load
+      # TEXT_ONLY: "1"                   # skip vision-encoder load
+      # SIGLIP2_DISABLE_MEGAKERNEL: "1"  # turn off custom CUDA fusions
+
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8890/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s

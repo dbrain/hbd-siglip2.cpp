@@ -1,0 +1,39 @@
+# Build artefacts — built fresh inside the image.
+build/
+build-cuda/
+build-cuda-*/
+
+# Models — mounted at runtime via docker-compose volumes.
+models/
+
+# Reference HF snapshots — too large for build context.
+reference/hf/
+reference/llama.cpp/
+reference/transformers/
+reference/*.bin
+reference/*.wav
+reference/debug/
+
+# Bench outputs.
+bench_results*.json
+
+# Logs / scratch.
+.logs/
+forensics/
+test_output/
+test_results.txt
+debug_*.bin
+
+# Dev tooling.
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# OS / IDE.
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

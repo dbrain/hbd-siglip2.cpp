@@ -40,55 +40,66 @@ The latency wins are mild — 15–20 % on most endpoints, parity on `classify_f
 
 ## Quick start
 
-### Dependencies
-
-- CMake ≥ 3.14, a C++17 compiler.
-- For CUDA builds: nvcc 12.x, a CUDA toolkit + drivers matching your card.
-- HF model snapshot (downloaded once for conversion + tokenizer).
-
-`sentencepiece`, `cpp-httplib`, and `nlohmann/json` are pulled by `FetchContent` at configure time.
-
-### Build (CUDA)
+### 1. Get the source
 
 ```bash
 git clone --recurse-submodules https://github.com/dbrain/siglip2.cpp.git
 cd siglip2.cpp
-cmake -B build-cuda -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
-cmake --build build-cuda -j$(nproc)
 ```
 
-`CMAKE_CUDA_ARCHITECTURES`: `86` for Ampere, `89` for Ada, `90` for Hopper, `120` for Blackwell. Multiple values supported (`-DCMAKE_CUDA_ARCHITECTURES="86;89"`).
+### 2. Convert the model
 
-### Build (CPU-only)
-
-```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-```
-
-Supported but unmeasured — perf claims in this README are CUDA-only.
-
-### Convert weights
+The HF snapshot needs to be converted to GGUF once. You'll also need the SentencePiece `tokenizer.model` from the same snapshot at runtime.
 
 ```bash
+pip install transformers torch huggingface_hub safetensors numpy
+
 huggingface-cli download google/siglip2-so400m-patch16-naflex \
-  --local-dir reference/hf/siglip2-so400m-patch16-naflex
+  --local-dir hf-snapshot
 
 python scripts/convert_siglip2_to_gguf.py \
-  --input  reference/hf/siglip2-so400m-patch16-naflex \
+  --input  hf-snapshot \
   --output models/siglip2-so400m-naflex-q8_0.gguf \
   --type   q8_0
+
+cp hf-snapshot/tokenizer.model models/tokenizer.model
 ```
 
-`--type` accepts `f16`, `f32`, `q8_0`, `q4_k_m`. For `q5_k_m` or arbitrary requantization, use `build-cuda/siglip2-quantize`.
+`--type` accepts `f16`, `f32`, `q8_0`, `q4_k_m`. For `q5_k_m` or arbitrary requantization, use the `siglip2-quantize` binary built alongside the server.
 
-### Run the server
+### 3a. Run with Docker (recommended)
+
+A `Dockerfile` and `docker-compose.yml` are included.
 
 ```bash
+# Optional: trim CUDA arch list to your card to shrink the image / context VRAM.
+# Default builds for Turing→Hopper (75;80;86;89;90).
+export SIGLIP2_CUDA_ARCHS=86   # 86=Ampere, 89=Ada, 90=Hopper, 120=Blackwell
+
+docker compose up -d --build
+curl -sf http://localhost:8890/health
+```
+
+The compose file mounts `./models:/models:ro` and sets `LAZY_LOAD=1`, `IDLE_UNLOAD_SECONDS=300`, and `SIGLIP2_WORKER_ISOLATION=1` for the "no GPU at idle" pattern. Override env or `command:` to taste — see the comments inside `docker-compose.yml`.
+
+### 3b. Build & run manually
+
+Requires CMake ≥ 3.14, a C++17 compiler, and (for CUDA) nvcc 12.x with toolkit + drivers. `sentencepiece`, `cpp-httplib`, and `nlohmann/json` are pulled by `FetchContent` at configure time.
+
+```bash
+# CUDA build
+cmake -B build-cuda -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
+cmake --build build-cuda -j$(nproc)
+
+# Or CPU-only (supported but unmeasured — perf claims here are CUDA-only)
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+
+# Run
 build-cuda/siglip2-server \
   --model     models/siglip2-so400m-naflex-q8_0.gguf \
-  --tokenizer reference/hf/siglip2-so400m-patch16-naflex/tokenizer.model \
-  --port      18890
+  --tokenizer models/tokenizer.model \
+  --port      8890
 ```
 
 Useful env: `SIGLIP2_WORKER_ISOLATION=0` to keep the encoder in-process; `IDLE_UNLOAD_SECONDS=N` to auto-kill the worker after N idle seconds; `LAZY_LOAD=1` to skip loading at startup.
