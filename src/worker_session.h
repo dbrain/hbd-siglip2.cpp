@@ -1,8 +1,7 @@
 // worker_session.h — parent-side handle on a subprocess worker, plus the
-// child-side dispatch loop. Mirrors qwen3-tts.cpp's WorkerSession contract:
-// the worker owns ALL GPU state (CUDA primary context, ggml backend
-// buffers, encoder weights), and shutdown() SIGKILLs the child so the
-// kernel reclaims every byte of VRAM the worker held.
+// child-side dispatch loop. The worker owns ALL GPU state (CUDA primary
+// context, ggml backend buffers, encoder weights), and shutdown() SIGKILLs
+// the child so the kernel reclaims every byte of VRAM the worker held.
 //
 // Parent path (HTTP server, no GPU): build args once, call
 // ensure_loaded() lazily on the first request, route encode/classify

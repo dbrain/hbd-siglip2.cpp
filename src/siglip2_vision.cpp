@@ -360,7 +360,7 @@ struct VisionGraphCacheEntry {
 };
 
 struct VisionEncoder::State {
-    qwen3_tts::GGUFLoader loader;
+    siglip2::GGUFLoader loader;
 
     ggml_backend_t        backend     = nullptr;
     ggml_backend_buffer_t weights_buf = nullptr;
@@ -403,7 +403,7 @@ struct VisionEncoder::State {
             ggml_free(weights_ctx);
         }
         if (backend) {
-            qwen3_tts::release_preferred_backend(backend);
+            siglip2::release_preferred_backend(backend);
         }
     }
 };
@@ -459,8 +459,8 @@ bool VisionEncoder::load(const std::string & gguf_path, bool private_backend) {
         prio = std::atoi(v);
     }
     state_->backend = private_backend
-        ? qwen3_tts::init_separate_backend("siglip2-vision", &error_msg_, prio)
-        : qwen3_tts::init_preferred_backend("siglip2-vision", &error_msg_);
+        ? siglip2::init_separate_backend("siglip2-vision", &error_msg_, prio)
+        : siglip2::init_preferred_backend("siglip2-vision", &error_msg_);
     if (!state_->backend) {
         delete state_;
         state_ = nullptr;
@@ -556,7 +556,7 @@ bool VisionEncoder::load(const std::string & gguf_path, bool private_backend) {
     }
 
     // Allocate backend buffer + load weight data.
-    if (!qwen3_tts::load_tensor_data_from_file(
+    if (!siglip2::load_tensor_data_from_file(
             gguf_path,
             state_->loader.get_ctx(),
             state_->weights_ctx,

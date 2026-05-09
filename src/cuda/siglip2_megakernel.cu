@@ -449,9 +449,7 @@ struct LayerNormEntry {
 // breaks for one-off chains like the vision probe head (gelu reads garbage)
 // and the patch embedding (non-consecutive). The plan-builder gates on both
 // `is_blk_bias` (bias name contains "blk") and consecutive-in-topo to scope
-// the fusion to the safe region. See HANDOFF-megakernel-v0.md "gallocr trap
-// take 2" for the bisect receipts (text bit-clean unrestricted, vision drops
-// to cosine 0.65 unrestricted, both 0.999+ once gated).
+// the fusion to the safe region.
 
 struct BiasResidualEntry {
     const ggml_tensor * mm_node       = nullptr;  // mul_mat output  (H, n_pos)
@@ -610,7 +608,7 @@ bool     g_enabled              = true;
 // 2 cast) → 2 kernels. Bit-identical to ggml's split path. Kill switch:
 // SIGLIP2_DISABLE_QKV_PREP=1. The earlier single-kernel design hit a
 // gallocr aliasing trap (qkv_add slot reclaimed before the late anchor
-// fired); see HANDOFF-megakernel-v0.md for receipts.
+// fired) — the two-kernel split is the workaround.
 bool     g_qkv_enabled          = true;
 // Phase A2 — pointwise tail fusion: (mm + 1D bias) + 2D residual collapsed
 // into one launch (P1, fires at o-proj and down-proj per block), and gelu(mm

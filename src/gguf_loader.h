@@ -9,7 +9,7 @@
 #include <vector>
 #include <memory>
 
-namespace qwen3_tts {
+namespace siglip2 {
 
 // Generic GGUF model loader class
 // This is a simplified loader that can be extended for specific model types
@@ -63,10 +63,10 @@ protected:
 };
 
 // Helper function to allocate and load tensor data from GGUF file.
-// preferred_backend_type is required (no default) — silently defaulting to
-// CPU caused the speaker encoder to ride the op_offload churn path with the
-// reviewer flagging it as MED-3. Callers must now pick explicitly so the
-// CPU-vs-GPU intent is visible at the call site.
+// preferred_backend_type is required (no default): an implicit CPU default
+// would silently route weight buffers through CPU on machines without the
+// requested device, dragging the encode graph onto CPU. Callers pick
+// explicitly so the CPU-vs-GPU intent is visible at the call site.
 bool load_tensor_data_from_file(
     const std::string & path,
     struct gguf_context * ctx,
@@ -97,4 +97,4 @@ ggml_backend_t init_separate_backend(const char * component_name, std::string * 
 // Helper function to free model resources
 void free_ggml_resources(struct ggml_context * ctx, ggml_backend_buffer_t buffer);
 
-} // namespace qwen3_tts
+} // namespace siglip2

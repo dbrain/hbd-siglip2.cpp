@@ -12,7 +12,7 @@
 // reductions per text encode, ~166 per vision encode, ~786 per /v1/classify.
 //
 // Bigger fusions (per-block megakernel, fused mul_mat+bias) come in later
-// phases — see HANDOFF-megakernel-v0.md.
+// phases.
 
 #pragma once
 

@@ -1,5 +1,4 @@
-// worker_ipc.cpp — see worker_ipc.h. Lifted from qwen3-tts.cpp with
-// siglip2-specific frame types + a multi-blob payload helper.
+// worker_ipc.cpp — see worker_ipc.h.
 
 #include "worker_ipc.h"
 

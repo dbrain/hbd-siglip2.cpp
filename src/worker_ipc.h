@@ -10,7 +10,7 @@
 // state into the CUDA process). Reads frames from the inherited socket
 // fd, dispatches.
 //
-// Protocol mirrors qwen3-tts.cpp's wire format:
+// Wire format:
 //
 //   [u32 frame_type][u32 payload_len][u32 req_id][u8 payload[payload_len]]
 //

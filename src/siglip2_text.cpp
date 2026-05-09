@@ -369,7 +369,7 @@ struct GraphCacheEntry {
 };
 
 struct TextEncoder::State {
-    qwen3_tts::GGUFLoader loader;
+    siglip2::GGUFLoader loader;
 
     ggml_backend_t        backend     = nullptr;
     ggml_backend_buffer_t weights_buf = nullptr;
@@ -403,7 +403,7 @@ struct TextEncoder::State {
         if (qkv_scratch_buf) ggml_backend_buffer_free(qkv_scratch_buf);
         if (weights_buf) ggml_backend_buffer_free(weights_buf);
         if (weights_ctx) ggml_free(weights_ctx);
-        if (backend) qwen3_tts::release_preferred_backend(backend);
+        if (backend) siglip2::release_preferred_backend(backend);
     }
 };
 
@@ -448,8 +448,8 @@ bool TextEncoder::load(const std::string & gguf_path, bool private_backend) {
     }
 
     state_->backend = private_backend
-        ? qwen3_tts::init_separate_backend("siglip2-text", &error_msg_)
-        : qwen3_tts::init_preferred_backend("siglip2-text", &error_msg_);
+        ? siglip2::init_separate_backend("siglip2-text", &error_msg_)
+        : siglip2::init_preferred_backend("siglip2-text", &error_msg_);
     if (!state_->backend) {
         delete state_;
         state_ = nullptr;
@@ -522,7 +522,7 @@ bool TextEncoder::load(const std::string & gguf_path, bool private_backend) {
         }
     }
 
-    if (!qwen3_tts::load_tensor_data_from_file(
+    if (!siglip2::load_tensor_data_from_file(
             gguf_path,
             state_->loader.get_ctx(),
             state_->weights_ctx,

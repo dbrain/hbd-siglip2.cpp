@@ -7,7 +7,7 @@
 #include <fstream>
 #include <mutex>
 
-namespace qwen3_tts {
+namespace siglip2 {
 
 namespace {
 struct shared_backend_state {
@@ -46,7 +46,7 @@ ggml_backend_t init_preferred_backend(const char * component_name, std::string *
         return shared.backend;
     }
 
-    const char * force_cpu = std::getenv("QWEN3_TTS_FORCE_CPU");
+    const char * force_cpu = std::getenv("SIGLIP2_FORCE_CPU");
     ggml_backend_t backend = nullptr;
     if (!(force_cpu && force_cpu[0] == '1')) {
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
@@ -78,7 +78,7 @@ ggml_backend_t init_separate_backend(const char * component_name, std::string * 
                                      int stream_priority) {
     if (error_msg) error_msg->clear();
 
-    const char * force_cpu = std::getenv("QWEN3_TTS_FORCE_CPU");
+    const char * force_cpu = std::getenv("SIGLIP2_FORCE_CPU");
     ggml_backend_t backend = nullptr;
     // Non-zero priority requested → use ggml-cuda's priority API directly
     // (the by_type init has no priority knob). Falls through to the by_type
@@ -212,10 +212,10 @@ bool load_tensor_data_from_file(
     enum ggml_backend_dev_type preferred_backend_type
 ) {
     // Try the requested device type first; if it doesn't exist (e.g. IGPU on
-    // a discrete-only machine), fall back to GPU then CPU. The previous
-    // IGPU-then-CPU path silently loaded the WavTokenizer vocoder weights into
-    // CPU buffer on systems with only a discrete GPU, which then forced the
-    // entire decoder graph to run on CPU.
+    // a discrete-only machine), fall back to GPU then CPU. Without the
+    // intermediate GPU step, IGPU-preferred loads on discrete-only systems
+    // would silently land weights on CPU and drag the entire encode graph
+    // onto CPU.
     ggml_backend_t backend = ggml_backend_init_by_type(preferred_backend_type, nullptr);
     if (!backend && preferred_backend_type != GGML_BACKEND_DEVICE_TYPE_CPU
                  && preferred_backend_type != GGML_BACKEND_DEVICE_TYPE_GPU) {
@@ -299,10 +299,9 @@ bool load_tensor_data_from_file(
         if (src_type == dst_type) {
             ggml_backend_tensor_set(tensor, read_buf.data(), 0, src_nbytes);
         } else if (src_type == GGML_TYPE_F16 && dst_type == GGML_TYPE_Q8_0) {
-            // Decoder requested Q8_0 for selected mat-mul-only weights to
-            // shrink vocoder VRAM (~28 MiB on the V1 12Hz tokenizer). On-disk
-            // is F16; convert F16 → F32 → Q8_0 via tmp buffers, then upload
-            // the quantized payload.
+            // Tensor was allocated Q8_0 in the model context but the on-disk
+            // weight is F16. Convert F16 → F32 → Q8_0 via tmp buffers, then
+            // upload the quantized payload.
             f32_buf.resize((size_t) n_elem);
             ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(read_buf.data()),
                                   f32_buf.data(), n_elem);
@@ -346,4 +345,4 @@ void free_ggml_resources(struct ggml_context * ctx, ggml_backend_buffer_t buffer
     }
 }
 
-} // namespace qwen3_tts
+} // namespace siglip2

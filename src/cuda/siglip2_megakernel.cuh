@@ -64,8 +64,7 @@ void launch_fused_layernorm_affine(
 // gallocr (qkv_add->data freed before V_cast.idx). The fix is to copy
 // (mm + bias) into a persistent device scratch at qkv_add.idx, then split-
 // permute-pad-cast from scratch at V_cast.idx — both anchors hit data that's
-// guaranteed alive at their respective indices. See HANDOFF-megakernel-v0.md
-// "Phase A1 — gallocr aliasing trap" for the full receipts.
+// guaranteed alive at their respective indices.
 
 // (1) Scratch-fill kernel — at qkv_add anchor: scratch[i] = mm[i] + bias[i%(3H)].
 // Replaces the bias-add launch entirely; scratch will host the QKV biased

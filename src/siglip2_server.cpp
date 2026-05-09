@@ -607,9 +607,9 @@ int main(int argc, char ** argv) {
         do_unload(res, "/v1/admin/unload");
     });
 
-    // -- /v1/admin/load — explicit reload (mirrors qwen3-tts admin path).
-    // In worker mode this is a synchronous spawn + LOAD_REQ; in in-process
-    // mode it loads the encoder + tokenizer.
+    // -- /v1/admin/load — explicit reload. In worker mode this is a
+    // synchronous spawn + LOAD_REQ; in in-process mode it loads the
+    // encoder + tokenizer.
     srv.Post("/v1/admin/load", [&](const httplib::Request &, httplib::Response & res) {
         bool was_loaded = false;
         bool ok = false;

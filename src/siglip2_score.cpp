@@ -17,7 +17,7 @@ bool read_score_params(
     const std::string & gguf_path,
     ScoreParams &       out,
     std::string &       error) {
-    qwen3_tts::GGUFLoader loader;
+    siglip2::GGUFLoader loader;
     if (!loader.open(gguf_path)) {
         error = loader.get_error();
         return false;
