@@ -51,28 +51,22 @@ The latency wins are mild — 15–20 % on most endpoints, parity on `classify_f
 
 ```bash
 git clone --recurse-submodules https://github.com/dbrain/hbd-siglip2.cpp.git
-cd siglip2.cpp
+cd hbd-siglip2.cpp
 ```
 
-### 2. Convert the model
+### 2. Get the weights
 
-The HF snapshot needs to be converted to GGUF once. You'll also need the SentencePiece `tokenizer.model` from the same snapshot at runtime.
+Pre-built GGUFs (all four quants + the SentencePiece tokenizer) live on HF. Pull the quant you want plus the tokenizer:
 
 ```bash
-pip install transformers torch huggingface_hub safetensors numpy
-
-huggingface-cli download google/siglip2-so400m-patch16-naflex \
-  --local-dir hf-snapshot
-
-python scripts/convert_siglip2_to_gguf.py \
-  --input  hf-snapshot \
-  --output models/siglip2-so400m-naflex-q8_0.gguf \
-  --type   q8_0
-
-cp hf-snapshot/tokenizer.model models/tokenizer.model
+huggingface-cli download dbrains/SigLIP2-So400m-Patch16-NaFlex-GGUF \
+  siglip2-so400m-naflex-q8_0.gguf tokenizer.model \
+  --local-dir models
 ```
 
-`--type` accepts `f16`, `f32`, `q8_0`, `q4_k_m`. For `q5_k_m` or arbitrary requantization, use the `siglip2-quantize` binary built alongside the server.
+Swap the GGUF filename for `f16`, `q5_k_m`, or `q4_k_m` to pick a different quant — see the [Quants](#quants) table for the tradeoffs.
+
+If you'd rather convert from the original safetensors (custom quant, debugging the converter, etc.), see [Convert from source](#convert-from-source) at the bottom.
 
 ### 3a. Run with Docker (recommended)
 
@@ -162,6 +156,26 @@ All numbers in this README come from a single **RTX 3060 12 GB** (Ampere GA106).
 | Non-CUDA accelerators (Metal, Vulkan) | ❌ |
 
 Parity is verified by `scripts/parity_check_{vision,text,score,image,tokenizer}.py` against the HF reference.
+
+## Convert from source
+
+For most users [step 2](#2-get-the-weights) (pre-built GGUFs from HF) is enough. If you need a custom quant or want to verify the conversion yourself:
+
+```bash
+pip install transformers torch huggingface_hub safetensors numpy
+
+huggingface-cli download google/siglip2-so400m-patch16-naflex \
+  --local-dir hf-snapshot
+
+python scripts/convert_siglip2_to_gguf.py \
+  --input  hf-snapshot \
+  --output models/siglip2-so400m-naflex-q8_0.gguf \
+  --type   q8_0
+
+cp hf-snapshot/tokenizer.model models/tokenizer.model
+```
+
+`--type` accepts `f16`, `f32`, `q8_0`, `q4_k_m`. For `q5_k_m` or arbitrary requantization, use the `siglip2-quantize` binary built alongside the server.
 
 ## Acknowledgements
 
