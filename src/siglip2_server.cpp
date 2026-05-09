@@ -530,6 +530,7 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "load failed: %s\n", err.c_str());
             return 1;
         }
+        st.touch();
     }
     if (worker_session && !cfg.lazy_load) {
         if (!worker_session->ensure_loaded(worker_cfg)) {
@@ -539,6 +540,7 @@ int main(int argc, char ** argv) {
         }
         fprintf(stderr, "[siglip2-server] worker pid=%d loaded model OK\n",
                 (int) worker_session->pid());
+        st.touch();
     }
 
     httplib::Server srv;
@@ -984,6 +986,39 @@ int main(int argc, char ** argv) {
                 tms(t_encode, t_score), tms(t_score, t_done), tms(t0, t_done));
         }
     });
+
+    // Idle-unload sweeper. Polls every 10 s; if the model has been loaded
+    // and no real request has hit ensure() / touch() within the threshold,
+    // SIGKILL the worker (or unload in-process state). /health intentionally
+    // does NOT touch, so docker healthchecks don't reset the timer.
+    // Detached — process exit reaps the thread.
+    if (cfg.idle_unload_seconds > 0) {
+        std::thread([&st, &worker_session, secs = cfg.idle_unload_seconds]() {
+            const auto      poll      = std::chrono::seconds(10);
+            const long long thresh_ms = (long long) secs * 1000;
+            for (;;) {
+                std::this_thread::sleep_for(poll);
+                const bool loaded = worker_session ? worker_session->is_alive()
+                                                   : st.loaded.load();
+                if (!loaded) continue;
+                const long long last = st.last_request_ms.load();
+                if (last == 0) continue;  // never touched (paranoia: eager-load touches above)
+                const long long age = st.now_ms() - last;
+                if (age < thresh_ms) continue;
+                fprintf(stderr,
+                    "[siglip2-server] idle-unload: %lld s since last request "
+                    "(threshold %d s)\n", age / 1000, secs);
+                if (worker_session) {
+                    worker_session->shutdown();
+                } else {
+                    st.unload();
+                }
+            }
+        }).detach();
+        fprintf(stderr,
+            "[siglip2-server] idle-unload sweeper: %d s threshold, 10 s poll\n",
+            cfg.idle_unload_seconds);
+    }
 
     fprintf(stderr, "[siglip2-server] listening on %s:%d (model=%s)\n",
         cfg.host.c_str(), cfg.port, cfg.model_path.c_str());
